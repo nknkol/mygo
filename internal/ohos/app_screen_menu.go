@@ -166,6 +166,16 @@ func (b *Backend) loadInitialEnv() {
 			}
 		}
 	}
+	if v := strings.TrimSpace(os.Getenv("MYGO_OHOS_ON_BATTERY")); v == "1" || v == "true" {
+		b.onBattery = true
+	}
+	b.netStatus = platform.NetworkStatus{Online: true}
+	if v := strings.TrimSpace(os.Getenv("MYGO_OHOS_NET_ONLINE")); v == "0" || v == "false" {
+		b.netStatus.Online = false
+	}
+	if v := strings.TrimSpace(os.Getenv("MYGO_OHOS_NET_METERED")); v == "1" || v == "true" {
+		b.netStatus.Metered = true
+	}
 }
 
 func parseDisplaySpec(spec string) (platform.Display, bool) {

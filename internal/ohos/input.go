@@ -137,6 +137,10 @@ func (b *Backend) onInput(payload []byte) {
 		return
 	}
 
+	if body[0] != inputWindow {
+		b.noteUserActivity()
+	}
+
 	win := b.windowByID(winID)
 	if win == nil || win.closed {
 		return
@@ -541,8 +545,11 @@ func (s *Surface) onWindow(p []byte) {
 		if op == winHide && !w.visible && wasHostHidden {
 			return
 		}
-		becameMin := !w.minimized
-		w.minimized = true
+		becameMin := false
+		if op == winMinimize {
+			becameMin = !w.minimized
+			w.minimized = true
+		}
 		if wasVisible {
 			s.touch.cancelFling()
 			s.send(platform.SurfaceEvent{Kind: platform.SurfaceHidden})

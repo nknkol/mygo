@@ -491,6 +491,8 @@ func (b *Backend) flushPendingAppOpens() {
 	b.readyDone = true
 	pending := b.pendingAppOpens
 	b.pendingAppOpens = nil
+	clicks := b.pendingNotifClicks
+	b.pendingNotifClicks = nil
 	app := b.app
 	hasVis := b.hasVisibleWindowLocked()
 	b.mu.Unlock()
@@ -499,6 +501,9 @@ func (b *Backend) flushPendingAppOpens() {
 	}
 	for _, ev := range pending {
 		deliverAppOpen(app, ev, hasVis)
+	}
+	for _, id := range clicks {
+		app.NotificationClicked(id)
 	}
 }
 

@@ -17,4 +17,5 @@ target_link_libraries(mygo_host PUBLIC
     libnative_vsync.so
     libohinputmethod.so
     libohinput.so
+    libohaudio.so
 )

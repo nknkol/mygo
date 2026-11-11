@@ -50,6 +50,27 @@ const (
 	kindDialogSave = 25 // engine -> host: save file picker
 	kindDialogMsg  = 26 // engine -> host: message box
 	kindShellReq   = 27 // engine -> host: {u32 reqID, u8 op, 3×pad, str target}
+
+	kindMediaCmd     = 28 // host -> engine: {u32 cmd, i64 posMs}
+	kindNotifResult  = 29 // host -> engine: {u32 reqID, u8 denied, 3×pad, str err}
+	kindNotifClicked = 30 // host -> engine: {str id}
+	kindPowerState   = 31 // host -> engine: {u8 onBattery, 3×pad, str event}
+	kindNetState     = 32 // host -> engine: {u8 online, u8 metered, 2×pad}
+
+	kindAudioOpen   = 33 // engine -> host: {u32 streamID, u32 rate, u32 channels, u32 latencyMode, u32 shmBytes} + fd
+	kindAudioClose  = 34 // engine -> host: {u32 streamID}
+	kindNowPlaying  = 35 // engine -> host: {u8 active, u8 state, u8 metaChanged, u8 pad, u32 cmds, i64 durMs, i64 posMs, f64 rate, ...}
+	kindNotifShow   = 36 // engine -> host: {u32 reqID, u8 silent, 3×pad, str id, str title, str subtitle, str body, str group, bytes image}
+	kindNotifRemove = 37 // engine -> host: {u8 all, 3×pad, str id}
+	kindPowerReq    = 38 // engine -> host: {u8 keepSys, u8 keepDisp, u8 keepRun, u8 pad, str reason}
+	kindNetWatch    = 39 // engine -> host: {}
+)
+
+// NowPlaying playback state bytes (kindNowPlaying).
+const (
+	npStateStopped byte = 0
+	npStatePlaying byte = 1
+	npStatePaused  byte = 2
 )
 
 // App open operations (kindAppOpen).
@@ -280,6 +301,38 @@ func (c *conn) write(kind byte, payload []byte) error {
 	msg[0] = kind
 	binary.LittleEndian.PutUint32(msg[1:], uint32(len(payload)))
 	copy(msg[5:], payload)
+	for len(msg) > 0 {
+		n, err := syscall.Write(c.fd, msg)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			return err
+		}
+		msg = msg[n:]
+	}
+	return nil
+}
+
+func (c *conn) writeWithFD(kind byte, payload []byte, fd int) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	msg := make([]byte, 5+len(payload))
+	msg[0] = kind
+	binary.LittleEndian.PutUint32(msg[1:], uint32(len(payload)))
+	copy(msg[5:], payload)
+	oob := syscall.UnixRights(fd)
+	for {
+		n, err := syscall.SendmsgN(c.fd, msg, oob, nil, 0)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			return err
+		}
+		msg = msg[n:]
+		break
+	}
 	for len(msg) > 0 {
 		n, err := syscall.Write(c.fd, msg)
 		if err != nil {
@@ -632,6 +685,12 @@ func appendUint32(b []byte, v uint32) []byte {
 	return append(b, tmp[:]...)
 }
 
+func appendUint64(b []byte, v uint64) []byte {
+	var tmp [8]byte
+	binary.LittleEndian.PutUint64(tmp[:], v)
+	return append(b, tmp[:]...)
+}
+
 func appendWireStr(b []byte, s string) []byte {
 	b = appendUint32(b, uint32(len(s)))
 	return append(b, s...)
@@ -647,6 +706,13 @@ func readUint32(b []byte, off int) (uint32, int, bool) {
 		return 0, off, false
 	}
 	return binary.LittleEndian.Uint32(b[off:]), off + 4, true
+}
+
+func readUint64(b []byte, off int) (uint64, int, bool) {
+	if off < 0 || off+8 > len(b) {
+		return 0, off, false
+	}
+	return binary.LittleEndian.Uint64(b[off:]), off + 8, true
 }
 
 func readWireStr(b []byte, off int) (string, int, bool) {
@@ -673,4 +739,12 @@ func putF32(b []byte, v float32) {
 
 func getF32(b []byte) float32 {
 	return math.Float32frombits(binary.LittleEndian.Uint32(b))
+}
+
+func putF64(b []byte, v float64) {
+	binary.LittleEndian.PutUint64(b, math.Float64bits(v))
+}
+
+func getF64(b []byte) float64 {
+	return math.Float64frombits(binary.LittleEndian.Uint64(b))
 }

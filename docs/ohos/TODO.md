@@ -117,12 +117,12 @@ fd 走 `SCM_RIGHTS` → Go 引擎 `mmap` 画 → `FlushBuffer`。
 - [x] **URL 深链与单实例激活**：`EntryAbility` 设为 `singleton`，在 `onCreate` / `onNewWant` 中捕获 `want.uri` 与文件参数，支持 `Ready()` 前冷启动深链缓冲与运行期桥接至 `AppHandler.OpenURLs` / `OpenFiles` / `Activated`
 - [x] **退出判据**：单元测试（`go test -count=10 ./internal/ohos/...`）与真机验证剪贴板、系统选择器、消息弹窗与 `mygo-music://` 单实例深链唤起通过
 
-## S7 框架补齐 Batch 3：音频输出、媒体播控、通知与后台运行
+## S7 框架补齐 Batch 3：音频输出、媒体播控、通知与后台运行 —— 已完成
 
-- [ ] **原生音频输出（`audio/output_ohos.go`）**：用 `purego` 直连 `libohaudio.so`（`OH_AudioStreamBuilder` + 低延迟 PCM 渲染流回调或宿主桥接，对齐 `audio/output_linux.go` 接口，使 `github.com/egoist/mygo/audio` 开箱发声）
-- [ ] **系统媒体播控中心（`Backend.NowPlaying`）**：接入 `@ohos.multimedia.avsession`（同步曲名、歌手、专辑、封面、时长、进度与倍速，将系统播控面板与键盘媒体键映射回 `AppHandler.MediaCommand`）
-- [ ] **桌面通知与电源/后台保活**：接入 `@ohos.notificationManager`（`ShowNotification`/`NotificationClicked`）以及 `@ohos.resourceschedule.backgroundTaskManager`（`AUDIO_PLAYBACK` 长时任务 + `Power.KeepRunning`）
-- [ ] **退出判据**：原生 PCM 音频稳定播放/Seek/暂停无爆音，控制中心与媒体键双向联动，切后台或锁屏继续播放且窗口暂停无谓重绘
+- [x] **原生音频输出（`audio/output_ohos.go` + `internal/ohosaudio`）**：通过 `memfd` 共享内存无锁 SPSC PCM 环形缓冲区 + 共享 `futex` 背压桥接 Stage 模型宿主进程内的 `OH_AudioStreamBuilder`/`OH_AudioRenderer`（`AUDIOSTREAM_USAGE_MUSIC`，支持 `F32LE` 原生输出与 `S16LE` 回退、音频打断恢复/拔耳机暂停回调及 5s 静音自动关流），避免 `CGO_ENABLED=0` 下实时音频线程回调开销并使音频流归属 Ability 进程 UID/PID
+- [x] **系统媒体播控中心（`Backend.NowPlaying`）**：接入 `@kit.AVSessionKit`（`AVSession` `audio` 会话，曲目元数据/封面 SHA-256 去重仅在变更时下发 PixelMap，同步时长、进度、状态与倍速，将系统播控面板与键盘媒体键映射回 `AppHandler.MediaCommand`）
+- [x] **桌面通知、电源/后台保活与网络感知**：接入 `@kit.NotificationKit`（支持图片通知、`WantAgent` 冷启动缓冲与热唤起 `NotificationClicked`、权限拒绝映射 `ErrNotificationsDenied`、按 `(id, label)` 取消）、`@kit.BackgroundTasksKit`（引用计数的 `AUDIO_PLAYBACK` 长时任务 + `setWindowKeepScreenOn`、`OnBattery`、锁屏/挂起恢复事件与输入驱动的 `IdleTime`）以及 `@kit.NetworkKit`（`Network.Status`/`Watch` 在线与计费网络监听）
+- [x] **退出判据**：单元测试（`go test -count=5 ./internal/ohos/... ./internal/ohosaudio/... ./audio/...` 含 `-tags mygo_ohos`）全绿；真机验证 48kHz 双声道 `F32LE` 共享内存音频流、`AVSession` 渲染流绑定（`renderer state is 2`）、电源长时任务与网络状态查询通过；`EntryAbility` 退后台触发 `SurfaceHidden` 停止无谓重绘而不误标窗口最小化
 
 ## S8 端到端验证与框架化
 

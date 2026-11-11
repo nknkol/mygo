@@ -26,6 +26,8 @@
 #include <native_window/buffer_handle.h>
 #include <native_buffer/native_buffer.h>
 #include <native_vsync/native_vsync.h>
+#include <ohaudio/native_audiostreambuilder.h>
+#include <ohaudio/native_audiorenderer.h>
 
 #include <algorithm>
 #include <atomic>
@@ -51,10 +53,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <linux/dma-buf.h>
+#include <linux/futex.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 
 #undef LOG_DOMAIN
@@ -96,6 +101,22 @@ constexpr uint8_t kDialogOpen = 24; // engine -> host: open file/folder dialog
 constexpr uint8_t kDialogSave = 25; // engine -> host: save file dialog
 constexpr uint8_t kDialogMsg  = 26; // engine -> host: message box
 constexpr uint8_t kShellReq   = 27; // engine -> host: {u32 reqId, u8 op, 3×pad, str target}
+
+constexpr uint8_t kMediaCmd     = 28; // host -> engine: {u32 cmd, i64 posMs}
+constexpr uint8_t kNotifResult  = 29; // host -> engine: {u32 reqId, u8 denied, 3×pad, str err}
+constexpr uint8_t kNotifClicked = 30; // host -> engine: {str id}
+constexpr uint8_t kPowerState   = 31; // host -> engine: {u8 onBattery, 3×pad, str event}
+constexpr uint8_t kNetState     = 32; // host -> engine: {u8 online, u8 metered, 2×pad}
+
+constexpr uint8_t kAudioOpen   = 33; // engine -> host: {u32 streamId, u32 rate, u32 ch, u32 latMode, u32 shmBytes} + fd
+constexpr uint8_t kAudioClose  = 34; // engine -> host: {u32 streamId}
+constexpr uint8_t kNowPlaying  = 35; // engine -> host: NowPlaying snapshot
+constexpr uint8_t kNotifShow   = 36; // engine -> host: show notification
+constexpr uint8_t kNotifRemove = 37; // engine -> host: remove notification(s)
+constexpr uint8_t kPowerReq    = 38; // engine -> host: aggregate wake/background lock request
+constexpr uint8_t kNetWatch    = 39; // engine -> host: start reporting network changes
+
+constexpr uint32_t kMediaPause = 1u << 1;
 
 // Input subkinds.
 constexpr uint8_t kInputMouse  = 1;
@@ -398,6 +419,12 @@ std::mutex gEnvMu;
 CachedEnv gCachedEnv;
 std::vector<uint8_t> gCachedClipWire;
 std::vector<std::vector<uint8_t>> gPendingAppOpens;
+std::vector<std::vector<uint8_t>> gPendingNotifClicks;
+bool gOnBattery = false;
+bool gNetOnline = true;
+bool gNetMetered = false;
+std::atomic<bool> gNowPlayingActive{false};
+std::atomic<uint32_t> gNowPlayingCmds{0};
 
 // ---------- Per-Window Session ----------
 
@@ -495,6 +522,11 @@ enum class BridgeEventKind {
     DialogSave,
     DialogMsg,
     ShellReq,
+    NowPlaying,
+    NotifShow,
+    NotifRemove,
+    PowerReq,
+    NetWatch,
     EngineQuit,
     EngineRestart,
 };
@@ -560,6 +592,38 @@ struct PopupItemData {
     std::vector<PopupItemData> items;
 };
 
+struct NowPlayingData {
+    bool active = false;
+    uint8_t state = 0;
+    bool metaChanged = false;
+    uint32_t commands = 0;
+    int64_t durationMs = 0;
+    int64_t positionMs = 0;
+    double rate = 1.0;
+    std::string title;
+    std::string artist;
+    std::string album;
+    std::vector<uint8_t> artwork;
+};
+
+struct NotifShowData {
+    uint32_t reqId = 0;
+    bool silent = false;
+    std::string id;
+    std::string title;
+    std::string subtitle;
+    std::string body;
+    std::string group;
+    std::vector<uint8_t> image;
+};
+
+struct PowerReqData {
+    bool keepSystem = false;
+    bool keepDisplay = false;
+    bool keepRunning = false;
+    std::string reason;
+};
+
 struct BridgeEvent {
     BridgeEventKind kind = BridgeEventKind::WinAction;
     WinConfigData winCfg;
@@ -577,6 +641,11 @@ struct BridgeEvent {
     MessageBoxData msgBox;
     uint8_t shellOp = 0;
     std::string shellTarget;
+    NowPlayingData nowPlaying;
+    NotifShowData notifShow;
+    bool notifRemoveAll = false;
+    std::string notifRemoveId;
+    PowerReqData powerReq;
 };
 
 std::mutex gBridgeMu;
@@ -826,6 +895,94 @@ void BridgeCallJs(napi_env env, napi_value, void *, void *data) {
         callBridgeMethod(env, cbObj, "onShellReq", 3, args);
         break;
     }
+    case BridgeEventKind::NowPlaying: {
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_value vAct = nullptr, vSt = nullptr, vMeta = nullptr, vCmds = nullptr;
+        napi_value vDur = nullptr, vPos = nullptr, vRate = nullptr;
+        napi_value vTitle = nullptr, vArtist = nullptr, vAlbum = nullptr, vArt = nullptr;
+        napi_get_boolean(env, ev->nowPlaying.active, &vAct);
+        napi_create_uint32(env, ev->nowPlaying.state, &vSt);
+        napi_get_boolean(env, ev->nowPlaying.metaChanged, &vMeta);
+        napi_create_uint32(env, ev->nowPlaying.commands, &vCmds);
+        napi_create_double(env, static_cast<double>(ev->nowPlaying.durationMs), &vDur);
+        napi_create_double(env, static_cast<double>(ev->nowPlaying.positionMs), &vPos);
+        napi_create_double(env, ev->nowPlaying.rate, &vRate);
+        napi_create_string_utf8(env, ev->nowPlaying.title.c_str(), ev->nowPlaying.title.size(), &vTitle);
+        napi_create_string_utf8(env, ev->nowPlaying.artist.c_str(), ev->nowPlaying.artist.size(), &vArtist);
+        napi_create_string_utf8(env, ev->nowPlaying.album.c_str(), ev->nowPlaying.album.size(), &vAlbum);
+        void *abData = nullptr;
+        napi_create_arraybuffer(env, ev->nowPlaying.artwork.size(), &abData, &vArt);
+        if (abData != nullptr && !ev->nowPlaying.artwork.empty()) {
+            memcpy(abData, ev->nowPlaying.artwork.data(), ev->nowPlaying.artwork.size());
+        }
+        napi_set_named_property(env, obj, "active", vAct);
+        napi_set_named_property(env, obj, "state", vSt);
+        napi_set_named_property(env, obj, "metaChanged", vMeta);
+        napi_set_named_property(env, obj, "commands", vCmds);
+        napi_set_named_property(env, obj, "durationMs", vDur);
+        napi_set_named_property(env, obj, "positionMs", vPos);
+        napi_set_named_property(env, obj, "rate", vRate);
+        napi_set_named_property(env, obj, "title", vTitle);
+        napi_set_named_property(env, obj, "artist", vArtist);
+        napi_set_named_property(env, obj, "album", vAlbum);
+        napi_set_named_property(env, obj, "artwork", vArt);
+        callBridgeMethod(env, cbObj, "onNowPlaying", 1, &obj);
+        break;
+    }
+    case BridgeEventKind::NotifShow: {
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_value vReq = nullptr, vSil = nullptr, vId = nullptr, vTitle = nullptr;
+        napi_value vSub = nullptr, vBody = nullptr, vGrp = nullptr, vImg = nullptr;
+        napi_create_uint32(env, ev->notifShow.reqId, &vReq);
+        napi_get_boolean(env, ev->notifShow.silent, &vSil);
+        napi_create_string_utf8(env, ev->notifShow.id.c_str(), ev->notifShow.id.size(), &vId);
+        napi_create_string_utf8(env, ev->notifShow.title.c_str(), ev->notifShow.title.size(), &vTitle);
+        napi_create_string_utf8(env, ev->notifShow.subtitle.c_str(), ev->notifShow.subtitle.size(), &vSub);
+        napi_create_string_utf8(env, ev->notifShow.body.c_str(), ev->notifShow.body.size(), &vBody);
+        napi_create_string_utf8(env, ev->notifShow.group.c_str(), ev->notifShow.group.size(), &vGrp);
+        void *abData = nullptr;
+        napi_create_arraybuffer(env, ev->notifShow.image.size(), &abData, &vImg);
+        if (abData != nullptr && !ev->notifShow.image.empty()) {
+            memcpy(abData, ev->notifShow.image.data(), ev->notifShow.image.size());
+        }
+        napi_set_named_property(env, obj, "reqId", vReq);
+        napi_set_named_property(env, obj, "silent", vSil);
+        napi_set_named_property(env, obj, "id", vId);
+        napi_set_named_property(env, obj, "title", vTitle);
+        napi_set_named_property(env, obj, "subtitle", vSub);
+        napi_set_named_property(env, obj, "body", vBody);
+        napi_set_named_property(env, obj, "group", vGrp);
+        napi_set_named_property(env, obj, "image", vImg);
+        callBridgeMethod(env, cbObj, "onNotifShow", 1, &obj);
+        break;
+    }
+    case BridgeEventKind::NotifRemove: {
+        napi_value args[2] = {nullptr, nullptr};
+        napi_get_boolean(env, ev->notifRemoveAll, &args[0]);
+        napi_create_string_utf8(env, ev->notifRemoveId.c_str(), ev->notifRemoveId.size(), &args[1]);
+        callBridgeMethod(env, cbObj, "onNotifRemove", 2, args);
+        break;
+    }
+    case BridgeEventKind::PowerReq: {
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_value vSys = nullptr, vDisp = nullptr, vRun = nullptr, vRsn = nullptr;
+        napi_get_boolean(env, ev->powerReq.keepSystem, &vSys);
+        napi_get_boolean(env, ev->powerReq.keepDisplay, &vDisp);
+        napi_get_boolean(env, ev->powerReq.keepRunning, &vRun);
+        napi_create_string_utf8(env, ev->powerReq.reason.c_str(), ev->powerReq.reason.size(), &vRsn);
+        napi_set_named_property(env, obj, "keepSystem", vSys);
+        napi_set_named_property(env, obj, "keepDisplay", vDisp);
+        napi_set_named_property(env, obj, "keepRunning", vRun);
+        napi_set_named_property(env, obj, "reason", vRsn);
+        callBridgeMethod(env, cbObj, "onPowerReq", 1, &obj);
+        break;
+    }
+    case BridgeEventKind::NetWatch:
+        callBridgeMethod(env, cbObj, "onNetWatch", 0, nullptr);
+        break;
     case BridgeEventKind::EngineQuit:
         callBridgeMethod(env, cbObj, "onEngineQuit", 0, nullptr);
         break;
@@ -2245,9 +2402,15 @@ std::vector<std::string> buildEngineEnv(const std::string &pkgRoot) {
     env.push_back("TMPDIR=" + tempDir);
 
     CachedEnv ce;
+    bool onBat = false;
+    bool netOn = true;
+    bool netMet = false;
     {
         std::lock_guard<std::mutex> lk(gEnvMu);
         ce = gCachedEnv;
+        onBat = gOnBattery;
+        netOn = gNetOnline;
+        netMet = gNetMetered;
     }
     if (!ce.pkgId.empty()) {
         env.push_back("MYGO_OHOS_PKG_ID=" + ce.pkgId);
@@ -2273,6 +2436,9 @@ std::vector<std::string> buildEngineEnv(const std::string &pkgRoot) {
     if (!ce.displaysSpec.empty()) {
         env.push_back("MYGO_OHOS_DISPLAYS=" + ce.displaysSpec);
     }
+    env.push_back(std::string("MYGO_OHOS_ON_BATTERY=") + (onBat ? "1" : "0"));
+    env.push_back(std::string("MYGO_OHOS_NET_ONLINE=") + (netOn ? "1" : "0"));
+    env.push_back(std::string("MYGO_OHOS_NET_METERED=") + (netMet ? "1" : "0"));
     return env;
 }
 
@@ -2334,7 +2500,327 @@ bool startEngine(int32_t w, int32_t h, double scale) {
     return true;
 }
 
+// ---------- Shared-Memory SPSC Audio Output (OH_AudioRenderer) ----------
+
+constexpr uint32_t kAudioHeaderBytes  = 64;
+constexpr uint32_t kAudioStateRunning = 0;
+constexpr uint32_t kAudioStateClosed  = 1;
+constexpr uint32_t kAudioStateError   = 2;
+
+struct AudioShmHeader {
+    std::atomic<uint64_t> writeFrames; // [0..7]
+    std::atomic<uint64_t> readFrames;  // [8..15]
+    uint32_t capFrames;                // [16..19]
+    uint32_t targetAhead;              // [20..23]
+    std::atomic<uint32_t> state;       // [24..27]
+    std::atomic<uint32_t> errCode;     // [28..31]
+    std::atomic<uint64_t> heartbeatNs; // [32..39]
+    std::atomic<uint32_t> readSeq;     // [40..43]
+    uint8_t pad[20];                   // [44..63]
+};
+static_assert(sizeof(AudioShmHeader) == kAudioHeaderBytes, "AudioShmHeader size mismatch");
+
+inline void wakeAudioProducer(AudioShmHeader *hdr) {
+    if (hdr == nullptr) {
+        return;
+    }
+    hdr->readSeq.fetch_add(1, std::memory_order_release);
+    syscall(SYS_futex, reinterpret_cast<uint32_t *>(&hdr->readSeq), FUTEX_WAKE, 1, nullptr, nullptr, 0);
+}
+
+void sendMediaCmdWire(uint32_t cmd, int64_t posMs) {
+    uint8_t wire[12] = {0};
+    memcpy(wire + 0, &cmd, 4);
+    memcpy(wire + 4, &posMs, 8);
+    sendMessage(kMediaCmd, wire, sizeof(wire), -1);
+}
+
+struct AudioStreamSession {
+    uint32_t streamId = 0;
+    uint32_t sampleRate = 48000;
+    uint32_t channels = 2;
+    uint32_t capFrames = 0;
+    bool useFloat32 = true;
+    void *shmPtr = nullptr;
+    size_t shmBytes = 0;
+    AudioShmHeader *hdr = nullptr;
+    const float *samples = nullptr;
+    OH_AudioRenderer *renderer = nullptr;
+    std::atomic<bool> closing{false};
+};
+
+std::mutex gAudioMu;
+std::unordered_map<uint32_t, std::shared_ptr<AudioStreamSession>> gAudioStreams;
+
+OH_AudioData_Callback_Result OnAudioWriteData(OH_AudioRenderer *, void *userData,
+                                              void *audioData, int32_t audioDataSize) {
+    auto *as = static_cast<AudioStreamSession *>(userData);
+    if (as == nullptr || audioData == nullptr || audioDataSize <= 0) {
+        return AUDIO_DATA_CALLBACK_RESULT_INVALID;
+    }
+    if (as->closing.load(std::memory_order_acquire) || as->hdr == nullptr || as->samples == nullptr) {
+        memset(audioData, 0, static_cast<size_t>(audioDataSize));
+        return AUDIO_DATA_CALLBACK_RESULT_VALID;
+    }
+
+    AudioShmHeader *hdr = as->hdr;
+    const uint32_t ch = as->channels;
+    const uint32_t cap = as->capFrames;
+    if (ch == 0 || cap == 0 || (cap & (cap - 1)) != 0) {
+        memset(audioData, 0, static_cast<size_t>(audioDataSize));
+        return AUDIO_DATA_CALLBACK_RESULT_VALID;
+    }
+
+    const uint32_t bytesPerFrame = ch * (as->useFloat32 ? 4u : 2u);
+    const uint32_t wantFrames = static_cast<uint32_t>(audioDataSize) / bytesPerFrame;
+    const uint64_t w = hdr->writeFrames.load(std::memory_order_acquire);
+    const uint64_t r = hdr->readFrames.load(std::memory_order_relaxed);
+    const uint32_t avail = (w > r) ? static_cast<uint32_t>(std::min<uint64_t>(w - r, cap)) : 0u;
+    const uint32_t take = std::min<uint32_t>(wantFrames, avail);
+    const uint64_t mask = static_cast<uint64_t>(cap - 1);
+
+    if (as->useFloat32) {
+        float *dst = static_cast<float *>(audioData);
+        if (take > 0) {
+            const uint32_t pos = static_cast<uint32_t>(r & mask);
+            const uint32_t first = std::min<uint32_t>(take, cap - pos);
+            memcpy(dst, as->samples + static_cast<size_t>(pos) * ch, static_cast<size_t>(first) * ch * sizeof(float));
+            const uint32_t second = take - first;
+            if (second > 0) {
+                memcpy(dst + static_cast<size_t>(first) * ch, as->samples,
+                       static_cast<size_t>(second) * ch * sizeof(float));
+            }
+        }
+        const size_t filledBytes = static_cast<size_t>(take) * bytesPerFrame;
+        if (filledBytes < static_cast<size_t>(audioDataSize)) {
+            memset(static_cast<uint8_t *>(audioData) + filledBytes, 0,
+                   static_cast<size_t>(audioDataSize) - filledBytes);
+        }
+    } else {
+        int16_t *dst = static_cast<int16_t *>(audioData);
+        uint32_t outIdx = 0;
+        for (uint32_t f = 0; f < take; ++f) {
+            const size_t srcBase = static_cast<size_t>((r + f) & mask) * ch;
+            for (uint32_t c = 0; c < ch; ++c) {
+                float v = std::clamp(as->samples[srcBase + c], -1.0f, 1.0f);
+                dst[outIdx++] = static_cast<int16_t>(std::lrintf(v * 32767.0f));
+            }
+        }
+        const size_t filledBytes = static_cast<size_t>(take) * bytesPerFrame;
+        if (filledBytes < static_cast<size_t>(audioDataSize)) {
+            memset(static_cast<uint8_t *>(audioData) + filledBytes, 0,
+                   static_cast<size_t>(audioDataSize) - filledBytes);
+        }
+    }
+
+    if (take > 0) {
+        hdr->readFrames.store(r + take, std::memory_order_release);
+    }
+    hdr->heartbeatNs.store(static_cast<uint64_t>(monoNs()), std::memory_order_relaxed);
+    if (take > 0 || hdr->state.load(std::memory_order_relaxed) != kAudioStateRunning) {
+        wakeAudioProducer(hdr);
+    }
+    return AUDIO_DATA_CALLBACK_RESULT_VALID;
+}
+
+void OnAudioInterrupt(OH_AudioRenderer *renderer, void *userData,
+                      OH_AudioInterrupt_ForceType type, OH_AudioInterrupt_Hint hint) {
+    auto *as = static_cast<AudioStreamSession *>(userData);
+    if (as == nullptr || as->closing.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (hint == AUDIOSTREAM_INTERRUPT_HINT_RESUME) {
+        if (renderer != nullptr) {
+            OH_AudioRenderer_Start(renderer);
+        }
+        return;
+    }
+    if (hint == AUDIOSTREAM_INTERRUPT_HINT_PAUSE) {
+        if (type == AUDIOSTREAM_INTERRUPT_SHARE && renderer != nullptr) {
+            OH_AudioRenderer_Pause(renderer);
+        }
+        if (gNowPlayingActive.load(std::memory_order_relaxed) &&
+            (gNowPlayingCmds.load(std::memory_order_relaxed) & kMediaPause) != 0) {
+            sendMediaCmdWire(kMediaPause, 0);
+        }
+        return;
+    }
+    if (hint == AUDIOSTREAM_INTERRUPT_HINT_STOP && as->hdr != nullptr) {
+        as->hdr->errCode.store(static_cast<uint32_t>(AUDIOSTREAM_ERROR_ILLEGAL_STATE), std::memory_order_relaxed);
+        as->hdr->state.store(kAudioStateError, std::memory_order_release);
+        wakeAudioProducer(as->hdr);
+    }
+}
+
+void OnAudioOutputDeviceChange(OH_AudioRenderer *, void *userData,
+                               OH_AudioStream_DeviceChangeReason reason) {
+    auto *as = static_cast<AudioStreamSession *>(userData);
+    if (as == nullptr || as->closing.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (reason == REASON_OLD_DEVICE_UNAVAILABLE &&
+        gNowPlayingActive.load(std::memory_order_relaxed) &&
+        (gNowPlayingCmds.load(std::memory_order_relaxed) & kMediaPause) != 0) {
+        sendMediaCmdWire(kMediaPause, 0);
+    }
+}
+
+void OnAudioError(OH_AudioRenderer *, void *userData, OH_AudioStream_Result error) {
+    auto *as = static_cast<AudioStreamSession *>(userData);
+    if (as == nullptr || as->hdr == nullptr) {
+        return;
+    }
+    OH_LOG_ERROR(LOG_APP, "OH_AudioRenderer error=%{public}d stream=%{public}u",
+                 static_cast<int>(error), as->streamId);
+    as->hdr->errCode.store(static_cast<uint32_t>(error), std::memory_order_relaxed);
+    as->hdr->state.store(kAudioStateError, std::memory_order_release);
+    wakeAudioProducer(as->hdr);
+}
+
+void teardownAudioSession(std::shared_ptr<AudioStreamSession> sp) {
+    if (!sp) {
+        return;
+    }
+    sp->closing.store(true, std::memory_order_release);
+    if (sp->hdr != nullptr) {
+        sp->hdr->state.store(kAudioStateClosed, std::memory_order_release);
+        wakeAudioProducer(sp->hdr);
+    }
+    if (sp->renderer != nullptr) {
+        OH_AudioRenderer_Stop(sp->renderer);
+        OH_AudioRenderer_Release(sp->renderer);
+        sp->renderer = nullptr;
+    }
+    if (sp->shmPtr != nullptr && sp->shmBytes > 0) {
+        munmap(sp->shmPtr, sp->shmBytes);
+        sp->shmPtr = nullptr;
+        sp->hdr = nullptr;
+        sp->samples = nullptr;
+    }
+}
+
+void closeAudioStream(uint32_t streamId) {
+    std::shared_ptr<AudioStreamSession> sp;
+    {
+        std::lock_guard<std::mutex> lk(gAudioMu);
+        auto it = gAudioStreams.find(streamId);
+        if (it != gAudioStreams.end()) {
+            sp = std::move(it->second);
+            gAudioStreams.erase(it);
+        }
+    }
+    teardownAudioSession(std::move(sp));
+}
+
+void closeAllAudioStreams() {
+    std::unordered_map<uint32_t, std::shared_ptr<AudioStreamSession>> all;
+    {
+        std::lock_guard<std::mutex> lk(gAudioMu);
+        all.swap(gAudioStreams);
+    }
+    for (auto &kv : all) {
+        teardownAudioSession(std::move(kv.second));
+    }
+}
+
+void openAudioStream(uint32_t streamId, uint32_t sampleRate, uint32_t channels,
+                     uint32_t latencyMode, uint32_t shmBytes, int shmFd) {
+    if (shmFd < 0) {
+        return;
+    }
+    if (shmBytes <= kAudioHeaderBytes || sampleRate == 0 || channels == 0 || channels > 8) {
+        close(shmFd);
+        return;
+    }
+    void *mapped = mmap(nullptr, shmBytes, PROT_READ | PROT_WRITE, MAP_SHARED, shmFd, 0);
+    close(shmFd);
+    if (mapped == MAP_FAILED || mapped == nullptr) {
+        OH_LOG_ERROR(LOG_APP, "audio mmap failed bytes=%{public}u errno=%{public}d", shmBytes, errno);
+        return;
+    }
+
+    auto sp = std::make_shared<AudioStreamSession>();
+    sp->streamId = streamId;
+    sp->sampleRate = sampleRate;
+    sp->channels = channels;
+    sp->shmPtr = mapped;
+    sp->shmBytes = shmBytes;
+    sp->hdr = static_cast<AudioShmHeader *>(mapped);
+    sp->capFrames = sp->hdr->capFrames;
+    sp->samples = reinterpret_cast<const float *>(static_cast<const uint8_t *>(mapped) + kAudioHeaderBytes);
+
+    const size_t neededBytes = kAudioHeaderBytes + static_cast<size_t>(sp->capFrames) * channels * sizeof(float);
+    if (sp->capFrames == 0 || (sp->capFrames & (sp->capFrames - 1)) != 0 || neededBytes > shmBytes) {
+        sp->hdr->errCode.store(static_cast<uint32_t>(AUDIOSTREAM_ERROR_INVALID_PARAM), std::memory_order_relaxed);
+        sp->hdr->state.store(kAudioStateError, std::memory_order_release);
+        wakeAudioProducer(sp->hdr);
+        teardownAudioSession(std::move(sp));
+        return;
+    }
+
+    auto tryGenerate = [&](OH_AudioStream_SampleFormat fmt, OH_AudioRenderer **outRen) -> OH_AudioStream_Result {
+        OH_AudioStreamBuilder *builder = nullptr;
+        OH_AudioStream_Result res = OH_AudioStreamBuilder_Create(&builder, AUDIOSTREAM_TYPE_RENDERER);
+        if (res != AUDIOSTREAM_SUCCESS || builder == nullptr) {
+            return res == AUDIOSTREAM_SUCCESS ? AUDIOSTREAM_ERROR_SYSTEM : res;
+        }
+        OH_AudioStreamBuilder_SetSamplingRate(builder, static_cast<int32_t>(sampleRate));
+        OH_AudioStreamBuilder_SetChannelCount(builder, static_cast<int32_t>(channels));
+        OH_AudioStreamBuilder_SetSampleFormat(builder, fmt);
+        OH_AudioStreamBuilder_SetEncodingType(builder, AUDIOSTREAM_ENCODING_TYPE_RAW);
+        OH_AudioStreamBuilder_SetRendererInfo(builder, AUDIOSTREAM_USAGE_MUSIC);
+        OH_AudioStreamBuilder_SetLatencyMode(builder, latencyMode == 1 ? AUDIOSTREAM_LATENCY_MODE_FAST
+                                                                       : AUDIOSTREAM_LATENCY_MODE_NORMAL);
+        OH_AudioStreamBuilder_SetRendererWriteDataCallback(builder, OnAudioWriteData, sp.get());
+        OH_AudioStreamBuilder_SetRendererInterruptCallback(builder, OnAudioInterrupt, sp.get());
+        OH_AudioStreamBuilder_SetRendererOutputDeviceChangeCallback(builder, OnAudioOutputDeviceChange, sp.get());
+        OH_AudioStreamBuilder_SetRendererErrorCallback(builder, OnAudioError, sp.get());
+        res = OH_AudioStreamBuilder_GenerateRenderer(builder, outRen);
+        OH_AudioStreamBuilder_Destroy(builder);
+        return res;
+    };
+
+    OH_AudioRenderer *ren = nullptr;
+    OH_AudioStream_Result res = tryGenerate(AUDIOSTREAM_SAMPLE_F32LE, &ren);
+    if (res == AUDIOSTREAM_SUCCESS && ren != nullptr) {
+        sp->useFloat32 = true;
+    } else {
+        res = tryGenerate(AUDIOSTREAM_SAMPLE_S16LE, &ren);
+        sp->useFloat32 = false;
+    }
+    if (res != AUDIOSTREAM_SUCCESS || ren == nullptr) {
+        OH_LOG_ERROR(LOG_APP, "OH_AudioStreamBuilder_GenerateRenderer failed res=%{public}d", static_cast<int>(res));
+        sp->hdr->errCode.store(static_cast<uint32_t>(res), std::memory_order_relaxed);
+        sp->hdr->state.store(kAudioStateError, std::memory_order_release);
+        wakeAudioProducer(sp->hdr);
+        teardownAudioSession(std::move(sp));
+        return;
+    }
+    sp->renderer = ren;
+
+    closeAudioStream(streamId);
+    {
+        std::lock_guard<std::mutex> lk(gAudioMu);
+        gAudioStreams[streamId] = sp;
+    }
+
+    res = OH_AudioRenderer_Start(ren);
+    if (res != AUDIOSTREAM_SUCCESS) {
+        OH_LOG_ERROR(LOG_APP, "OH_AudioRenderer_Start failed res=%{public}d", static_cast<int>(res));
+        sp->hdr->errCode.store(static_cast<uint32_t>(res), std::memory_order_relaxed);
+        sp->hdr->state.store(kAudioStateError, std::memory_order_release);
+        wakeAudioProducer(sp->hdr);
+        closeAudioStream(streamId);
+        return;
+    }
+    OH_LOG_INFO(LOG_APP, "audio stream=%{public}u started rate=%{public}u ch=%{public}u f32=%{public}d cap=%{public}u",
+                streamId, sampleRate, channels, sp->useFloat32 ? 1 : 0, sp->capFrames);
+}
+
 void killEngine() {
+    closeAllAudioStreams();
+    gNowPlayingActive.store(false, std::memory_order_relaxed);
+    gNowPlayingCmds.store(0, std::memory_order_relaxed);
     int fd = -1;
     {
         std::lock_guard<std::mutex> lk(sendMu);
@@ -2356,7 +2842,8 @@ void killEngine() {
     }
 }
 
-int recvMessage(uint8_t *kind, std::vector<uint8_t> *payload, int timeoutMs) {
+int recvMessage(uint8_t *kind, std::vector<uint8_t> *payload, int *outFd, int timeoutMs) {
+    *outFd = -1;
     int fd = -1;
     {
         std::lock_guard<std::mutex> lk(sendMu);
@@ -2376,18 +2863,66 @@ int recvMessage(uint8_t *kind, std::vector<uint8_t> *payload, int timeoutMs) {
     if (p == 0) {
         return 0;
     }
-    uint8_t hdr[5];
-    if (!readFull(fd, hdr, sizeof(hdr))) {
+
+    uint8_t hdr[5] = {0};
+    struct iovec iov;
+    iov.iov_base = hdr;
+    iov.iov_len = sizeof(hdr);
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    memset(cbuf, 0, sizeof(cbuf));
+    struct msghdr mh;
+    memset(&mh, 0, sizeof(mh));
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = cbuf;
+    mh.msg_controllen = sizeof(cbuf);
+
+    ssize_t r = 0;
+    for (;;) {
+        r = recvmsg(fd, &mh, MSG_CMSG_CLOEXEC);
+        if (r < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+    if (r <= 0) {
         return -1;
     }
+    for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm != nullptr; cm = CMSG_NXTHDR(&mh, cm)) {
+        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
+            cm->cmsg_len >= CMSG_LEN(sizeof(int))) {
+            int passed = -1;
+            memcpy(&passed, CMSG_DATA(cm), sizeof(int));
+            *outFd = passed;
+            break;
+        }
+    }
+    if (static_cast<size_t>(r) < sizeof(hdr)) {
+        if (!readFull(fd, hdr + r, sizeof(hdr) - static_cast<size_t>(r))) {
+            if (*outFd >= 0) {
+                close(*outFd);
+                *outFd = -1;
+            }
+            return -1;
+        }
+    }
+
     uint32_t len = 0;
     memcpy(&len, hdr + 1, 4);
     if (len > (64u << 20)) {
+        if (*outFd >= 0) {
+            close(*outFd);
+            *outFd = -1;
+        }
         return -1;
     }
     *kind = hdr[0];
     payload->resize(len);
     if (len > 0 && !readFull(fd, payload->data(), len)) {
+        if (*outFd >= 0) {
+            close(*outFd);
+            *outFd = -1;
+        }
         return -1;
     }
     return 1;
@@ -2596,6 +3131,67 @@ void sendClipDataFallback(uint32_t reqId, const std::string &errStr) {
     sendMessage(kClipData, wire.data(), static_cast<uint32_t>(wire.size()), -1);
 }
 
+void sendNotifResultWire(uint32_t reqId, bool denied, const std::string &errStr) {
+    std::vector<uint8_t> wire(8, 0);
+    memcpy(wire.data() + 0, &reqId, 4);
+    wire[4] = denied ? 1 : 0;
+    appendStr(wire, errStr);
+    sendMessage(kNotifResult, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+}
+
+bool decodeNowPlaying(const std::vector<uint8_t> &p, NowPlayingData *out) {
+    if (p.size() < 32) {
+        return false;
+    }
+    out->active = p[0] != 0;
+    out->state = p[1];
+    out->metaChanged = p[2] != 0;
+    memcpy(&out->commands, p.data() + 4, 4);
+    memcpy(&out->durationMs, p.data() + 8, 8);
+    memcpy(&out->positionMs, p.data() + 16, 8);
+    memcpy(&out->rate, p.data() + 24, 8);
+    size_t off = 32;
+    if (!readStr(p, off, &out->title) ||
+        !readStr(p, off, &out->artist) ||
+        !readStr(p, off, &out->album) ||
+        !readBytes(p, off, &out->artwork)) {
+        return false;
+    }
+    return off == p.size();
+}
+
+bool decodeNotifShow(const std::vector<uint8_t> &p, NotifShowData *out) {
+    if (p.size() < 8) {
+        return false;
+    }
+    memcpy(&out->reqId, p.data() + 0, 4);
+    out->silent = p[4] != 0;
+    size_t off = 8;
+    if (!readStr(p, off, &out->id) ||
+        !readStr(p, off, &out->title) ||
+        !readStr(p, off, &out->subtitle) ||
+        !readStr(p, off, &out->body) ||
+        !readStr(p, off, &out->group) ||
+        !readBytes(p, off, &out->image)) {
+        return false;
+    }
+    return off == p.size();
+}
+
+bool decodePowerReq(const std::vector<uint8_t> &p, PowerReqData *out) {
+    if (p.size() < 4) {
+        return false;
+    }
+    out->keepSystem = p[0] != 0;
+    out->keepDisplay = p[1] != 0;
+    out->keepRunning = p[2] != 0;
+    size_t off = 4;
+    if (!readStr(p, off, &out->reason)) {
+        return false;
+    }
+    return off == p.size();
+}
+
 void resetAllPendingBuffers() {
     std::vector<std::shared_ptr<WinSession>> list;
     {
@@ -2620,11 +3216,19 @@ void sendInitialStateToEngine() {
     std::vector<uint8_t> envWire;
     std::vector<uint8_t> clipWire;
     std::vector<std::vector<uint8_t>> appOpens;
+    std::vector<std::vector<uint8_t>> notifClicks;
+    bool onBat = false;
+    bool netOn = true;
+    bool netMet = false;
     {
         std::lock_guard<std::mutex> lk(gEnvMu);
         envWire = gCachedEnv.wirePayload;
         clipWire = gCachedClipWire;
         appOpens.swap(gPendingAppOpens);
+        notifClicks.swap(gPendingNotifClicks);
+        onBat = gOnBattery;
+        netOn = gNetOnline;
+        netMet = gNetMetered;
     }
     if (!envWire.empty()) {
         sendMessage(kEnvInfo, envWire.data(), static_cast<uint32_t>(envWire.size()), -1);
@@ -2632,9 +3236,24 @@ void sendInitialStateToEngine() {
     if (!clipWire.empty()) {
         sendMessage(kClipChanged, clipWire.data(), static_cast<uint32_t>(clipWire.size()), -1);
     }
+    {
+        std::vector<uint8_t> pwrWire(4, 0);
+        pwrWire[0] = onBat ? 1 : 0;
+        appendU32(pwrWire, 0);
+        sendMessage(kPowerState, pwrWire.data(), static_cast<uint32_t>(pwrWire.size()), -1);
+    }
+    {
+        uint8_t netWire[4] = {static_cast<uint8_t>(netOn ? 1 : 0), static_cast<uint8_t>(netMet ? 1 : 0), 0, 0};
+        sendMessage(kNetState, netWire, sizeof(netWire), -1);
+    }
     for (const auto &ao : appOpens) {
         if (!ao.empty()) {
             sendMessage(kAppOpen, ao.data(), static_cast<uint32_t>(ao.size()), -1);
+        }
+    }
+    for (const auto &nc : notifClicks) {
+        if (!nc.empty()) {
+            sendMessage(kNotifClicked, nc.data(), static_cast<uint32_t>(nc.size()), -1);
         }
     }
     sendWindowInput(1, currentDark ? kWinThemeDark : kWinThemeLight);
@@ -2657,17 +3276,24 @@ bool pumpEngineMessages() {
             return false;
         }
         uint8_t kind = 0;
-        int got = recvMessage(&kind, &payload, 250);
+        int inFd = -1;
+        int got = recvMessage(&kind, &payload, &inFd, 250);
         if (got == 0) {
             continue;
         }
         if (got < 0) {
+            closeAllAudioStreams();
             return !gSupervisorRunning.load() || gEngineCleanQuit.load();
+        }
+        if (inFd >= 0 && kind != kAudioOpen) {
+            close(inFd);
+            inFd = -1;
         }
 
         switch (kind) {
         case kQuit: {
             gEngineCleanQuit.store(true);
+            closeAllAudioStreams();
             resetAllPendingBuffers();
             auto ev = std::make_unique<BridgeEvent>();
             ev->kind = BridgeEventKind::EngineQuit;
@@ -2851,6 +3477,80 @@ bool pumpEngineMessages() {
                     sendShellResult(reqId, "ohos: malformed shell request");
                 }
             }
+            break;
+        }
+        case kAudioOpen: {
+            if (payload.size() == 20 && inFd >= 0) {
+                uint32_t streamId = 0, rate = 0, ch = 0, latMode = 0, shmBytes = 0;
+                memcpy(&streamId, payload.data() + 0, 4);
+                memcpy(&rate, payload.data() + 4, 4);
+                memcpy(&ch, payload.data() + 8, 4);
+                memcpy(&latMode, payload.data() + 12, 4);
+                memcpy(&shmBytes, payload.data() + 16, 4);
+                openAudioStream(streamId, rate, ch, latMode, shmBytes, inFd);
+                inFd = -1;
+            } else if (inFd >= 0) {
+                close(inFd);
+                inFd = -1;
+            }
+            break;
+        }
+        case kAudioClose: {
+            if (payload.size() == 4) {
+                uint32_t streamId = 0;
+                memcpy(&streamId, payload.data(), 4);
+                closeAudioStream(streamId);
+            }
+            break;
+        }
+        case kNowPlaying: {
+            auto ev = std::make_unique<BridgeEvent>();
+            ev->kind = BridgeEventKind::NowPlaying;
+            if (decodeNowPlaying(payload, &ev->nowPlaying)) {
+                gNowPlayingActive.store(ev->nowPlaying.active, std::memory_order_relaxed);
+                gNowPlayingCmds.store(ev->nowPlaying.active ? ev->nowPlaying.commands : 0u, std::memory_order_relaxed);
+                postBridgeEvent(std::move(ev));
+            }
+            break;
+        }
+        case kNotifShow: {
+            auto ev = std::make_unique<BridgeEvent>();
+            ev->kind = BridgeEventKind::NotifShow;
+            if (decodeNotifShow(payload, &ev->notifShow)) {
+                postBridgeEvent(std::move(ev));
+            } else if (payload.size() >= 4) {
+                uint32_t reqId = 0;
+                memcpy(&reqId, payload.data(), 4);
+                sendNotifResultWire(reqId, false, "ohos: malformed notification request");
+            }
+            break;
+        }
+        case kNotifRemove: {
+            if (payload.size() >= 4) {
+                size_t off = 4;
+                std::string id;
+                if (readStr(payload, off, &id) && off == payload.size()) {
+                    auto ev = std::make_unique<BridgeEvent>();
+                    ev->kind = BridgeEventKind::NotifRemove;
+                    ev->notifRemoveAll = payload[0] != 0;
+                    ev->notifRemoveId = std::move(id);
+                    postBridgeEvent(std::move(ev));
+                }
+            }
+            break;
+        }
+        case kPowerReq: {
+            auto ev = std::make_unique<BridgeEvent>();
+            ev->kind = BridgeEventKind::PowerReq;
+            if (decodePowerReq(payload, &ev->powerReq)) {
+                postBridgeEvent(std::move(ev));
+            }
+            break;
+        }
+        case kNetWatch: {
+            auto ev = std::make_unique<BridgeEvent>();
+            ev->kind = BridgeEventKind::NetWatch;
+            postBridgeEvent(std::move(ev));
             break;
         }
         default:
@@ -3752,6 +4452,101 @@ napi_value NotifyAppOpen(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+napi_value NotifyMediaCmd(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return nullptr;
+    }
+    uint32_t cmd = 0;
+    double posMsD = 0;
+    napi_get_value_uint32(env, argv[0], &cmd);
+    napi_get_value_double(env, argv[1], &posMsD);
+    sendMediaCmdWire(cmd, static_cast<int64_t>(std::llround(posMsD)));
+    return nullptr;
+}
+
+napi_value ResolveNotif(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) {
+        return nullptr;
+    }
+    uint32_t reqId = 0;
+    bool denied = false;
+    napi_get_value_uint32(env, argv[0], &reqId);
+    napi_get_value_bool(env, argv[1], &denied);
+    std::string errStr = getNapiString(env, argv[2]);
+    sendNotifResultWire(reqId, denied, errStr);
+    return nullptr;
+}
+
+napi_value NotifyNotifClicked(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return nullptr;
+    }
+    std::string id = getNapiString(env, argv[0]);
+    if (id.empty()) {
+        return nullptr;
+    }
+    std::vector<uint8_t> wire;
+    appendStr(wire, id);
+    if (!sendMessage(kNotifClicked, wire.data(), static_cast<uint32_t>(wire.size()), -1)) {
+        std::lock_guard<std::mutex> lk(gEnvMu);
+        if (gPendingNotifClicks.size() < 32) {
+            gPendingNotifClicks.push_back(std::move(wire));
+        }
+    }
+    return nullptr;
+}
+
+napi_value NotifyPowerState(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return nullptr;
+    }
+    bool onBat = false;
+    napi_get_value_bool(env, argv[0], &onBat);
+    std::string evStr = getNapiString(env, argv[1]);
+    {
+        std::lock_guard<std::mutex> lk(gEnvMu);
+        gOnBattery = onBat;
+    }
+    std::vector<uint8_t> wire(4, 0);
+    wire[0] = onBat ? 1 : 0;
+    appendStr(wire, evStr);
+    sendMessage(kPowerState, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+    return nullptr;
+}
+
+napi_value NotifyNetState(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return nullptr;
+    }
+    bool online = true;
+    bool metered = false;
+    napi_get_value_bool(env, argv[0], &online);
+    napi_get_value_bool(env, argv[1], &metered);
+    {
+        std::lock_guard<std::mutex> lk(gEnvMu);
+        gNetOnline = online;
+        gNetMetered = metered;
+    }
+    uint8_t wire[4] = {static_cast<uint8_t>(online ? 1 : 0), static_cast<uint8_t>(metered ? 1 : 0), 0, 0};
+    sendMessage(kNetState, wire, sizeof(wire), -1);
+    return nullptr;
+}
+
 napi_value SetDarkMode(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1] = {nullptr};
@@ -3792,6 +4587,11 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"resolveDialog", nullptr, ResolveDialog, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"resolveShell", nullptr, ResolveShell, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"notifyAppOpen", nullptr, NotifyAppOpen, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"notifyMediaCmd", nullptr, NotifyMediaCmd, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"resolveNotif", nullptr, ResolveNotif, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"notifyNotifClicked", nullptr, NotifyNotifClicked, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"notifyPowerState", nullptr, NotifyPowerState, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"notifyNetState", nullptr, NotifyNetState, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setDarkMode", nullptr, SetDarkMode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"crash", nullptr, Crash, nullptr, nullptr, nullptr, napi_default, nullptr},
     };

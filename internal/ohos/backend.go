@@ -14,7 +14,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
+	"github.com/egoist/mygo/internal/ohosaudio"
 	"github.com/egoist/mygo/internal/platform"
 	"github.com/egoist/mygo/internal/unsupported"
 )
@@ -66,9 +68,32 @@ type Backend struct {
 	pendingDialogs  map[uint32]pendingDialog
 	nextShellReq    uint32
 	shellResults    map[uint32]string
-	readyDone       bool
-	pendingAppOpens []appOpenEvent
-	schemes         map[string]bool
+	readyDone          bool
+	pendingAppOpens    []appOpenEvent
+	pendingNotifClicks []string
+	schemes            map[string]bool
+
+	npActive  bool
+	npHasMeta bool
+	npTitle   string
+	npArtist  string
+	npAlbum   string
+	npArtLen  int
+	npArtSum  [32]byte
+
+	nextNotifReq  uint32
+	pendingNotifs map[uint32]func(error)
+
+	powerWatching bool
+	nextPowerHold uint64
+	wakeHolds     map[uint64]wakeHold
+	runHolds      map[uint64]string
+	lastPowerReq  powerReqWire
+	onBattery     bool
+	lastInputAt   time.Time
+
+	netWatching bool
+	netStatus   platform.NetworkStatus
 }
 
 // New returns the backend from the arguments and environment the host started
@@ -76,9 +101,10 @@ type Backend struct {
 // size and scale, and packaged app / display / locale metadata.
 func New() *Backend {
 	b := &Backend{
-		fd:        3,
-		initScale: 1,
-		windows:   make(map[uint32]*Window),
+		fd:          3,
+		initScale:   1,
+		windows:     make(map[uint32]*Window),
+		lastInputAt: time.Now(),
 	}
 	b.mainTID.Store(int64(syscall.Getpid()))
 	b.cond = sync.NewCond(&b.mu)
@@ -112,9 +138,10 @@ func New() *Backend {
 // NewWithFD is New for a process or test the host gave another descriptor.
 func NewWithFD(fd int) *Backend {
 	b := &Backend{
-		fd:        fd,
-		initScale: 1,
-		windows:   make(map[uint32]*Window),
+		fd:          fd,
+		initScale:   1,
+		windows:     make(map[uint32]*Window),
+		lastInputAt: time.Now(),
 	}
 	b.mainTID.Store(int64(syscall.Getpid()))
 	b.cond = sync.NewCond(&b.mu)
@@ -181,6 +208,7 @@ func (b *Backend) Init(h platform.AppHandler, opts platform.AppOptions) error {
 	}
 	b.mu.Unlock()
 	b.conn = &conn{fd: b.fd}
+	ohosaudio.SetBridge(b)
 	return nil
 }
 
@@ -239,7 +267,8 @@ func (b *Backend) popNextLocked() (event, bool) {
 			k := b.events[i].kind
 			switch k {
 			case kindInput, kindPopupResult, kindEnvInfo,
-				kindClipChanged, kindClipData, kindDialogResult, kindShellResult, kindAppOpen:
+				kindClipChanged, kindClipData, kindDialogResult, kindShellResult, kindAppOpen,
+				kindMediaCmd, kindNotifResult, kindNotifClicked, kindPowerState, kindNetState:
 				idx = i
 			case kindQuit, kindSurface:
 				i = len(b.events)
@@ -331,6 +360,7 @@ func (b *Backend) Signal() {
 }
 
 func (b *Backend) Quit() {
+	ohosaudio.ClearBridge(b)
 	if b.IsMainThread() {
 		b.syncOwnedClipboardToHost()
 	}
@@ -486,6 +516,16 @@ func (b *Backend) dispatch(ev event) {
 		b.onShellResult(ev.payload)
 	case kindAppOpen:
 		b.onAppOpen(ev.payload)
+	case kindMediaCmd:
+		b.onMediaCmd(ev.payload)
+	case kindNotifResult:
+		b.onNotifResult(ev.payload)
+	case kindNotifClicked:
+		b.onNotifClicked(ev.payload)
+	case kindPowerState:
+		b.onPowerState(ev.payload)
+	case kindNetState:
+		b.onNetState(ev.payload)
 	}
 }
 

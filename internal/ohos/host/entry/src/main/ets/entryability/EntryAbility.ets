@@ -55,6 +55,14 @@ export default class EntryAbility extends UIAbility {
     hostBridge.destroyStage();
   }
 
+  onForeground(): void {
+    hostBridge.onAppForeground();
+  }
+
+  onBackground(): void {
+    hostBridge.onAppBackground();
+  }
+
   onDestroy(): void {
     hilog.info(DOMAIN, TAG, 'onDestroy');
   }

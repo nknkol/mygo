@@ -1,4 +1,4 @@
-//go:build linux && arm64 && mygo_ohos
+//go:build linux && (amd64 || arm64) && mygo_ohos
 
 package mygo
 

@@ -7,16 +7,23 @@ import host, {
   HostFileFilter,
   HostMenuItem,
   HostMessageBox,
+  HostNotifShow,
+  HostNowPlaying,
+  HostPowerReq,
   HostWinConfig
 } from 'libmygo_host.so';
-import { Permissions, Want, abilityAccessCtrl, bundleManager, common } from '@kit.AbilityKit';
+import { Permissions, Want, WantAgent, abilityAccessCtrl, bundleManager, common, wantAgent } from '@kit.AbilityKit';
+import { avSession } from '@kit.AVSessionKit';
 import { preferences } from '@kit.ArkData';
 import { util } from '@kit.ArkTS';
 import { display, window } from '@kit.ArkUI';
-import { BusinessError, pasteboard } from '@kit.BasicServicesKit';
+import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
+import { BusinessError, batteryInfo, commonEventManager, pasteboard } from '@kit.BasicServicesKit';
 import { fileIo, fileShare, fileUri, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { i18n } from '@kit.LocalizationKit';
+import { connection } from '@kit.NetworkKit';
+import { notificationManager } from '@kit.NotificationKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const DOMAIN: number = 0x0000;
@@ -87,6 +94,26 @@ const SHELL_TRASH: number = 4;
 const APP_OPEN_URLS: number = 1;
 const APP_OPEN_FILES: number = 2;
 const APP_OPEN_ACTIVATE: number = 3;
+
+const MEDIA_CMD_PLAY: number = 1 << 0;
+const MEDIA_CMD_PAUSE: number = 1 << 1;
+const MEDIA_CMD_TOGGLE: number = 1 << 2;
+const MEDIA_CMD_STOP: number = 1 << 3;
+const MEDIA_CMD_NEXT: number = 1 << 4;
+const MEDIA_CMD_PREV: number = 1 << 5;
+const MEDIA_CMD_SEEK: number = 1 << 6;
+
+const NOTIF_PARAM_KEY: string = 'mygoNotificationId';
+
+function hashNotifId(id: string): number {
+  let h: number = 0x811c9dc5;
+  for (let i: number = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  const pos: number = h & 0x7fffffff;
+  return pos > 0 ? pos : 1;
+}
 
 const PREF_STORE_NAME: string = 'mygo_file_perms';
 const PREF_KEY_URIS: string = 'persisted_uris';
@@ -171,6 +198,22 @@ class HostBridgeManager {
   private callbacksRegistered: boolean = false;
   private lastSelfChangeCount: number = -1;
   private tokenId: number = 0;
+  private bundleName: string = 'dev.egoist.music';
+  private bundleLabel: string = 'MyGo';
+  private mediaSession: avSession.AVSession | undefined = undefined;
+  private mediaCoverPm: image.PixelMap | undefined = undefined;
+  private mediaMetaCache: avSession.AVMetadata | undefined = undefined;
+  private registeredMediaCmds: number = 0;
+  private avChain: Promise<void> = Promise.resolve();
+  private npPlaying: boolean = false;
+  private powerKeepDisplay: boolean = false;
+  private powerKeepRunning: boolean = false;
+  private bgRunningActive: boolean = false;
+  private bgChain: Promise<void> = Promise.resolve();
+  private notifPermAsked: boolean = false;
+  private powerSubscriber: commonEventManager.CommonEventSubscriber | undefined = undefined;
+  private netConn: connection.NetConnection | undefined = undefined;
+  private netWatching: boolean = false;
   private pasteboardUpdateHandler: () => void = (): void => {
     this.onSystemPasteboardUpdated();
   };
@@ -181,8 +224,17 @@ class HostBridgeManager {
       const bInfo: bundleManager.BundleInfo = bundleManager.getBundleInfoForSelfSync(
         bundleManager.BundleFlag.GET_BUNDLE_INFO_WITH_APPLICATION
       );
+      if (bInfo.name.length > 0) {
+        this.bundleName = bInfo.name;
+      }
       if (bInfo.appInfo !== undefined) {
         this.tokenId = bInfo.appInfo.accessTokenId;
+        try {
+          const lbl: string = ctx.resourceManager.getStringSync(bInfo.appInfo.labelResource);
+          if (lbl.length > 0) {
+            this.bundleLabel = lbl;
+          }
+        } catch (_) {}
       }
     } catch (_) {}
 
@@ -219,6 +271,21 @@ class HostBridgeManager {
         onShellReq: (reqId: number, op: number, target: string): void => {
           this.handleShellReq(reqId, op, target);
         },
+        onNowPlaying: (np: HostNowPlaying): void => {
+          this.handleNowPlaying(np);
+        },
+        onNotifShow: (notif: HostNotifShow): void => {
+          this.handleNotifShow(notif);
+        },
+        onNotifRemove: (all: boolean, id: string): void => {
+          this.handleNotifRemove(all, id);
+        },
+        onPowerReq: (req: HostPowerReq): void => {
+          this.handlePowerReq(req);
+        },
+        onNetWatch: (): void => {
+          this.handleNetWatch();
+        },
         onEngineQuit: (): void => {
           this.handleEngineQuit();
         },
@@ -231,10 +298,24 @@ class HostBridgeManager {
     this.refreshEnvAndDisplays();
     this.registerDisplayListeners();
     this.registerPasteboardListener();
+    this.registerPowerEvents();
+    this.queryAndNotifyNetState();
     this.reactivatePersistedUris();
   }
 
+  onAppForeground(): void {
+    host.notifyWindowEvent(1, WIN_OP_SHOW);
+  }
+
+  onAppBackground(): void {
+    host.notifyWindowEvent(1, WIN_OP_HIDE);
+  }
+
   handleWant(want: Want, isNewWant: boolean): void {
+    const notifParam: Object | undefined = want.parameters?.[NOTIF_PARAM_KEY];
+    if (typeof notifParam === 'string' && notifParam.length > 0) {
+      host.notifyNotifClicked(notifParam);
+    }
     const rawUri: string = (want.uri ?? '').trim();
     if (rawUri.length > 0) {
       if (rawUri.toLowerCase().startsWith('file://')) {
@@ -287,12 +368,18 @@ class HostBridgeManager {
     if (mw.cfg !== undefined) {
       this.applyWindowConfig(mw, mw.cfg, CFG_MASK_ALL, true);
     }
+    if (this.powerKeepDisplay) {
+      try { mw.win.setWindowKeepScreenOn(true).catch((): void => {}); } catch (_) {}
+    }
     this.flushPendingActions(mw);
   }
 
   destroyStage(): void {
     this.unregisterDisplayListeners();
     this.unregisterPasteboardListener();
+    this.unregisterPowerEvents();
+    this.unregisterNetWatch();
+    this.teardownAVSessionAndBackground();
     this.windows.forEach((mw: ManagedWindow): void => {
       this.detachWindowListeners(mw);
     });
@@ -1656,6 +1743,11 @@ class HostBridgeManager {
   }
 
   private handleEngineRestart(): void {
+    this.npPlaying = false;
+    this.powerKeepDisplay = false;
+    this.powerKeepRunning = false;
+    this.applyKeepScreenOn(false);
+    this.syncBackgroundRunning();
     const staleIds: number[] = [];
     this.windows.forEach((_mw: ManagedWindow, id: number): void => {
       if (id >= 2) {
@@ -1664,6 +1756,547 @@ class HostBridgeManager {
     });
     for (let i: number = 0; i < staleIds.length; i++) {
       this.cleanupClosedSubWindow(staleIds[i]);
+    }
+  }
+
+  // ---------- AVSession, Notifications, Power & Network ----------
+
+  private async buildLaunchWantAgent(extraParams?: Record<string, Object>): Promise<WantAgent | undefined> {
+    if (this.context === undefined) {
+      return undefined;
+    }
+    const wantInfo: wantAgent.WantAgentInfo = {
+      wants: [
+        {
+          bundleName: this.bundleName,
+          abilityName: 'EntryAbility',
+          parameters: extraParams
+        }
+      ],
+      actionType: wantAgent.OperationType.START_ABILITY,
+      requestCode: 0,
+      actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
+    };
+    try {
+      return await wantAgent.getWantAgent(wantInfo);
+    } catch (_) {
+      return undefined;
+    }
+  }
+
+  private handleNowPlaying(np: HostNowPlaying): void {
+    this.avChain = this.avChain.then((): Promise<void> => {
+      return this.applyNowPlayingAsync(np);
+    }).catch((err: BusinessError): void => {
+      hilog.error(DOMAIN, TAG, 'applyNowPlayingAsync failed: %{public}s', JSON.stringify(err));
+    });
+  }
+
+  private clearAVSessionListeners(session: avSession.AVSession): void {
+    if ((this.registeredMediaCmds & (MEDIA_CMD_PLAY | MEDIA_CMD_TOGGLE)) !== 0) {
+      try { session.off('play'); } catch (_) {}
+    }
+    if ((this.registeredMediaCmds & (MEDIA_CMD_PAUSE | MEDIA_CMD_TOGGLE)) !== 0) {
+      try { session.off('pause'); } catch (_) {}
+    }
+    if ((this.registeredMediaCmds & MEDIA_CMD_STOP) !== 0) {
+      try { session.off('stop'); } catch (_) {}
+    }
+    if ((this.registeredMediaCmds & MEDIA_CMD_NEXT) !== 0) {
+      try { session.off('playNext'); } catch (_) {}
+    }
+    if ((this.registeredMediaCmds & MEDIA_CMD_PREV) !== 0) {
+      try { session.off('playPrevious'); } catch (_) {}
+    }
+    if ((this.registeredMediaCmds & MEDIA_CMD_SEEK) !== 0) {
+      try { session.off('seek'); } catch (_) {}
+    }
+    this.registeredMediaCmds = 0;
+  }
+
+  private syncAVSessionListeners(session: avSession.AVSession, cmds: number): void {
+    if (cmds === this.registeredMediaCmds) {
+      return;
+    }
+    this.clearAVSessionListeners(session);
+
+    if ((cmds & (MEDIA_CMD_PLAY | MEDIA_CMD_TOGGLE)) !== 0) {
+      const sendCmd: number = (cmds & MEDIA_CMD_PLAY) !== 0 ? MEDIA_CMD_PLAY : MEDIA_CMD_TOGGLE;
+      try {
+        session.on('play', (): void => {
+          host.notifyMediaCmd(sendCmd, 0);
+        });
+      } catch (_) {}
+    }
+    if ((cmds & (MEDIA_CMD_PAUSE | MEDIA_CMD_TOGGLE)) !== 0) {
+      const sendCmd: number = (cmds & MEDIA_CMD_PAUSE) !== 0 ? MEDIA_CMD_PAUSE : MEDIA_CMD_TOGGLE;
+      try {
+        session.on('pause', (): void => {
+          host.notifyMediaCmd(sendCmd, 0);
+        });
+      } catch (_) {}
+    }
+    if ((cmds & MEDIA_CMD_STOP) !== 0) {
+      try {
+        session.on('stop', (): void => {
+          host.notifyMediaCmd(MEDIA_CMD_STOP, 0);
+        });
+      } catch (_) {}
+    }
+    if ((cmds & MEDIA_CMD_NEXT) !== 0) {
+      try {
+        session.on('playNext', (): void => {
+          host.notifyMediaCmd(MEDIA_CMD_NEXT, 0);
+        });
+      } catch (_) {}
+    }
+    if ((cmds & MEDIA_CMD_PREV) !== 0) {
+      try {
+        session.on('playPrevious', (): void => {
+          host.notifyMediaCmd(MEDIA_CMD_PREV, 0);
+        });
+      } catch (_) {}
+    }
+    if ((cmds & MEDIA_CMD_SEEK) !== 0) {
+      try {
+        session.on('seek', (timeMs: number): void => {
+          host.notifyMediaCmd(MEDIA_CMD_SEEK, timeMs);
+        });
+      } catch (_) {}
+    }
+    this.registeredMediaCmds = cmds;
+  }
+
+  private async applyNowPlayingAsync(np: HostNowPlaying): Promise<void> {
+    if (this.context === undefined) {
+      return;
+    }
+    if (!np.active) {
+      this.npPlaying = false;
+      this.syncBackgroundRunning();
+      if (this.mediaSession !== undefined) {
+        this.clearAVSessionListeners(this.mediaSession);
+        try {
+          await this.mediaSession.setAVPlaybackState({
+            state: avSession.PlaybackState.PLAYBACK_STATE_STOP
+          });
+        } catch (_) {}
+        try { await this.mediaSession.deactivate(); } catch (_) {}
+      }
+      if (this.mediaCoverPm !== undefined) {
+        try { await this.mediaCoverPm.release(); } catch (_) {}
+        this.mediaCoverPm = undefined;
+      }
+      this.mediaMetaCache = undefined;
+      return;
+    }
+
+    let createdSession: boolean = false;
+    if (this.mediaSession === undefined) {
+      this.mediaSession = await avSession.createAVSession(this.context, 'MyGoAudio', 'audio');
+      createdSession = true;
+      const agent: WantAgent | undefined = await this.buildLaunchWantAgent();
+      if (agent !== undefined) {
+        try { await this.mediaSession.setLaunchAbility(agent); } catch (_) {}
+      }
+    }
+
+    if (np.metaChanged || (createdSession && this.mediaMetaCache !== undefined)) {
+      if (np.metaChanged) {
+        let newPm: image.PixelMap | undefined = undefined;
+        if (np.artwork.byteLength > 0) {
+          let imgSrc: image.ImageSource | undefined = undefined;
+          try {
+            imgSrc = image.createImageSource(np.artwork);
+            newPm = await imgSrc.createPixelMap();
+          } catch (_) {
+          } finally {
+            if (imgSrc !== undefined) {
+              try { await imgSrc.release(); } catch (_) {}
+            }
+          }
+        }
+        if (this.mediaCoverPm !== undefined) {
+          try { await this.mediaCoverPm.release(); } catch (_) {}
+        }
+        this.mediaCoverPm = newPm;
+
+        const meta: avSession.AVMetadata = {
+          assetId: 'mygo-current',
+          title: np.title.length > 0 ? np.title : this.bundleLabel
+        };
+        if (np.artist.length > 0) {
+          meta.artist = np.artist;
+        }
+        if (np.album.length > 0) {
+          meta.album = np.album;
+        }
+        if (np.durationMs > 0) {
+          meta.duration = Math.round(np.durationMs);
+        }
+        if (newPm !== undefined) {
+          meta.mediaImage = newPm;
+        }
+        this.mediaMetaCache = meta;
+      } else if (this.mediaMetaCache !== undefined && np.durationMs > 0) {
+        this.mediaMetaCache.duration = Math.round(np.durationMs);
+      }
+      if (this.mediaMetaCache !== undefined) {
+        try {
+          await this.mediaSession.setAVMetadata(this.mediaMetaCache);
+        } catch (e) {
+          hilog.error(DOMAIN, TAG, 'setAVMetadata failed: %{public}s', JSON.stringify(e));
+        }
+      }
+    }
+
+    this.syncAVSessionListeners(this.mediaSession, np.commands);
+
+    let pbStateEnum: avSession.PlaybackState = avSession.PlaybackState.PLAYBACK_STATE_STOP;
+    if (np.state === 1) {
+      pbStateEnum = avSession.PlaybackState.PLAYBACK_STATE_PLAY;
+    } else if (np.state === 2) {
+      pbStateEnum = avSession.PlaybackState.PLAYBACK_STATE_PAUSE;
+    }
+    const pb: avSession.AVPlaybackState = {
+      state: pbStateEnum,
+      speed: np.rate > 0 ? np.rate : 1.0,
+      position: {
+        elapsedTime: Math.max(0, Math.round(np.positionMs)),
+        updateTime: Date.now()
+      }
+    };
+    if (np.durationMs > 0) {
+      pb.duration = Math.round(np.durationMs);
+    }
+    try {
+      await this.mediaSession.setAVPlaybackState(pb);
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'setAVPlaybackState failed: %{public}s', JSON.stringify(e));
+    }
+    try {
+      await this.mediaSession.activate();
+    } catch (_) {}
+
+    this.npPlaying = np.state === 1;
+    this.syncBackgroundRunning();
+  }
+
+  private teardownAVSessionAndBackground(): void {
+    this.npPlaying = false;
+    this.powerKeepDisplay = false;
+    this.powerKeepRunning = false;
+    this.syncBackgroundRunning();
+    const sess: avSession.AVSession | undefined = this.mediaSession;
+    this.mediaSession = undefined;
+    if (sess !== undefined) {
+      this.clearAVSessionListeners(sess);
+      sess.destroy().catch((): void => {});
+    }
+    const pm: image.PixelMap | undefined = this.mediaCoverPm;
+    this.mediaCoverPm = undefined;
+    this.mediaMetaCache = undefined;
+    if (pm !== undefined) {
+      pm.release().catch((): void => {});
+    }
+  }
+
+  private handleNotifShow(notif: HostNotifShow): void {
+    this.publishNotificationAsync(notif).then((denied: boolean): void => {
+      host.resolveNotif(notif.reqId, denied, '');
+    }).catch((err: BusinessError): void => {
+      const code: number = err?.code ?? 0;
+      if (code === 1600004 || code === 1600020 || code === 201) {
+        host.resolveNotif(notif.reqId, true, '');
+        return;
+      }
+      const msg: string = err?.message ?? 'notification publish failed';
+      host.resolveNotif(notif.reqId, false, msg);
+    });
+  }
+
+  private async ensureNotificationEnabled(): Promise<boolean> {
+    try {
+      if (notificationManager.isNotificationEnabledSync()) {
+        return true;
+      }
+    } catch (_) {}
+    if (!this.notifPermAsked && this.context !== undefined) {
+      this.notifPermAsked = true;
+      try {
+        await notificationManager.requestEnableNotification(this.context);
+      } catch (_) {}
+      try {
+        return notificationManager.isNotificationEnabledSync();
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  private async publishNotificationAsync(notif: HostNotifShow): Promise<boolean> {
+    const enabled: boolean = await this.ensureNotificationEnabled();
+    if (!enabled) {
+      return true;
+    }
+
+    const titleText: string = notif.title.trim().length > 0 ? notif.title.trim() : this.bundleLabel;
+    const subText: string = notif.subtitle.trim();
+    const bodyRaw: string = notif.body.trim();
+    let combinedBody: string = bodyRaw;
+    if (subText.length > 0 && bodyRaw.length > 0) {
+      combinedBody = subText + '\n' + bodyRaw;
+    } else if (subText.length > 0) {
+      combinedBody = subText;
+    }
+    if (combinedBody.length === 0) {
+      combinedBody = ' ';
+    }
+
+    let picPm: image.PixelMap | undefined = undefined;
+    if (notif.image.byteLength > 0) {
+      let imgSrc: image.ImageSource | undefined = undefined;
+      try {
+        imgSrc = image.createImageSource(notif.image);
+        const pm: image.PixelMap = await imgSrc.createPixelMap();
+        if (pm.getPixelBytesNumber() <= 2 * 1024 * 1024) {
+          picPm = pm;
+        } else {
+          await pm.release();
+        }
+      } catch (_) {
+      } finally {
+        if (imgSrc !== undefined) {
+          try { await imgSrc.release(); } catch (_) {}
+        }
+      }
+    }
+
+    let content: notificationManager.NotificationContent;
+    if (picPm !== undefined) {
+      content = {
+        notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_PICTURE,
+        picture: {
+          title: titleText,
+          text: combinedBody,
+          briefText: subText.length > 0 ? subText : titleText,
+          expandedTitle: titleText,
+          picture: picPm
+        }
+      };
+    } else {
+      content = {
+        notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
+        normal: {
+          title: titleText,
+          text: combinedBody,
+          additionalText: subText.length > 0 ? subText : undefined
+        }
+      };
+    }
+
+    const numId: number = notif.id.length > 0 ? hashNotifId(notif.id) : 1;
+    const req: notificationManager.NotificationRequest = {
+      id: numId,
+      content: content,
+      notificationSlotType: notif.silent
+        ? notificationManager.SlotType.CONTENT_INFORMATION
+        : notificationManager.SlotType.SOCIAL_COMMUNICATION,
+      tapDismissed: true
+    };
+    if (notif.id.length > 0) {
+      req.label = notif.id.substring(0, 200);
+      const params: Record<string, Object> = {};
+      params[NOTIF_PARAM_KEY] = notif.id;
+      const agent: WantAgent | undefined = await this.buildLaunchWantAgent(params);
+      if (agent !== undefined) {
+        req.wantAgent = agent;
+      }
+    }
+    if (notif.group.length > 0) {
+      req.groupName = notif.group.substring(0, 200);
+    }
+
+    try {
+      await notificationManager.publish(req);
+    } finally {
+      if (picPm !== undefined) {
+        try { await picPm.release(); } catch (_) {}
+      }
+    }
+    return false;
+  }
+
+  private handleNotifRemove(all: boolean, id: string): void {
+    if (all) {
+      notificationManager.cancelAll().catch((): void => {});
+      return;
+    }
+    if (id.length > 0) {
+      notificationManager.cancel(hashNotifId(id), id.substring(0, 200)).catch((): void => {});
+    }
+  }
+
+  private isCurrentlyOnBattery(): boolean {
+    try {
+      return batteryInfo.pluggedType === batteryInfo.BatteryPluggedType.NONE;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  private registerPowerEvents(): void {
+    host.notifyPowerState(this.isCurrentlyOnBattery(), '');
+    if (this.powerSubscriber !== undefined) {
+      return;
+    }
+    const subInfo: commonEventManager.CommonEventSubscribeInfo = {
+      events: [
+        commonEventManager.Support.COMMON_EVENT_SCREEN_LOCKED,
+        commonEventManager.Support.COMMON_EVENT_SCREEN_UNLOCKED,
+        commonEventManager.Support.COMMON_EVENT_SCREEN_OFF,
+        commonEventManager.Support.COMMON_EVENT_SCREEN_ON,
+        commonEventManager.Support.COMMON_EVENT_CHARGING,
+        commonEventManager.Support.COMMON_EVENT_DISCHARGING,
+        commonEventManager.Support.COMMON_EVENT_POWER_CONNECTED,
+        commonEventManager.Support.COMMON_EVENT_POWER_DISCONNECTED
+      ]
+    };
+    commonEventManager.createSubscriber(subInfo).then((sub: commonEventManager.CommonEventSubscriber): void => {
+      this.powerSubscriber = sub;
+      commonEventManager.subscribe(sub, (err: BusinessError, data: commonEventManager.CommonEventData): void => {
+        if (err) {
+          return;
+        }
+        const onBat: boolean = this.isCurrentlyOnBattery();
+        let evName: string = '';
+        if (data.event === commonEventManager.Support.COMMON_EVENT_SCREEN_LOCKED) {
+          evName = 'lock-screen';
+        } else if (data.event === commonEventManager.Support.COMMON_EVENT_SCREEN_UNLOCKED) {
+          evName = 'unlock-screen';
+        } else if (data.event === commonEventManager.Support.COMMON_EVENT_SCREEN_OFF) {
+          evName = 'suspend';
+        } else if (data.event === commonEventManager.Support.COMMON_EVENT_SCREEN_ON) {
+          evName = 'resume';
+        }
+        host.notifyPowerState(onBat, evName);
+      });
+    }).catch((): void => {});
+  }
+
+  private unregisterPowerEvents(): void {
+    const sub: commonEventManager.CommonEventSubscriber | undefined = this.powerSubscriber;
+    this.powerSubscriber = undefined;
+    if (sub !== undefined) {
+      try {
+        commonEventManager.unsubscribe(sub, (): void => {});
+      } catch (_) {}
+    }
+  }
+
+  private applyKeepScreenOn(keepOn: boolean): void {
+    this.windows.forEach((mw: ManagedWindow): void => {
+      if (mw.win !== undefined) {
+        try {
+          mw.win.setWindowKeepScreenOn(keepOn).catch((): void => {});
+        } catch (_) {}
+      }
+    });
+  }
+
+  private handlePowerReq(req: HostPowerReq): void {
+    this.powerKeepDisplay = req.keepDisplay;
+    this.powerKeepRunning = req.keepRunning || req.keepSystem;
+    this.applyKeepScreenOn(this.powerKeepDisplay);
+    this.syncBackgroundRunning();
+  }
+
+  private syncBackgroundRunning(): void {
+    const wantBg: boolean = this.npPlaying || this.powerKeepRunning;
+    this.bgChain = this.bgChain.then(async (): Promise<void> => {
+      if (this.context === undefined || wantBg === this.bgRunningActive) {
+        return;
+      }
+      if (wantBg) {
+        const agent: WantAgent | undefined = await this.buildLaunchWantAgent();
+        if (agent === undefined) {
+          return;
+        }
+        try {
+          await backgroundTaskManager.startBackgroundRunning(
+            this.context,
+            backgroundTaskManager.BackgroundMode.AUDIO_PLAYBACK,
+            agent
+          );
+          this.bgRunningActive = true;
+        } catch (_) {}
+      } else {
+        try {
+          await backgroundTaskManager.stopBackgroundRunning(this.context);
+        } catch (_) {}
+        this.bgRunningActive = false;
+      }
+    }).catch((): void => {});
+  }
+
+  private queryAndNotifyNetState(): void {
+    let online: boolean = false;
+    let metered: boolean = false;
+    try {
+      online = connection.hasDefaultNetSync();
+      if (online) {
+        const netHandle: connection.NetHandle = connection.getDefaultNetSync();
+        const caps: connection.NetCapabilities = connection.getNetCapabilitiesSync(netHandle);
+        let notMetered: boolean = false;
+        if (caps.networkCap !== undefined) {
+          for (let i: number = 0; i < caps.networkCap.length; i++) {
+            if (caps.networkCap[i] === connection.NetCap.NET_CAPABILITY_NOT_METERED) {
+              notMetered = true;
+              break;
+            }
+          }
+        }
+        metered = !notMetered;
+      }
+    } catch (_) {
+      online = true;
+      metered = false;
+    }
+    host.notifyNetState(online, metered);
+  }
+
+  private handleNetWatch(): void {
+    this.queryAndNotifyNetState();
+    if (this.netWatching) {
+      return;
+    }
+    this.netWatching = true;
+    try {
+      const conn: connection.NetConnection = connection.createNetConnection();
+      this.netConn = conn;
+      conn.register((): void => {});
+      conn.on('netAvailable', (): void => {
+        this.queryAndNotifyNetState();
+      });
+      conn.on('netCapabilitiesChange', (): void => {
+        this.queryAndNotifyNetState();
+      });
+      conn.on('netLost', (): void => {
+        this.queryAndNotifyNetState();
+      });
+      conn.on('netUnavailable', (): void => {
+        this.queryAndNotifyNetState();
+      });
+    } catch (_) {}
+  }
+
+  private unregisterNetWatch(): void {
+    this.netWatching = false;
+    const conn: connection.NetConnection | undefined = this.netConn;
+    this.netConn = undefined;
+    if (conn !== undefined) {
+      try {
+        conn.unregister((): void => {});
+      } catch (_) {}
     }
   }
 }

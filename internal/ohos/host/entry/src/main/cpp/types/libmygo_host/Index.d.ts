@@ -88,6 +88,38 @@ export interface HostMessageBox {
   destructiveIds: number[];
 }
 
+export interface HostNowPlaying {
+  active: boolean;
+  state: number;
+  metaChanged: boolean;
+  commands: number;
+  durationMs: number;
+  positionMs: number;
+  rate: number;
+  title: string;
+  artist: string;
+  album: string;
+  artwork: ArrayBuffer;
+}
+
+export interface HostNotifShow {
+  reqId: number;
+  silent: boolean;
+  id: string;
+  title: string;
+  subtitle: string;
+  body: string;
+  group: string;
+  image: ArrayBuffer;
+}
+
+export interface HostPowerReq {
+  keepSystem: boolean;
+  keepDisplay: boolean;
+  keepRunning: boolean;
+  reason: string;
+}
+
 export interface HostBridgeCallbacks {
   onWinCreate: (cfg: HostWinConfig) => void;
   onWinConfig: (cfg: HostWinConfig) => void;
@@ -99,6 +131,11 @@ export interface HostBridgeCallbacks {
   onDialogSave: (dlg: HostFileDialog) => void;
   onDialogMsg: (box: HostMessageBox) => void;
   onShellReq: (reqId: number, op: number, target: string) => void;
+  onNowPlaying: (np: HostNowPlaying) => void;
+  onNotifShow: (notif: HostNotifShow) => void;
+  onNotifRemove: (all: boolean, id: string) => void;
+  onPowerReq: (req: HostPowerReq) => void;
+  onNetWatch: () => void;
   onEngineQuit: () => void;
   onEngineRestart: () => void;
 }
@@ -134,6 +171,11 @@ export interface HostModule {
   resolveDialog(reqId: number, response: number, checkboxChecked: boolean, err: string, paths: string[]): void;
   resolveShell(reqId: number, err: string): void;
   notifyAppOpen(op: number, items: string[]): void;
+  notifyMediaCmd(cmd: number, posMs: number): void;
+  resolveNotif(reqId: number, denied: boolean, err: string): void;
+  notifyNotifClicked(id: string): void;
+  notifyPowerState(onBattery: boolean, event: string): void;
+  notifyNetState(online: boolean, metered: boolean): void;
   setDarkMode(dark: boolean): void;
   crash(): void;
 }

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/egoist/mygo/internal/platform"
 )
@@ -375,6 +376,11 @@ func TestIMEPreviewCommitAndDeleteSurrounding(t *testing.T) {
 	}
 }
 
+type recordedMediaCmd struct {
+	cmd platform.MediaCommand
+	pos time.Duration
+}
+
 type testAppHandler struct {
 	platform.AppHandler
 	ready           func()
@@ -387,6 +393,10 @@ type testAppHandler struct {
 	openURLs        []string
 	openFiles       []string
 	activated       []bool
+	mediaCmds       []recordedMediaCmd
+	notifClicks     []string
+	powerEvents     []string
+	netChanges      []platform.NetworkStatus
 }
 
 func (h *testAppHandler) Ready() {
@@ -394,15 +404,21 @@ func (h *testAppHandler) Ready() {
 		h.ready()
 	}
 }
-func (h *testAppHandler) Dispatch()                { h.dispatched++ }
-func (h *testAppHandler) ThemeChanged()            { h.themeChanged++ }
-func (h *testAppHandler) DidBecomeActive()         { h.becameActive++ }
-func (h *testAppHandler) DidResignActive()         { h.resigned++ }
-func (h *testAppHandler) DisplaysChanged()         { h.displaysChanged++ }
-func (h *testAppHandler) LocaleChanged()           { h.localeChanged++ }
-func (h *testAppHandler) OpenURLs(urls []string)   { h.openURLs = append(h.openURLs, urls...) }
-func (h *testAppHandler) OpenFiles(paths []string) { h.openFiles = append(h.openFiles, paths...) }
-func (h *testAppHandler) Activated(vis bool)       { h.activated = append(h.activated, vis) }
+func (h *testAppHandler) Dispatch()                                 { h.dispatched++ }
+func (h *testAppHandler) ThemeChanged()                             { h.themeChanged++ }
+func (h *testAppHandler) DidBecomeActive()                          { h.becameActive++ }
+func (h *testAppHandler) DidResignActive()                          { h.resigned++ }
+func (h *testAppHandler) DisplaysChanged()                          { h.displaysChanged++ }
+func (h *testAppHandler) LocaleChanged()                            { h.localeChanged++ }
+func (h *testAppHandler) OpenURLs(urls []string)                    { h.openURLs = append(h.openURLs, urls...) }
+func (h *testAppHandler) OpenFiles(paths []string)                  { h.openFiles = append(h.openFiles, paths...) }
+func (h *testAppHandler) Activated(vis bool)                        { h.activated = append(h.activated, vis) }
+func (h *testAppHandler) NotificationClicked(id string)             { h.notifClicks = append(h.notifClicks, id) }
+func (h *testAppHandler) PowerEvent(ev string)                      { h.powerEvents = append(h.powerEvents, ev) }
+func (h *testAppHandler) NetworkChanged(st platform.NetworkStatus)  { h.netChanges = append(h.netChanges, st) }
+func (h *testAppHandler) MediaCommand(cmd platform.MediaCommand, pos time.Duration) {
+	h.mediaCmds = append(h.mediaCmds, recordedMediaCmd{cmd: cmd, pos: pos})
+}
 
 // Signaling the backend before Init (such as Application.SetLanguages posting before Run) does not panic on a nil sync.Cond and dispatches on the first step.
 func TestSignalBeforeInitDispatchesOnFirstStep(t *testing.T) {
