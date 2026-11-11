@@ -37,6 +37,43 @@ const (
 	kindWinConfig   = 14 // engine -> host: update window properties by mask
 	kindWinAction   = 15 // engine -> host: {u32 winID, u8 action, 3×pad}
 	kindPopupMenu   = 16 // engine -> host: {u32 reqID, u32 winID, i32 x, i32 y, u8 rtl, 3×pad, items...}
+
+	kindClipChanged  = 17 // host -> engine: {u32 changeCount, u8 external, 3×pad, u32 mimeCount, mimes...}
+	kindClipData     = 18 // host -> engine: {u32 reqID, str err, u32 repCount, reps...}
+	kindDialogResult = 19 // host -> engine: {u32 reqID, i32 response, u8 checkbox, 3×pad, str err, paths...}
+	kindShellResult  = 20 // host -> engine: {u32 reqID, str err}
+	kindAppOpen      = 21 // host -> engine: {u8 op, 3×pad, u32 count, items...}
+
+	kindClipWrite  = 22 // engine -> host: {u8 clear, u8 concealed, 2×pad, str text, str html, str uriList, bytes png}
+	kindClipRead   = 23 // engine -> host: {u32 reqID, u32 fmtCount, fmts...}
+	kindDialogOpen = 24 // engine -> host: open file/folder picker
+	kindDialogSave = 25 // engine -> host: save file picker
+	kindDialogMsg  = 26 // engine -> host: message box
+	kindShellReq   = 27 // engine -> host: {u32 reqID, u8 op, 3×pad, str target}
+)
+
+// App open operations (kindAppOpen).
+const (
+	appOpenURLs     byte = 1
+	appOpenFiles    byte = 2
+	appOpenActivate byte = 3
+)
+
+// Shell operations (kindShellReq).
+const (
+	shellOpenExternal byte = 1
+	shellOpenPath     byte = 2
+	shellShowInFolder byte = 3
+	shellTrash        byte = 4
+)
+
+// Open/Save dialog option flags (kindDialogOpen / kindDialogSave).
+const (
+	dlgFlagOpenFiles       byte = 1 << 0
+	dlgFlagOpenDirectories byte = 1 << 1
+	dlgFlagMultiple        byte = 1 << 2
+	dlgFlagShowHidden      byte = 1 << 3
+	dlgFlagCreateDirs      byte = 1 << 4
 )
 
 // Input subkinds carried inside kindInput payloads (after u32 winID).
@@ -219,8 +256,21 @@ type envInfoWire struct {
 // conn is the socket to the host: one reader and one writer, both on the
 // same descriptor.
 type conn struct {
-	fd  int
-	wmu sync.Mutex
+	fd        int
+	wmu       sync.Mutex
+	closeOnce sync.Once
+}
+
+func (c *conn) close() {
+	if c == nil {
+		return
+	}
+	c.closeOnce.Do(func() {
+		if c.fd >= 0 {
+			_ = syscall.Shutdown(c.fd, syscall.SHUT_RDWR)
+			_ = syscall.Close(c.fd)
+		}
+	})
 }
 
 func (c *conn) write(kind byte, payload []byte) error {
@@ -281,7 +331,7 @@ func (c *conn) read() (kind byte, payload []byte, fd int, err error) {
 	}
 	kind = hdr[0]
 	length := int(binary.LittleEndian.Uint32(hdr[1:]))
-	if length > 1<<20 {
+	if length > 64<<20 {
 		return 0, nil, fd, fmt.Errorf("ohos: payload of %d bytes", length)
 	}
 	payload = make([]byte, length)
@@ -587,6 +637,11 @@ func appendWireStr(b []byte, s string) []byte {
 	return append(b, s...)
 }
 
+func appendWireBytes(b []byte, data []byte) []byte {
+	b = appendUint32(b, uint32(len(data)))
+	return append(b, data...)
+}
+
 func readUint32(b []byte, off int) (uint32, int, bool) {
 	if off < 0 || off+4 > len(b) {
 		return 0, off, false
@@ -600,6 +655,16 @@ func readWireStr(b []byte, off int) (string, int, bool) {
 		return "", off, false
 	}
 	return string(b[off : off+int(n)]), off + int(n), true
+}
+
+func readWireBytes(b []byte, off int) ([]byte, int, bool) {
+	n, off, ok := readUint32(b, off)
+	if !ok || int(n) < 0 || off+int(n) > len(b) {
+		return nil, off, false
+	}
+	out := make([]byte, int(n))
+	copy(out, b[off:off+int(n)])
+	return out, off + int(n), true
 }
 
 func putF32(b []byte, v float32) {

@@ -11,6 +11,14 @@
     {
       "name": "EntryAbility_label",
       "value": "MyGo Music"
+    },
+    {
+      "name": "read_pasteboard_reason",
+      "value": "Used to paste text, links, files, and images from the system clipboard into the application."
+    },
+    {
+      "name": "keep_background_reason",
+      "value": "Used to keep audio playing smoothly while windows are minimized or in the background."
     }
   ]
 }

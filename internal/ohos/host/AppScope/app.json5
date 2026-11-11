@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "dev.egoist.music",
     "vendor": "example",
-    "versionCode": 128,
-    "versionName": "0.1.28",
+    "versionCode": 129,
+    "versionName": "0.1.29",
     "icon": "$media:app_icon",
     "label": "$string:app_name"
   }

@@ -1,6 +1,21 @@
-import host, { HostBridgeCallbacks, HostDisplayInfo, HostMenuItem, HostWinConfig } from 'libmygo_host.so';
-import { bundleManager, common } from '@kit.AbilityKit';
+import host, {
+  HostBridgeCallbacks,
+  HostClipRep,
+  HostClipWrite,
+  HostDisplayInfo,
+  HostFileDialog,
+  HostFileFilter,
+  HostMenuItem,
+  HostMessageBox,
+  HostWinConfig
+} from 'libmygo_host.so';
+import { Permissions, Want, abilityAccessCtrl, bundleManager, common } from '@kit.AbilityKit';
+import { preferences } from '@kit.ArkData';
+import { util } from '@kit.ArkTS';
 import { display, window } from '@kit.ArkUI';
+import { BusinessError, pasteboard } from '@kit.BasicServicesKit';
+import { fileIo, fileShare, fileUri, picker } from '@kit.CoreFileKit';
+import { image } from '@kit.ImageKit';
 import { i18n } from '@kit.LocalizationKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
@@ -60,7 +75,24 @@ const WIN_OP_LEAVE_FULLSCREEN: number = 12;
 const WIN_OP_CLOSE_REQUEST: number = 13;
 const WIN_OP_CLOSED: number = 14;
 
+const DLG_FLAG_OPEN_FILES: number = 1 << 0;
+const DLG_FLAG_OPEN_DIRS: number = 1 << 1;
+const DLG_FLAG_MULTIPLE: number = 1 << 2;
+
+const SHELL_OPEN_EXTERNAL: number = 1;
+const SHELL_OPEN_PATH: number = 2;
+const SHELL_SHOW_IN_FOLDER: number = 3;
+const SHELL_TRASH: number = 4;
+
+const APP_OPEN_URLS: number = 1;
+const APP_OPEN_FILES: number = 2;
+const APP_OPEN_ACTIVATE: number = 3;
+
+const PREF_STORE_NAME: string = 'mygo_file_perms';
+const PREF_KEY_URIS: string = 'persisted_uris';
+
 export type PopupMenuOpener = (reqId: number, x: number, y: number, rtl: boolean, items: HostMenuItem[]) => void;
+export type MessageBoxOpener = (box: HostMessageBox) => void;
 
 class ManagedWindow {
   winId: number = 1;
@@ -84,16 +116,76 @@ function rgbaToHexColor(rgba: number): string {
   return '#' + to2(a) + to2(r) + to2(g) + to2(b);
 }
 
+function encodeUtf8Buffer(text: string): ArrayBuffer {
+  const enc: util.TextEncoder = util.TextEncoder.create('utf-8');
+  const u8: Uint8Array = enc.encodeInto(text);
+  const out: ArrayBuffer = new ArrayBuffer(u8.byteLength);
+  new Uint8Array(out).set(u8);
+  return out;
+}
+
+function splitPathDirAndBase(fullPath: string): [string, string] {
+  const trimmed: string = fullPath.length > 1 && fullPath.endsWith('/')
+    ? fullPath.substring(0, fullPath.length - 1)
+    : fullPath;
+  const slash: number = trimmed.lastIndexOf('/');
+  if (slash <= 0) {
+    return ['/', trimmed.substring(slash + 1)];
+  }
+  return [trimmed.substring(0, slash), trimmed.substring(slash + 1)];
+}
+
+function formatPickerFilters(filters: HostFileFilter[]): string[] {
+  const out: string[] = [];
+  for (let i: number = 0; i < filters.length; i++) {
+    const f: HostFileFilter = filters[i];
+    if (f.extensions.length === 0) {
+      continue;
+    }
+    if (f.extensions.indexOf('*') >= 0) {
+      return [];
+    }
+    const suffixes: string[] = [];
+    for (let j: number = 0; j < f.extensions.length; j++) {
+      const ext: string = f.extensions[j].trim();
+      if (ext.length > 0) {
+        suffixes.push(ext.startsWith('.') ? ext : ('.' + ext));
+      }
+    }
+    if (suffixes.length > 0) {
+      const desc: string = f.name.trim().length > 0 ? f.name.trim().replace(/\|/g, ' ') : 'Files';
+      out.push(desc + '|' + suffixes.join(','));
+    }
+  }
+  return out;
+}
+
 class HostBridgeManager {
   private context: common.UIAbilityContext | undefined = undefined;
   private windowStage: window.WindowStage | undefined = undefined;
   private windows: Map<number, ManagedWindow> = new Map<number, ManagedWindow>();
   private popupOpeners: Map<number, PopupMenuOpener> = new Map<number, PopupMenuOpener>();
+  private msgBoxOpeners: Map<number, MessageBoxOpener> = new Map<number, MessageBoxOpener>();
   private displayListenersRegistered: boolean = false;
+  private pasteboardListenerRegistered: boolean = false;
   private callbacksRegistered: boolean = false;
+  private lastSelfChangeCount: number = -1;
+  private tokenId: number = 0;
+  private pasteboardUpdateHandler: () => void = (): void => {
+    this.onSystemPasteboardUpdated();
+  };
 
   init(ctx: common.UIAbilityContext): void {
     this.context = ctx;
+    try {
+      const bInfo: bundleManager.BundleInfo = bundleManager.getBundleInfoForSelfSync(
+        bundleManager.BundleFlag.GET_BUNDLE_INFO_WITH_APPLICATION
+      );
+      if (bInfo.appInfo !== undefined) {
+        this.tokenId = bInfo.appInfo.accessTokenId;
+      }
+    } catch (_) {}
+
     if (!this.callbacksRegistered) {
       this.callbacksRegistered = true;
       const cb: HostBridgeCallbacks = {
@@ -109,6 +201,24 @@ class HostBridgeManager {
         onPopupMenu: (reqId: number, winId: number, x: number, y: number, rtl: boolean, items: HostMenuItem[]): void => {
           this.handlePopupMenu(reqId, winId, x, y, rtl, items);
         },
+        onClipWrite: (data: HostClipWrite): void => {
+          this.handleClipWrite(data);
+        },
+        onClipRead: (reqId: number, formats: string[]): void => {
+          this.handleClipRead(reqId, formats);
+        },
+        onDialogOpen: (dlg: HostFileDialog): void => {
+          this.handleDialogOpen(dlg);
+        },
+        onDialogSave: (dlg: HostFileDialog): void => {
+          this.handleDialogSave(dlg);
+        },
+        onDialogMsg: (box: HostMessageBox): void => {
+          this.handleDialogMsg(box);
+        },
+        onShellReq: (reqId: number, op: number, target: string): void => {
+          this.handleShellReq(reqId, op, target);
+        },
         onEngineQuit: (): void => {
           this.handleEngineQuit();
         },
@@ -120,6 +230,34 @@ class HostBridgeManager {
     }
     this.refreshEnvAndDisplays();
     this.registerDisplayListeners();
+    this.registerPasteboardListener();
+    this.reactivatePersistedUris();
+  }
+
+  handleWant(want: Want, isNewWant: boolean): void {
+    const rawUri: string = (want.uri ?? '').trim();
+    if (rawUri.length > 0) {
+      if (rawUri.toLowerCase().startsWith('file://')) {
+        this.resolveIncomingFileUri(rawUri).then((resolved: string): void => {
+          if (resolved.length > 0) {
+            host.notifyAppOpen(APP_OPEN_FILES, [resolved]);
+          }
+        }).catch((): void => {});
+      } else {
+        host.notifyAppOpen(APP_OPEN_URLS, [rawUri]);
+      }
+    }
+    if (isNewWant) {
+      host.notifyAppOpen(APP_OPEN_ACTIVATE, []);
+      const mainMw: ManagedWindow | undefined = this.windows.get(1);
+      if (mainMw !== undefined && mainMw.win !== undefined) {
+        try {
+          mainMw.win.showWindow().then((): void => {
+            this.focusManagedWindow(mainMw);
+          }).catch((): void => {});
+        } catch (_) {}
+      }
+    }
   }
 
   attachMainStage(stage: window.WindowStage, mainWin: window.Window): void {
@@ -154,11 +292,13 @@ class HostBridgeManager {
 
   destroyStage(): void {
     this.unregisterDisplayListeners();
+    this.unregisterPasteboardListener();
     this.windows.forEach((mw: ManagedWindow): void => {
       this.detachWindowListeners(mw);
     });
     this.windows.clear();
     this.popupOpeners.clear();
+    this.msgBoxOpeners.clear();
     this.windowStage = undefined;
   }
 
@@ -177,6 +317,636 @@ class HostBridgeManager {
   unregisterPopupMenuOpener(winId: number): void {
     this.popupOpeners.delete(winId);
   }
+
+  registerMessageBoxOpener(winId: number, opener: MessageBoxOpener): void {
+    this.msgBoxOpeners.set(winId, opener);
+  }
+
+  unregisterMessageBoxOpener(winId: number): void {
+    this.msgBoxOpeners.delete(winId);
+  }
+
+  // ---------- Pasteboard Bridge ----------
+
+  private registerPasteboardListener(): void {
+    if (this.pasteboardListenerRegistered) {
+      return;
+    }
+    this.pasteboardListenerRegistered = true;
+    try {
+      const sysBoard: pasteboard.SystemPasteboard = pasteboard.getSystemPasteboard();
+      sysBoard.on('update', this.pasteboardUpdateHandler);
+      this.onSystemPasteboardUpdated();
+    } catch (_) {}
+  }
+
+  private unregisterPasteboardListener(): void {
+    if (!this.pasteboardListenerRegistered) {
+      return;
+    }
+    this.pasteboardListenerRegistered = false;
+    try {
+      const sysBoard: pasteboard.SystemPasteboard = pasteboard.getSystemPasteboard();
+      sysBoard.off('update', this.pasteboardUpdateHandler);
+    } catch (_) {}
+  }
+
+  private onSystemPasteboardUpdated(): void {
+    try {
+      const sysBoard: pasteboard.SystemPasteboard = pasteboard.getSystemPasteboard();
+      const count: number = sysBoard.getChangeCount();
+      if (count === this.lastSelfChangeCount) {
+        return;
+      }
+      sysBoard.getMimeTypes().then((mimes: string[]): void => {
+        if (sysBoard.getChangeCount() === this.lastSelfChangeCount) {
+          return;
+        }
+        host.notifyClipChanged(count >>> 0, true, mimes);
+      }).catch((): void => {
+        host.notifyClipChanged(count >>> 0, true, []);
+      });
+    } catch (_) {}
+  }
+
+  private handleClipWrite(data: HostClipWrite): void {
+    this.writePasteboardAsync(data).catch((err: BusinessError): void => {
+      hilog.error(DOMAIN, TAG, 'handleClipWrite failed: %{public}s', JSON.stringify(err));
+    });
+  }
+
+  private async writePasteboardAsync(data: HostClipWrite): Promise<void> {
+    const sysBoard: pasteboard.SystemPasteboard = pasteboard.getSystemPasteboard();
+    if (data.clear) {
+      await sysBoard.clearData();
+      this.lastSelfChangeCount = sysBoard.getChangeCount();
+      return;
+    }
+
+    let pd: pasteboard.PasteData | undefined = undefined;
+    let firstRec: pasteboard.PasteDataRecord | undefined = undefined;
+
+    const addPrimaryOrExtra = (mime: string, val: pasteboard.ValueType): void => {
+      if (pd === undefined) {
+        pd = pasteboard.createData(mime, val);
+        firstRec = pd.getRecord(0);
+      } else if (firstRec !== undefined) {
+        firstRec.addEntry(mime, val);
+      }
+    };
+
+    if (data.html.length > 0) {
+      addPrimaryOrExtra(pasteboard.MIMETYPE_TEXT_HTML, data.html);
+    }
+    if (data.text.length > 0 || (data.html.length === 0 && data.uriList.length === 0 && data.png.byteLength === 0)) {
+      addPrimaryOrExtra(pasteboard.MIMETYPE_TEXT_PLAIN, data.text);
+    }
+    if (data.png.byteLength > 0) {
+      let imgSrc: image.ImageSource | undefined = undefined;
+      try {
+        imgSrc = image.createImageSource(data.png);
+        const pm: image.PixelMap = await imgSrc.createPixelMap();
+        addPrimaryOrExtra(pasteboard.MIMETYPE_PIXELMAP, pm);
+      } catch (e) {
+        hilog.error(DOMAIN, TAG, 'decode clipboard PNG failed: %{public}s', JSON.stringify(e));
+      } finally {
+        if (imgSrc !== undefined) {
+          try { await imgSrc.release(); } catch (_) {}
+        }
+      }
+    }
+    if (data.uriList.length > 0) {
+      const lines: string[] = data.uriList.replace(/\r\n/g, '\n').split('\n');
+      let addedFirstUri: boolean = false;
+      for (let i: number = 0; i < lines.length; i++) {
+        const u: string = lines[i].trim();
+        if (u.length === 0 || u.startsWith('#')) {
+          continue;
+        }
+        if (pd === undefined) {
+          pd = pasteboard.createData(pasteboard.MIMETYPE_TEXT_URI, u);
+          firstRec = pd.getRecord(0);
+          addedFirstUri = true;
+        } else if (!addedFirstUri && firstRec !== undefined) {
+          firstRec.addEntry(pasteboard.MIMETYPE_TEXT_URI, u);
+          addedFirstUri = true;
+        } else {
+          pd.addRecord(pasteboard.MIMETYPE_TEXT_URI, u);
+        }
+      }
+    }
+
+    if (pd === undefined) {
+      await sysBoard.clearData();
+      this.lastSelfChangeCount = sysBoard.getChangeCount();
+      return;
+    }
+
+    const prop: pasteboard.PasteDataProperty = pd.getProperty();
+    prop.shareOption = data.concealed ? pasteboard.ShareOption.INAPP : pasteboard.ShareOption.LOCALDEVICE;
+    pd.setProperty(prop);
+
+    await sysBoard.setData(pd);
+    this.lastSelfChangeCount = sysBoard.getChangeCount();
+  }
+
+  private handleClipRead(reqId: number, formats: string[]): void {
+    this.readPasteboardAsync(formats).then((reps: HostClipRep[]): void => {
+      host.resolveClipRead(reqId, '', reps);
+    }).catch((err: BusinessError): void => {
+      const msg: string = err?.message ?? 'pasteboard read failed';
+      host.resolveClipRead(reqId, msg, []);
+    });
+  }
+
+  private async ensurePasteboardPermission(): Promise<boolean> {
+    if (this.context === undefined) {
+      return false;
+    }
+    const perm: Permissions = 'ohos.permission.READ_PASTEBOARD';
+    const atMgr: abilityAccessCtrl.AtManager = abilityAccessCtrl.createAtManager();
+    try {
+      if (this.tokenId !== 0) {
+        const status: abilityAccessCtrl.GrantStatus = atMgr.checkAccessTokenSync(this.tokenId, perm);
+        if (status === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
+          return true;
+        }
+      }
+      const res = await atMgr.requestPermissionsFromUser(this.context, [perm]);
+      if (res.authResults.length > 0 && res.authResults[0] === 0) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  private async readPasteboardAsync(formats: string[]): Promise<HostClipRep[]> {
+    const sysBoard: pasteboard.SystemPasteboard = pasteboard.getSystemPasteboard();
+    if (!sysBoard.hasDataSync()) {
+      return [];
+    }
+    await this.ensurePasteboardPermission();
+
+    let pd: pasteboard.PasteData;
+    try {
+      pd = await sysBoard.getData();
+    } catch (e) {
+      const be: BusinessError = e as BusinessError;
+      if (be.code === 201 || be.code === 12900005) {
+        return [];
+      }
+      throw e as Error;
+    }
+
+    const wantAll: boolean = formats.length === 0;
+    const wants = (fmt: string): boolean => {
+      if (wantAll) {
+        return true;
+      }
+      for (let i: number = 0; i < formats.length; i++) {
+        if (formats[i] === fmt) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const reps: HostClipRep[] = [];
+    const recCount: number = pd.getRecordCount();
+
+    if (wants('text/html')) {
+      let htmlVal: string = '';
+      try {
+        htmlVal = pd.getPrimaryHtml() ?? '';
+      } catch (_) {}
+      if (htmlVal.length === 0 && recCount > 0) {
+        try {
+          const v: pasteboard.ValueType = await pd.getRecord(0).getData(pasteboard.MIMETYPE_TEXT_HTML);
+          if (typeof v === 'string') {
+            htmlVal = v;
+          }
+        } catch (_) {}
+      }
+      if (htmlVal.length > 0) {
+        reps.push({ format: 'text/html', data: encodeUtf8Buffer(htmlVal) });
+      }
+    }
+
+    if (wants('text/plain')) {
+      const textParts: string[] = [];
+      for (let i: number = 0; i < recCount; i++) {
+        const rec: pasteboard.PasteDataRecord = pd.getRecord(i);
+        let t: string = '';
+        try {
+          const v: pasteboard.ValueType = await rec.getData(pasteboard.MIMETYPE_TEXT_PLAIN);
+          if (typeof v === 'string') {
+            t = v;
+          }
+        } catch (_) {}
+        if (t.length === 0) {
+          try {
+            t = rec.toPlainText() ?? '';
+          } catch (_) {}
+        }
+        if (t.length > 0) {
+          textParts.push(t);
+        }
+      }
+      if (textParts.length > 0) {
+        reps.push({ format: 'text/plain', data: encodeUtf8Buffer(textParts.join('\n')) });
+      }
+    }
+
+    if (wants('text/uri-list') || wants('application/x-mygo-file-list')) {
+      const uris: string[] = [];
+      for (let i: number = 0; i < recCount; i++) {
+        const rec: pasteboard.PasteDataRecord = pd.getRecord(i);
+        try {
+          const v: pasteboard.ValueType = await rec.getData(pasteboard.MIMETYPE_TEXT_URI);
+          if (typeof v === 'string' && v.length > 0) {
+            uris.push(v);
+          }
+        } catch (_) {}
+      }
+      if (uris.length === 0) {
+        try {
+          const pu: string = pd.getPrimaryUri() ?? '';
+          if (pu.length > 0) {
+            uris.push(pu);
+          }
+        } catch (_) {}
+      }
+      if (uris.length > 0) {
+        reps.push({ format: 'text/uri-list', data: encodeUtf8Buffer(uris.join('\r\n')) });
+      }
+    }
+
+    if (wants('image/png')) {
+      let pm: image.PixelMap | undefined = undefined;
+      try {
+        pm = pd.getPrimaryPixelMap();
+      } catch (_) {}
+      if (pm === undefined && recCount > 0) {
+        try {
+          const v: pasteboard.ValueType = await pd.getRecord(0).getData(pasteboard.MIMETYPE_PIXELMAP);
+          if (v !== undefined && typeof v === 'object' && !(v instanceof ArrayBuffer)) {
+            pm = v as image.PixelMap;
+          }
+        } catch (_) {}
+      }
+      if (pm !== undefined) {
+        const packer: image.ImagePacker = image.createImagePacker();
+        try {
+          const pngBuf: ArrayBuffer = await packer.packToData(pm, { format: 'image/png', quality: 100 });
+          if (pngBuf.byteLength > 0) {
+            reps.push({ format: 'image/png', data: pngBuf });
+          }
+        } catch (_) {
+        } finally {
+          try { await packer.release(); } catch (_) {}
+        }
+      }
+    }
+
+    for (let fIdx: number = 0; fIdx < formats.length; fIdx++) {
+      const customFmt: string = formats[fIdx];
+      if (customFmt === 'text/plain' || customFmt === 'text/html' ||
+          customFmt === 'text/uri-list' || customFmt === 'application/x-mygo-file-list' ||
+          customFmt === 'image/png') {
+        continue;
+      }
+      if (recCount > 0) {
+        try {
+          const v: pasteboard.ValueType = await pd.getRecord(0).getData(customFmt);
+          if (v instanceof ArrayBuffer) {
+            reps.push({ format: customFmt, data: v });
+          } else if (typeof v === 'string') {
+            reps.push({ format: customFmt, data: encodeUtf8Buffer(v) });
+          }
+        } catch (_) {}
+      }
+    }
+
+    return reps;
+  }
+
+  // ---------- Dialogs, FileURI Persistence & Shell ----------
+
+  private reactivatePersistedUris(): void {
+    if (this.context === undefined) {
+      return;
+    }
+    try {
+      const pref: preferences.Preferences = preferences.getPreferencesSync(this.context, { name: PREF_STORE_NAME });
+      const raw: preferences.ValueType = pref.getSync(PREF_KEY_URIS, []);
+      if (Array.isArray(raw) && raw.length > 0) {
+        const policies: fileShare.PolicyInfo[] = [];
+        for (let i: number = 0; i < raw.length; i++) {
+          const u: string = String(raw[i]);
+          if (u.length > 0) {
+            policies.push({
+              uri: u,
+              operationMode: fileShare.OperationMode.READ_MODE | fileShare.OperationMode.WRITE_MODE
+            });
+          }
+        }
+        if (policies.length > 0) {
+          fileShare.activatePermission(policies).catch((): void => {});
+        }
+      }
+    } catch (_) {}
+  }
+
+  private async persistAndRecordUris(uris: string[], writable: boolean): Promise<void> {
+    if (uris.length === 0 || this.context === undefined) {
+      return;
+    }
+    const mode: number = writable
+      ? (fileShare.OperationMode.READ_MODE | fileShare.OperationMode.WRITE_MODE)
+      : fileShare.OperationMode.READ_MODE;
+    const policies: fileShare.PolicyInfo[] = [];
+    for (let i: number = 0; i < uris.length; i++) {
+      if (uris[i].length > 0) {
+        policies.push({ uri: uris[i], operationMode: mode });
+      }
+    }
+    if (policies.length === 0) {
+      return;
+    }
+    try {
+      await fileShare.persistPermission(policies);
+      const pref: preferences.Preferences = preferences.getPreferencesSync(this.context, { name: PREF_STORE_NAME });
+      const prevRaw: preferences.ValueType = pref.getSync(PREF_KEY_URIS, []);
+      const merged: string[] = [];
+      if (Array.isArray(prevRaw)) {
+        for (let i: number = 0; i < prevRaw.length; i++) {
+          const s: string = String(prevRaw[i]);
+          if (s.length > 0 && merged.indexOf(s) < 0) {
+            merged.push(s);
+          }
+        }
+      }
+      for (let i: number = 0; i < uris.length; i++) {
+        if (uris[i].length > 0 && merged.indexOf(uris[i]) < 0) {
+          merged.push(uris[i]);
+        }
+      }
+      while (merged.length > 500) {
+        merged.shift();
+      }
+      pref.putSync(PREF_KEY_URIS, merged);
+      await pref.flush();
+    } catch (_) {}
+  }
+
+  private async resolveIncomingFileUri(uri: string, writable: boolean = false): Promise<string> {
+    await this.persistAndRecordUris([uri], writable);
+    let directPath: string = '';
+    try {
+      const fu: fileUri.FileUri = new fileUri.FileUri(uri);
+      directPath = fu.path;
+    } catch (_) {}
+
+    if (directPath.length > 0) {
+      try {
+        if (fileIo.accessSync(directPath)) {
+          return directPath;
+        }
+      } catch (_) {}
+      if (writable) {
+        return directPath;
+      }
+    }
+
+    if (this.context === undefined) {
+      return directPath;
+    }
+
+    // Fallback for virtual URIs whose underlying path is not directly accessible:
+    // copy into sandbox cache directory so Go's os.Open reads the file seamlessly.
+    let srcFile: fileIo.File | undefined = undefined;
+    try {
+      srcFile = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
+      const cacheDir: string = this.context.cacheDir + '/picked';
+      try { fileIo.mkdirSync(cacheDir, true); } catch (_) {}
+      const baseName: string = srcFile.name && srcFile.name.length > 0
+        ? srcFile.name
+        : ('file_' + Date.now().toString());
+      const dstPath: string = cacheDir + '/' + baseName;
+      fileIo.copyFileSync(srcFile.fd, dstPath);
+      return dstPath;
+    } catch (_) {
+      return directPath;
+    } finally {
+      if (srcFile !== undefined) {
+        try { fileIo.closeSync(srcFile); } catch (_) {}
+      }
+    }
+  }
+
+  private createDocumentPicker(winId: number): picker.DocumentViewPicker | undefined {
+    if (this.context === undefined) {
+      return undefined;
+    }
+    const mw: ManagedWindow | undefined = this.windows.get(winId) ?? this.windows.get(1);
+    if (mw !== undefined && mw.win !== undefined) {
+      try {
+        return new picker.DocumentViewPicker(this.context, mw.win);
+      } catch (_) {}
+    }
+    return new picker.DocumentViewPicker(this.context);
+  }
+
+  private handleDialogOpen(dlg: HostFileDialog): void {
+    this.runOpenDialogAsync(dlg).then((paths: string[]): void => {
+      host.resolveDialog(dlg.reqId, 0, false, '', paths);
+    }).catch((err: BusinessError): void => {
+      const msg: string = err?.message ?? 'open dialog failed';
+      host.resolveDialog(dlg.reqId, 0, false, msg, []);
+    });
+  }
+
+  private async runOpenDialogAsync(dlg: HostFileDialog): Promise<string[]> {
+    const docPicker: picker.DocumentViewPicker | undefined = this.createDocumentPicker(dlg.winId);
+    if (docPicker === undefined) {
+      return [];
+    }
+    const opts: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+    const wantFiles: boolean = (dlg.flags & DLG_FLAG_OPEN_FILES) !== 0;
+    const wantDirs: boolean = (dlg.flags & DLG_FLAG_OPEN_DIRS) !== 0;
+    const multiple: boolean = (dlg.flags & DLG_FLAG_MULTIPLE) !== 0;
+
+    if (wantFiles && wantDirs) {
+      opts.selectMode = picker.DocumentSelectMode.MIXED;
+    } else if (wantDirs) {
+      opts.selectMode = picker.DocumentSelectMode.FOLDER;
+    } else {
+      opts.selectMode = picker.DocumentSelectMode.FILE;
+    }
+    opts.maxSelectNumber = multiple ? 500 : 1;
+
+    if (dlg.defaultPath.length > 0) {
+      try {
+        opts.defaultFilePathUri = fileUri.getUriFromPath(dlg.defaultPath);
+      } catch (_) {}
+    }
+    const suffixes: string[] = formatPickerFilters(dlg.filters);
+    if (suffixes.length > 0 && opts.selectMode !== picker.DocumentSelectMode.FOLDER) {
+      opts.fileSuffixFilters = suffixes;
+    }
+
+    const uris: string[] = await docPicker.select(opts);
+    if (uris === undefined || uris.length === 0) {
+      return [];
+    }
+    await this.persistAndRecordUris(uris, wantDirs);
+    const out: string[] = [];
+    for (let i: number = 0; i < uris.length; i++) {
+      const p: string = await this.resolveIncomingFileUri(uris[i], wantDirs);
+      if (p.length > 0) {
+        out.push(p);
+      }
+    }
+    return out;
+  }
+
+  private handleDialogSave(dlg: HostFileDialog): void {
+    this.runSaveDialogAsync(dlg).then((savedPath: string): void => {
+      const paths: string[] = savedPath.length > 0 ? [savedPath] : [];
+      host.resolveDialog(dlg.reqId, 0, false, '', paths);
+    }).catch((err: BusinessError): void => {
+      const msg: string = err?.message ?? 'save dialog failed';
+      host.resolveDialog(dlg.reqId, 0, false, msg, []);
+    });
+  }
+
+  private async runSaveDialogAsync(dlg: HostFileDialog): Promise<string> {
+    const docPicker: picker.DocumentViewPicker | undefined = this.createDocumentPicker(dlg.winId);
+    if (docPicker === undefined) {
+      return '';
+    }
+    const opts: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
+    if (dlg.defaultPath.length > 0) {
+      if (dlg.defaultPath.startsWith('/')) {
+        const parts: [string, string] = splitPathDirAndBase(dlg.defaultPath);
+        if (parts[0].length > 0) {
+          try {
+            opts.defaultFilePathUri = fileUri.getUriFromPath(parts[0]);
+          } catch (_) {}
+        }
+        if (parts[1].length > 0) {
+          opts.newFileNames = [parts[1]];
+        }
+      } else {
+        opts.newFileNames = [dlg.defaultPath];
+      }
+    }
+    const suffixes: string[] = formatPickerFilters(dlg.filters);
+    if (suffixes.length > 0) {
+      opts.fileSuffixChoices = suffixes;
+    }
+
+    const uris: string[] = await docPicker.save(opts);
+    if (uris === undefined || uris.length === 0) {
+      return '';
+    }
+    return await this.resolveIncomingFileUri(uris[0], true);
+  }
+
+  private handleDialogMsg(box: HostMessageBox): void {
+    const opener: MessageBoxOpener | undefined = this.msgBoxOpeners.get(box.winId) ?? this.msgBoxOpeners.get(1);
+    if (opener === undefined) {
+      host.resolveDialog(box.reqId, box.cancelId, box.checkboxChecked, '', []);
+      return;
+    }
+    opener(box);
+  }
+
+  private handleShellReq(reqId: number, op: number, target: string): void {
+    this.runShellReqAsync(op, target).then((): void => {
+      host.resolveShell(reqId, '');
+    }).catch((err: BusinessError): void => {
+      const msg: string = err?.message ?? 'shell operation failed';
+      host.resolveShell(reqId, msg);
+    });
+  }
+
+  private async runShellReqAsync(op: number, target: string): Promise<void> {
+    if (this.context === undefined) {
+      throw new Error('UIAbilityContext unavailable');
+    }
+    const ctx: common.UIAbilityContext = this.context;
+
+    switch (op) {
+      case SHELL_OPEN_EXTERNAL: {
+        try {
+          await ctx.openLink(target, { appLinkingOnly: false });
+        } catch (_) {
+          const want: Want = {
+            action: 'ohos.want.action.viewData',
+            uri: target
+          };
+          await ctx.startAbility(want);
+        }
+        return;
+      }
+      case SHELL_OPEN_PATH: {
+        const uri: string = fileUri.getUriFromPath(target);
+        const want: Want = {
+          action: 'ohos.want.action.viewData',
+          uri: uri
+        };
+        await ctx.startAbility(want);
+        return;
+      }
+      case SHELL_SHOW_IN_FOLDER: {
+        let dirPath: string = target;
+        try {
+          if (!fileIo.statSync(target).isDirectory()) {
+            const parts: [string, string] = splitPathDirAndBase(target);
+            dirPath = parts[0];
+          }
+        } catch (_) {
+          const parts: [string, string] = splitPathDirAndBase(target);
+          dirPath = parts[0];
+        }
+        const uri: string = fileUri.getUriFromPath(dirPath);
+        const want: Want = {
+          action: 'ohos.want.action.viewData',
+          uri: uri
+        };
+        await ctx.startAbility(want);
+        return;
+      }
+      case SHELL_TRASH: {
+        const trashDir: string = ctx.filesDir + '/.Trash';
+        try { fileIo.mkdirSync(trashDir, true); } catch (_) {}
+        const parts: [string, string] = splitPathDirAndBase(target);
+        const base: string = parts[1].length > 0 ? parts[1] : 'trashed';
+        let dst: string = trashDir + '/' + base;
+        try {
+          if (fileIo.accessSync(dst)) {
+            dst = trashDir + '/' + Date.now().toString() + '_' + base;
+          }
+        } catch (_) {}
+        try {
+          fileIo.renameSync(target, dst);
+        } catch (_) {
+          const st: fileIo.Stat = fileIo.statSync(target);
+          if (st.isDirectory()) {
+            fileIo.rmdirSync(target);
+          } else {
+            fileIo.unlinkSync(target);
+          }
+        }
+        return;
+      }
+      default:
+        throw new Error('unsupported shell op');
+    }
+  }
+
+  // ---------- Environment & Multi-Window Management ----------
 
   refreshEnvAndDisplays(): void {
     let pkgId: string = 'dev.egoist.music';
@@ -655,6 +1425,7 @@ class HostBridgeManager {
           this.detachWindowListeners(mw);
           this.windows.delete(mw.winId);
           this.popupOpeners.delete(mw.winId);
+          this.msgBoxOpeners.delete(mw.winId);
           try {
             w.destroyWindow().catch((): void => {});
           } catch (_) {}
@@ -828,6 +1599,7 @@ class HostBridgeManager {
     this.detachWindowListeners(mw);
     this.windows.delete(winId);
     this.popupOpeners.delete(winId);
+    this.msgBoxOpeners.delete(winId);
     if (mw.win !== undefined) {
       try {
         mw.win.destroyWindow().catch((): void => {});

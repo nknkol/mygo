@@ -84,6 +84,19 @@ constexpr uint8_t kWinConfig   = 14; // engine -> host: masked window config upd
 constexpr uint8_t kWinAction   = 15; // engine -> host: {u32 winId, u8 action, 3×pad}
 constexpr uint8_t kPopupMenu   = 16; // engine -> host: popup menu tree
 
+constexpr uint8_t kClipChanged  = 17; // host -> engine: {u32 changeCount, u8 external, 3×pad, mimes...}
+constexpr uint8_t kClipData     = 18; // host -> engine: {u32 reqId, str err, reps...}
+constexpr uint8_t kDialogResult = 19; // host -> engine: {u32 reqId, i32 response, u8 checkbox, 3×pad, str err, paths...}
+constexpr uint8_t kShellResult  = 20; // host -> engine: {u32 reqId, str err}
+constexpr uint8_t kAppOpen      = 21; // host -> engine: {u8 op, 3×pad, items...}
+
+constexpr uint8_t kClipWrite  = 22; // engine -> host: clipboard write/clear
+constexpr uint8_t kClipRead   = 23; // engine -> host: clipboard read
+constexpr uint8_t kDialogOpen = 24; // engine -> host: open file/folder dialog
+constexpr uint8_t kDialogSave = 25; // engine -> host: save file dialog
+constexpr uint8_t kDialogMsg  = 26; // engine -> host: message box
+constexpr uint8_t kShellReq   = 27; // engine -> host: {u32 reqId, u8 op, 3×pad, str target}
+
 // Input subkinds.
 constexpr uint8_t kInputMouse  = 1;
 constexpr uint8_t kInputTouch  = 2;
@@ -336,6 +349,23 @@ bool readStr(const std::vector<uint8_t> &b, size_t &off, std::string *out) {
     return true;
 }
 
+void appendBytes(std::vector<uint8_t> &b, const uint8_t *data, size_t len) {
+    appendU32(b, static_cast<uint32_t>(len));
+    if (len > 0 && data != nullptr) {
+        b.insert(b.end(), data, data + len);
+    }
+}
+
+bool readBytes(const std::vector<uint8_t> &b, size_t &off, std::vector<uint8_t> *out) {
+    uint32_t n = 0;
+    if (!readU32(b, off, &n) || off + n > b.size()) {
+        return false;
+    }
+    out->assign(b.begin() + static_cast<ptrdiff_t>(off), b.begin() + static_cast<ptrdiff_t>(off + n));
+    off += n;
+    return true;
+}
+
 // ---------- Shared Engine Socket & Environment State ----------
 
 ArkUI_NativeNodeAPI_1 *nodeAPI = nullptr;
@@ -366,6 +396,8 @@ struct CachedEnv {
 
 std::mutex gEnvMu;
 CachedEnv gCachedEnv;
+std::vector<uint8_t> gCachedClipWire;
+std::vector<std::vector<uint8_t>> gPendingAppOpens;
 
 // ---------- Per-Window Session ----------
 
@@ -457,8 +489,53 @@ enum class BridgeEventKind {
     WinConfig,
     WinAction,
     PopupMenu,
+    ClipWrite,
+    ClipRead,
+    DialogOpen,
+    DialogSave,
+    DialogMsg,
+    ShellReq,
     EngineQuit,
     EngineRestart,
+};
+
+struct ClipWriteData {
+    bool clear = false;
+    bool concealed = false;
+    std::string text;
+    std::string html;
+    std::string uriList;
+    std::vector<uint8_t> png;
+};
+
+struct FileFilterData {
+    std::string name;
+    std::vector<std::string> extensions;
+};
+
+struct FileDialogData {
+    uint32_t reqId = 0;
+    uint32_t winId = 0;
+    uint8_t flags = 0;
+    std::string title;
+    std::string defaultPath;
+    std::string buttonLabel;
+    std::vector<FileFilterData> filters;
+};
+
+struct MessageBoxData {
+    uint32_t reqId = 0;
+    uint32_t winId = 0;
+    int32_t defaultId = 0;
+    int32_t cancelId = 0;
+    bool checkboxChecked = false;
+    std::string boxType;
+    std::string title;
+    std::string message;
+    std::string detail;
+    std::string checkboxLabel;
+    std::vector<std::string> buttons;
+    std::vector<int32_t> destructiveIds;
 };
 
 struct WinConfigData {
@@ -493,6 +570,13 @@ struct BridgeEvent {
     int32_t popupY = 0;
     bool popupRtl = false;
     std::vector<PopupItemData> popupItems;
+    ClipWriteData clipWrite;
+    uint32_t reqId = 0;
+    std::vector<std::string> strList;
+    FileDialogData fileDlg;
+    MessageBoxData msgBox;
+    uint8_t shellOp = 0;
+    std::string shellTarget;
 };
 
 std::mutex gBridgeMu;
@@ -619,6 +703,127 @@ void BridgeCallJs(napi_env env, napi_value, void *, void *data) {
         napi_get_boolean(env, ev->popupRtl, &args[4]);
         args[5] = makeJsMenuItems(env, ev->popupItems);
         callBridgeMethod(env, cbObj, "onPopupMenu", 6, args);
+        break;
+    }
+    case BridgeEventKind::ClipWrite: {
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_value vClear = nullptr, vConc = nullptr, vTxt = nullptr, vHtml = nullptr, vUri = nullptr, vPng = nullptr;
+        napi_get_boolean(env, ev->clipWrite.clear, &vClear);
+        napi_get_boolean(env, ev->clipWrite.concealed, &vConc);
+        napi_create_string_utf8(env, ev->clipWrite.text.c_str(), ev->clipWrite.text.size(), &vTxt);
+        napi_create_string_utf8(env, ev->clipWrite.html.c_str(), ev->clipWrite.html.size(), &vHtml);
+        napi_create_string_utf8(env, ev->clipWrite.uriList.c_str(), ev->clipWrite.uriList.size(), &vUri);
+        void *abData = nullptr;
+        napi_create_arraybuffer(env, ev->clipWrite.png.size(), &abData, &vPng);
+        if (abData != nullptr && !ev->clipWrite.png.empty()) {
+            memcpy(abData, ev->clipWrite.png.data(), ev->clipWrite.png.size());
+        }
+        napi_set_named_property(env, obj, "clear", vClear);
+        napi_set_named_property(env, obj, "concealed", vConc);
+        napi_set_named_property(env, obj, "text", vTxt);
+        napi_set_named_property(env, obj, "html", vHtml);
+        napi_set_named_property(env, obj, "uriList", vUri);
+        napi_set_named_property(env, obj, "png", vPng);
+        callBridgeMethod(env, cbObj, "onClipWrite", 1, &obj);
+        break;
+    }
+    case BridgeEventKind::ClipRead: {
+        napi_value args[2] = {nullptr, nullptr};
+        napi_create_uint32(env, ev->reqId, &args[0]);
+        napi_create_array_with_length(env, ev->strList.size(), &args[1]);
+        for (size_t i = 0; i < ev->strList.size(); ++i) {
+            napi_value s = nullptr;
+            napi_create_string_utf8(env, ev->strList[i].c_str(), ev->strList[i].size(), &s);
+            napi_set_element(env, args[1], static_cast<uint32_t>(i), s);
+        }
+        callBridgeMethod(env, cbObj, "onClipRead", 2, args);
+        break;
+    }
+    case BridgeEventKind::DialogOpen:
+    case BridgeEventKind::DialogSave: {
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_value vReq = nullptr, vWin = nullptr, vFlags = nullptr, vTitle = nullptr, vDef = nullptr, vBtn = nullptr, vFlt = nullptr;
+        napi_create_uint32(env, ev->fileDlg.reqId, &vReq);
+        napi_create_uint32(env, ev->fileDlg.winId, &vWin);
+        napi_create_uint32(env, ev->fileDlg.flags, &vFlags);
+        napi_create_string_utf8(env, ev->fileDlg.title.c_str(), ev->fileDlg.title.size(), &vTitle);
+        napi_create_string_utf8(env, ev->fileDlg.defaultPath.c_str(), ev->fileDlg.defaultPath.size(), &vDef);
+        napi_create_string_utf8(env, ev->fileDlg.buttonLabel.c_str(), ev->fileDlg.buttonLabel.size(), &vBtn);
+        napi_create_array_with_length(env, ev->fileDlg.filters.size(), &vFlt);
+        for (size_t i = 0; i < ev->fileDlg.filters.size(); ++i) {
+            const FileFilterData &ff = ev->fileDlg.filters[i];
+            napi_value fo = nullptr, fn = nullptr, fe = nullptr;
+            napi_create_object(env, &fo);
+            napi_create_string_utf8(env, ff.name.c_str(), ff.name.size(), &fn);
+            napi_create_array_with_length(env, ff.extensions.size(), &fe);
+            for (size_t j = 0; j < ff.extensions.size(); ++j) {
+                napi_value es = nullptr;
+                napi_create_string_utf8(env, ff.extensions[j].c_str(), ff.extensions[j].size(), &es);
+                napi_set_element(env, fe, static_cast<uint32_t>(j), es);
+            }
+            napi_set_named_property(env, fo, "name", fn);
+            napi_set_named_property(env, fo, "extensions", fe);
+            napi_set_element(env, vFlt, static_cast<uint32_t>(i), fo);
+        }
+        napi_set_named_property(env, obj, "reqId", vReq);
+        napi_set_named_property(env, obj, "winId", vWin);
+        napi_set_named_property(env, obj, "flags", vFlags);
+        napi_set_named_property(env, obj, "title", vTitle);
+        napi_set_named_property(env, obj, "defaultPath", vDef);
+        napi_set_named_property(env, obj, "buttonLabel", vBtn);
+        napi_set_named_property(env, obj, "filters", vFlt);
+        callBridgeMethod(env, cbObj, ev->kind == BridgeEventKind::DialogOpen ? "onDialogOpen" : "onDialogSave", 1, &obj);
+        break;
+    }
+    case BridgeEventKind::DialogMsg: {
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        auto setStr = [&](const char *k, const std::string &s) {
+            napi_value v = nullptr;
+            napi_create_string_utf8(env, s.c_str(), s.size(), &v);
+            napi_set_named_property(env, obj, k, v);
+        };
+        napi_value vReq = nullptr, vWin = nullptr, vDef = nullptr, vCan = nullptr, vChk = nullptr, vBtns = nullptr, vDestr = nullptr;
+        napi_create_uint32(env, ev->msgBox.reqId, &vReq);
+        napi_create_uint32(env, ev->msgBox.winId, &vWin);
+        napi_create_int32(env, ev->msgBox.defaultId, &vDef);
+        napi_create_int32(env, ev->msgBox.cancelId, &vCan);
+        napi_get_boolean(env, ev->msgBox.checkboxChecked, &vChk);
+        napi_create_array_with_length(env, ev->msgBox.buttons.size(), &vBtns);
+        for (size_t i = 0; i < ev->msgBox.buttons.size(); ++i) {
+            napi_value bs = nullptr;
+            napi_create_string_utf8(env, ev->msgBox.buttons[i].c_str(), ev->msgBox.buttons[i].size(), &bs);
+            napi_set_element(env, vBtns, static_cast<uint32_t>(i), bs);
+        }
+        napi_create_array_with_length(env, ev->msgBox.destructiveIds.size(), &vDestr);
+        for (size_t i = 0; i < ev->msgBox.destructiveIds.size(); ++i) {
+            napi_value di = nullptr;
+            napi_create_int32(env, ev->msgBox.destructiveIds[i], &di);
+            napi_set_element(env, vDestr, static_cast<uint32_t>(i), di);
+        }
+        napi_set_named_property(env, obj, "reqId", vReq);
+        napi_set_named_property(env, obj, "winId", vWin);
+        napi_set_named_property(env, obj, "defaultId", vDef);
+        napi_set_named_property(env, obj, "cancelId", vCan);
+        napi_set_named_property(env, obj, "checkboxChecked", vChk);
+        setStr("boxType", ev->msgBox.boxType);
+        setStr("title", ev->msgBox.title);
+        setStr("message", ev->msgBox.message);
+        setStr("detail", ev->msgBox.detail);
+        setStr("checkboxLabel", ev->msgBox.checkboxLabel);
+        napi_set_named_property(env, obj, "buttons", vBtns);
+        napi_set_named_property(env, obj, "destructiveIds", vDestr);
+        callBridgeMethod(env, cbObj, "onDialogMsg", 1, &obj);
+        break;
+    }
+    case BridgeEventKind::ShellReq: {
+        napi_value args[3] = {nullptr, nullptr, nullptr};
+        napi_create_uint32(env, ev->reqId, &args[0]);
+        napi_create_uint32(env, ev->shellOp, &args[1]);
+        napi_create_string_utf8(env, ev->shellTarget.c_str(), ev->shellTarget.size(), &args[2]);
+        callBridgeMethod(env, cbObj, "onShellReq", 3, args);
         break;
     }
     case BridgeEventKind::EngineQuit:
@@ -2177,7 +2382,7 @@ int recvMessage(uint8_t *kind, std::vector<uint8_t> *payload, int timeoutMs) {
     }
     uint32_t len = 0;
     memcpy(&len, hdr + 1, 4);
-    if (len > (1u << 20)) {
+    if (len > (64u << 20)) {
         return -1;
     }
     *kind = hdr[0];
@@ -2255,6 +2460,142 @@ bool decodePopupMenu(const std::vector<uint8_t> &p, BridgeEvent *ev) {
     return decodePopupSlice(p, off, &ev->popupItems) && off == p.size();
 }
 
+bool decodeClipWrite(const std::vector<uint8_t> &p, ClipWriteData *out) {
+    if (p.size() < 4) {
+        return false;
+    }
+    out->clear = p[0] != 0;
+    out->concealed = p[1] != 0;
+    size_t off = 4;
+    return readStr(p, off, &out->text) &&
+           readStr(p, off, &out->html) &&
+           readStr(p, off, &out->uriList) &&
+           readBytes(p, off, &out->png) &&
+           off == p.size();
+}
+
+bool decodeClipRead(const std::vector<uint8_t> &p, uint32_t *reqId, std::vector<std::string> *fmts) {
+    size_t off = 0;
+    uint32_t count = 0;
+    if (!readU32(p, off, reqId) || !readU32(p, off, &count) || count > 128) {
+        return false;
+    }
+    fmts->clear();
+    fmts->reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        std::string s;
+        if (!readStr(p, off, &s)) {
+            return false;
+        }
+        fmts->push_back(std::move(s));
+    }
+    return off == p.size();
+}
+
+bool decodeFileDialog(const std::vector<uint8_t> &p, FileDialogData *out) {
+    if (p.size() < 12) {
+        return false;
+    }
+    memcpy(&out->reqId, p.data() + 0, 4);
+    memcpy(&out->winId, p.data() + 4, 4);
+    out->flags = p[8];
+    size_t off = 12;
+    uint32_t fCount = 0;
+    if (!readStr(p, off, &out->title) ||
+        !readStr(p, off, &out->defaultPath) ||
+        !readStr(p, off, &out->buttonLabel) ||
+        !readU32(p, off, &fCount) || fCount > 64) {
+        return false;
+    }
+    out->filters.clear();
+    out->filters.reserve(fCount);
+    for (uint32_t i = 0; i < fCount; ++i) {
+        FileFilterData ff;
+        uint32_t eCount = 0;
+        if (!readStr(p, off, &ff.name) || !readU32(p, off, &eCount) || eCount > 256) {
+            return false;
+        }
+        ff.extensions.reserve(eCount);
+        for (uint32_t j = 0; j < eCount; ++j) {
+            std::string ext;
+            if (!readStr(p, off, &ext)) {
+                return false;
+            }
+            ff.extensions.push_back(std::move(ext));
+        }
+        out->filters.push_back(std::move(ff));
+    }
+    return off == p.size();
+}
+
+bool decodeMessageBox(const std::vector<uint8_t> &p, MessageBoxData *out) {
+    if (p.size() < 20) {
+        return false;
+    }
+    memcpy(&out->reqId, p.data() + 0, 4);
+    memcpy(&out->winId, p.data() + 4, 4);
+    memcpy(&out->defaultId, p.data() + 8, 4);
+    memcpy(&out->cancelId, p.data() + 12, 4);
+    out->checkboxChecked = p[16] != 0;
+    size_t off = 20;
+    uint32_t bCount = 0;
+    if (!readStr(p, off, &out->boxType) ||
+        !readStr(p, off, &out->title) ||
+        !readStr(p, off, &out->message) ||
+        !readStr(p, off, &out->detail) ||
+        !readStr(p, off, &out->checkboxLabel) ||
+        !readU32(p, off, &bCount) || bCount > 32) {
+        return false;
+    }
+    out->buttons.clear();
+    out->buttons.reserve(bCount);
+    for (uint32_t i = 0; i < bCount; ++i) {
+        std::string s;
+        if (!readStr(p, off, &s)) {
+            return false;
+        }
+        out->buttons.push_back(std::move(s));
+    }
+    uint32_t dCount = 0;
+    if (!readU32(p, off, &dCount) || dCount > 32) {
+        return false;
+    }
+    out->destructiveIds.clear();
+    out->destructiveIds.reserve(dCount);
+    for (uint32_t i = 0; i < dCount; ++i) {
+        uint32_t u = 0;
+        if (!readU32(p, off, &u)) {
+            return false;
+        }
+        out->destructiveIds.push_back(static_cast<int32_t>(u));
+    }
+    return off == p.size();
+}
+
+void sendDialogFallbackResult(uint32_t reqId, int32_t resp, const std::string &errStr) {
+    std::vector<uint8_t> wire(12, 0);
+    memcpy(wire.data() + 0, &reqId, 4);
+    memcpy(wire.data() + 4, &resp, 4);
+    appendStr(wire, errStr);
+    appendU32(wire, 0);
+    sendMessage(kDialogResult, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+}
+
+void sendShellResult(uint32_t reqId, const std::string &errStr) {
+    std::vector<uint8_t> wire;
+    appendU32(wire, reqId);
+    appendStr(wire, errStr);
+    sendMessage(kShellResult, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+}
+
+void sendClipDataFallback(uint32_t reqId, const std::string &errStr) {
+    std::vector<uint8_t> wire;
+    appendU32(wire, reqId);
+    appendStr(wire, errStr);
+    appendU32(wire, 0);
+    sendMessage(kClipData, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+}
+
 void resetAllPendingBuffers() {
     std::vector<std::shared_ptr<WinSession>> list;
     {
@@ -2277,12 +2618,24 @@ void resetAllPendingBuffers() {
 
 void sendInitialStateToEngine() {
     std::vector<uint8_t> envWire;
+    std::vector<uint8_t> clipWire;
+    std::vector<std::vector<uint8_t>> appOpens;
     {
         std::lock_guard<std::mutex> lk(gEnvMu);
         envWire = gCachedEnv.wirePayload;
+        clipWire = gCachedClipWire;
+        appOpens.swap(gPendingAppOpens);
     }
     if (!envWire.empty()) {
         sendMessage(kEnvInfo, envWire.data(), static_cast<uint32_t>(envWire.size()), -1);
+    }
+    if (!clipWire.empty()) {
+        sendMessage(kClipChanged, clipWire.data(), static_cast<uint32_t>(clipWire.size()), -1);
+    }
+    for (const auto &ao : appOpens) {
+        if (!ao.empty()) {
+            sendMessage(kAppOpen, ao.data(), static_cast<uint32_t>(ao.size()), -1);
+        }
     }
     sendWindowInput(1, currentDark ? kWinThemeDark : kWinThemeLight);
     auto ws1 = findSession(1);
@@ -2433,6 +2786,70 @@ bool pumpEngineMessages() {
                 uint32_t reqId = 0;
                 memcpy(&reqId, payload.data(), 4);
                 sendPopupResult(reqId, 0);
+            }
+            break;
+        }
+        case kClipWrite: {
+            auto ev = std::make_unique<BridgeEvent>();
+            ev->kind = BridgeEventKind::ClipWrite;
+            if (decodeClipWrite(payload, &ev->clipWrite)) {
+                postBridgeEvent(std::move(ev));
+            }
+            break;
+        }
+        case kClipRead: {
+            auto ev = std::make_unique<BridgeEvent>();
+            ev->kind = BridgeEventKind::ClipRead;
+            if (decodeClipRead(payload, &ev->reqId, &ev->strList)) {
+                postBridgeEvent(std::move(ev));
+            } else if (payload.size() >= 4) {
+                uint32_t reqId = 0;
+                memcpy(&reqId, payload.data(), 4);
+                sendClipDataFallback(reqId, "ohos: malformed clipboard request");
+            }
+            break;
+        }
+        case kDialogOpen:
+        case kDialogSave: {
+            auto ev = std::make_unique<BridgeEvent>();
+            ev->kind = (kind == kDialogOpen) ? BridgeEventKind::DialogOpen : BridgeEventKind::DialogSave;
+            if (decodeFileDialog(payload, &ev->fileDlg)) {
+                postBridgeEvent(std::move(ev));
+            } else if (payload.size() >= 4) {
+                uint32_t reqId = 0;
+                memcpy(&reqId, payload.data(), 4);
+                sendDialogFallbackResult(reqId, 0, "ohos: malformed file dialog request");
+            }
+            break;
+        }
+        case kDialogMsg: {
+            auto ev = std::make_unique<BridgeEvent>();
+            ev->kind = BridgeEventKind::DialogMsg;
+            if (decodeMessageBox(payload, &ev->msgBox)) {
+                postBridgeEvent(std::move(ev));
+            } else if (payload.size() >= 4) {
+                uint32_t reqId = 0;
+                memcpy(&reqId, payload.data(), 4);
+                sendDialogFallbackResult(reqId, -1, "ohos: malformed message box request");
+            }
+            break;
+        }
+        case kShellReq: {
+            if (payload.size() >= 8) {
+                size_t off = 8;
+                std::string target;
+                if (readStr(payload, off, &target) && off == payload.size()) {
+                    auto ev = std::make_unique<BridgeEvent>();
+                    ev->kind = BridgeEventKind::ShellReq;
+                    memcpy(&ev->reqId, payload.data(), 4);
+                    ev->shellOp = payload[4];
+                    ev->shellTarget = std::move(target);
+                    postBridgeEvent(std::move(ev));
+                } else {
+                    uint32_t reqId = 0;
+                    memcpy(&reqId, payload.data(), 4);
+                    sendShellResult(reqId, "ohos: malformed shell request");
+                }
             }
             break;
         }
@@ -3141,6 +3558,200 @@ napi_value ResolvePopupMenu(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+napi_value NotifyClipChanged(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) {
+        return nullptr;
+    }
+    uint32_t changeCount = 0;
+    bool external = true;
+    napi_get_value_uint32(env, argv[0], &changeCount);
+    napi_get_value_bool(env, argv[1], &external);
+
+    std::vector<std::string> mimes;
+    uint32_t arrLen = 0;
+    if (napi_get_array_length(env, argv[2], &arrLen) == napi_ok) {
+        for (uint32_t i = 0; i < arrLen && i < 128; ++i) {
+            napi_value elem = nullptr;
+            if (napi_get_element(env, argv[2], i, &elem) == napi_ok && elem != nullptr) {
+                std::string m = getNapiString(env, elem);
+                if (!m.empty()) {
+                    mimes.push_back(std::move(m));
+                }
+            }
+        }
+    }
+
+    std::vector<uint8_t> wire(8, 0);
+    memcpy(wire.data() + 0, &changeCount, 4);
+    wire[4] = external ? 1 : 0;
+    appendU32(wire, static_cast<uint32_t>(mimes.size()));
+    for (const auto &m : mimes) {
+        appendStr(wire, m);
+    }
+
+    if (external) {
+        std::lock_guard<std::mutex> lk(gEnvMu);
+        gCachedClipWire = wire;
+    }
+    sendMessage(kClipChanged, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+    return nullptr;
+}
+
+napi_value ResolveClipRead(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) {
+        return nullptr;
+    }
+    uint32_t reqId = 0;
+    napi_get_value_uint32(env, argv[0], &reqId);
+    std::string errStr = getNapiString(env, argv[1]);
+
+    struct RepEntry {
+        std::string fmt;
+        const uint8_t *ptr = nullptr;
+        size_t len = 0;
+    };
+    std::vector<RepEntry> reps;
+    uint32_t arrLen = 0;
+    if (napi_get_array_length(env, argv[2], &arrLen) == napi_ok) {
+        for (uint32_t i = 0; i < arrLen && i < 128; ++i) {
+            napi_value obj = nullptr;
+            if (napi_get_element(env, argv[2], i, &obj) != napi_ok || obj == nullptr) {
+                continue;
+            }
+            RepEntry re;
+            re.fmt = getPropString(env, obj, "format");
+            if (re.fmt.empty()) {
+                continue;
+            }
+            napi_value dataVal = nullptr;
+            if (napi_get_named_property(env, obj, "data", &dataVal) == napi_ok && dataVal != nullptr) {
+                bool isAb = false;
+                if (napi_is_arraybuffer(env, dataVal, &isAb) == napi_ok && isAb) {
+                    void *raw = nullptr;
+                    size_t byteLen = 0;
+                    if (napi_get_arraybuffer_info(env, dataVal, &raw, &byteLen) == napi_ok) {
+                        re.ptr = static_cast<const uint8_t *>(raw);
+                        re.len = byteLen;
+                    }
+                }
+            }
+            reps.push_back(re);
+        }
+    }
+
+    std::vector<uint8_t> wire;
+    appendU32(wire, reqId);
+    appendStr(wire, errStr);
+    appendU32(wire, static_cast<uint32_t>(reps.size()));
+    for (const auto &r : reps) {
+        appendStr(wire, r.fmt);
+        appendBytes(wire, r.ptr, r.len);
+    }
+    sendMessage(kClipData, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+    return nullptr;
+}
+
+napi_value ResolveDialog(napi_env env, napi_callback_info info) {
+    size_t argc = 5;
+    napi_value argv[5] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 5) {
+        return nullptr;
+    }
+    uint32_t reqId = 0;
+    int32_t response = 0;
+    bool checked = false;
+    napi_get_value_uint32(env, argv[0], &reqId);
+    napi_get_value_int32(env, argv[1], &response);
+    napi_get_value_bool(env, argv[2], &checked);
+    std::string errStr = getNapiString(env, argv[3]);
+
+    std::vector<std::string> paths;
+    uint32_t arrLen = 0;
+    if (napi_get_array_length(env, argv[4], &arrLen) == napi_ok) {
+        for (uint32_t i = 0; i < arrLen && i < 4096; ++i) {
+            napi_value elem = nullptr;
+            if (napi_get_element(env, argv[4], i, &elem) == napi_ok && elem != nullptr) {
+                std::string p = getNapiString(env, elem);
+                if (!p.empty()) {
+                    paths.push_back(std::move(p));
+                }
+            }
+        }
+    }
+
+    std::vector<uint8_t> wire(12, 0);
+    memcpy(wire.data() + 0, &reqId, 4);
+    memcpy(wire.data() + 4, &response, 4);
+    wire[8] = checked ? 1 : 0;
+    appendStr(wire, errStr);
+    appendU32(wire, static_cast<uint32_t>(paths.size()));
+    for (const auto &p : paths) {
+        appendStr(wire, p);
+    }
+    sendMessage(kDialogResult, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+    return nullptr;
+}
+
+napi_value ResolveShell(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return nullptr;
+    }
+    uint32_t reqId = 0;
+    napi_get_value_uint32(env, argv[0], &reqId);
+    std::string errStr = getNapiString(env, argv[1]);
+    sendShellResult(reqId, errStr);
+    return nullptr;
+}
+
+napi_value NotifyAppOpen(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return nullptr;
+    }
+    uint32_t op = 0;
+    napi_get_value_uint32(env, argv[0], &op);
+
+    std::vector<std::string> items;
+    uint32_t arrLen = 0;
+    if (napi_get_array_length(env, argv[1], &arrLen) == napi_ok) {
+        for (uint32_t i = 0; i < arrLen && i < 256; ++i) {
+            napi_value elem = nullptr;
+            if (napi_get_element(env, argv[1], i, &elem) == napi_ok && elem != nullptr) {
+                std::string s = getNapiString(env, elem);
+                if (!s.empty()) {
+                    items.push_back(std::move(s));
+                }
+            }
+        }
+    }
+
+    std::vector<uint8_t> wire(4, 0);
+    wire[0] = static_cast<uint8_t>(op);
+    appendU32(wire, static_cast<uint32_t>(items.size()));
+    for (const auto &s : items) {
+        appendStr(wire, s);
+    }
+    if (!sendMessage(kAppOpen, wire.data(), static_cast<uint32_t>(wire.size()), -1)) {
+        std::lock_guard<std::mutex> lk(gEnvMu);
+        if (gPendingAppOpens.size() < 32) {
+            gPendingAppOpens.push_back(std::move(wire));
+        }
+    }
+    return nullptr;
+}
+
 napi_value SetDarkMode(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1] = {nullptr};
@@ -3176,6 +3787,11 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"notifyWindowRect", nullptr, NotifyWindowRect, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"notifyTitleBar", nullptr, NotifyTitleBar, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"resolvePopupMenu", nullptr, ResolvePopupMenu, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"notifyClipChanged", nullptr, NotifyClipChanged, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"resolveClipRead", nullptr, ResolveClipRead, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"resolveDialog", nullptr, ResolveDialog, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"resolveShell", nullptr, ResolveShell, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"notifyAppOpen", nullptr, NotifyAppOpen, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setDarkMode", nullptr, SetDarkMode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"crash", nullptr, Crash, nullptr, nullptr, nullptr, napi_default, nullptr},
     };

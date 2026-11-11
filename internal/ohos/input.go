@@ -511,8 +511,11 @@ func (s *Surface) onWindow(p []byte) {
 				}
 				app := w.b.app
 				w.b.mu.Unlock()
-				if resigned && app != nil {
-					app.DidResignActive()
+				if resigned {
+					w.b.syncOwnedClipboardToHost()
+					if app != nil {
+						app.DidResignActive()
+					}
 				}
 			}
 		}

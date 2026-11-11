@@ -109,13 +109,13 @@ fd 走 `SCM_RIGHTS` → Go 引擎 `mmap` 画 → `FlushBuffer`。
 - [x] **屏幕与打包应用元数据**：实现 `Screen.Displays()` / `CursorPoint()`（接入 `@ohos.display` 多显示器几何、可用工作区 `WorkArea` 与缩放比，监听显示器变更触发 `DisplaysChanged`）以及 `App.PreferredLanguages()` / `App.Region()` / `App.Package()`（接入 `@ohos.i18n` 与 `bundleManager`）
 - [x] **退出判据**：`go test -count=5 ./internal/ohos` 全绿，真机验证原生右键弹出菜单、标题同步及屏幕/语言信息查询通过；框架宿主与 HNP 工具统一收归 `mygo` 仓库（`internal/ohos/host`、`internal/ohos/cmd/hnp`）
 
-## S6 框架补齐 Batch 2：桌面通用 I/O（剪贴板、对话框/Picker、Shell、深链与单实例）
+## S6 框架补齐 Batch 2：桌面通用 I/O（剪贴板、对话框/Picker、Shell、深链与单实例）—— 已完成
 
-- [ ] **剪贴板（`Backend.Clipboard`）**：接入 `@ohos.pasteboard` 读写纯文本、HTML、PNG 图片与格式探测，打通文本框 `Ctrl+C`/`Ctrl+V`/`Ctrl+X` 及应用内复制操作
-- [ ] **原生文件/目录选择器与消息框（`Backend.Dialogs`）**：接入 `@ohos.file.picker`（`DocumentViewPicker` 多选文件/目录选择、保存面板，处理 URI 授权到引擎可读路径的桥接）与 `UIContext.showAlertDialog` 消息框
-- [ ] **Shell 与系统集成（`Backend.Shell`）**：实现 `OpenExternal`（`context.openLink` / `startAbility` 打开外部浏览器）、`OpenPath`、`ShowItemInFolder`
-- [ ] **URL 深链与单实例激活**：在 `EntryAbility` 的 `onCreate` / `onNewWant` 中捕获 `want.uri` 与文件参数，桥接至 `AppHandler.OpenURLs` / `OpenFiles` / `Activated`
-- [ ] **退出判据**：单元测试与真机验证剪贴板双向复制粘贴、系统文件/文件夹选择返回可读路径、消息弹窗与 `mygo-music://` 深链唤起通过
+- [x] **剪贴板（`Backend.Clipboard`）**：接入 `@ohos.pasteboard` 读写纯文本、HTML、PNG 图片与格式探测（保持惰性 Provider 语义，在 `Flush`、失焦或退出时落盘至系统剪贴板，`concealed` 映射 `ShareOption.INAPP`），打通文本框 `Ctrl+C`/`Ctrl+V`/`Ctrl+X` 及应用内复制操作
+- [x] **原生文件/目录选择器与消息框（`Backend.Dialogs`）**：接入 `@ohos.file.picker`（`DocumentViewPicker` 多选文件/目录选择、保存面板，`fileShare.persistPermission` 持久化授权并在重启时激活，URI 自动映射或回退至沙箱可读路径）与 `openCustomDialog` 原生消息框（支持多按钮、默认/破坏性按钮及复选框）；补齐 `ReplaceFile` 与 `inotify` `NewFileWatch`
+- [x] **Shell 与系统集成（`Backend.Shell`）**：实现 `OpenExternal`（`context.openLink` / `startAbility` 打开外部浏览器）、`OpenPath`、`ShowItemInFolder`、`TrashItem`、`Beep`
+- [x] **URL 深链与单实例激活**：`EntryAbility` 设为 `singleton`，在 `onCreate` / `onNewWant` 中捕获 `want.uri` 与文件参数，支持 `Ready()` 前冷启动深链缓冲与运行期桥接至 `AppHandler.OpenURLs` / `OpenFiles` / `Activated`
+- [x] **退出判据**：单元测试（`go test -count=10 ./internal/ohos/...`）与真机验证剪贴板、系统选择器、消息弹窗与 `mygo-music://` 单实例深链唤起通过
 
 ## S7 框架补齐 Batch 3：音频输出、媒体播控、通知与后台运行
 

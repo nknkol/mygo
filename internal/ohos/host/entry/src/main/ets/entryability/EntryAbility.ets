@@ -12,10 +12,16 @@ function isDarkMode(mode: ConfigurationConstant.ColorMode | undefined): boolean 
 }
 
 export default class EntryAbility extends UIAbility {
-  onCreate(_want: Want, _launchParam: AbilityConstant.LaunchParam): void {
+  onCreate(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'onCreate');
     AppStorage.setOrCreate<boolean>('darkMode', isDarkMode(this.context.config?.colorMode));
     hostBridge.init(this.context);
+    hostBridge.handleWant(want, false);
+  }
+
+  onNewWant(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
+    hilog.info(DOMAIN, TAG, 'onNewWant');
+    hostBridge.handleWant(want, true);
   }
 
   onConfigurationUpdate(newConfig: Configuration): void {

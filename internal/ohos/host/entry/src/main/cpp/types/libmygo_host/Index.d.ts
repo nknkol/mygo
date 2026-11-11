@@ -44,11 +44,61 @@ export interface HostDisplayInfo {
   internal: boolean;
 }
 
+export interface HostClipWrite {
+  clear: boolean;
+  concealed: boolean;
+  text: string;
+  html: string;
+  uriList: string;
+  png: ArrayBuffer;
+}
+
+export interface HostClipRep {
+  format: string;
+  data: ArrayBuffer;
+}
+
+export interface HostFileFilter {
+  name: string;
+  extensions: string[];
+}
+
+export interface HostFileDialog {
+  reqId: number;
+  winId: number;
+  flags: number;
+  title: string;
+  defaultPath: string;
+  buttonLabel: string;
+  filters: HostFileFilter[];
+}
+
+export interface HostMessageBox {
+  reqId: number;
+  winId: number;
+  defaultId: number;
+  cancelId: number;
+  checkboxChecked: boolean;
+  boxType: string;
+  title: string;
+  message: string;
+  detail: string;
+  checkboxLabel: string;
+  buttons: string[];
+  destructiveIds: number[];
+}
+
 export interface HostBridgeCallbacks {
   onWinCreate: (cfg: HostWinConfig) => void;
   onWinConfig: (cfg: HostWinConfig) => void;
   onWinAction: (winId: number, action: number) => void;
   onPopupMenu: (reqId: number, winId: number, x: number, y: number, rtl: boolean, items: HostMenuItem[]) => void;
+  onClipWrite: (data: HostClipWrite) => void;
+  onClipRead: (reqId: number, formats: string[]) => void;
+  onDialogOpen: (dlg: HostFileDialog) => void;
+  onDialogSave: (dlg: HostFileDialog) => void;
+  onDialogMsg: (box: HostMessageBox) => void;
+  onShellReq: (reqId: number, op: number, target: string) => void;
   onEngineQuit: () => void;
   onEngineRestart: () => void;
 }
@@ -79,6 +129,11 @@ export interface HostModule {
   notifyWindowRect(winId: number, xDip: number, yDip: number, wDip: number, hDip: number): void;
   notifyTitleBar(winId: number, heightDip: number, leftDip: number, rightDip: number): void;
   resolvePopupMenu(reqId: number, chosenId: number): void;
+  notifyClipChanged(changeCount: number, external: boolean, mimes: string[]): void;
+  resolveClipRead(reqId: number, err: string, reps: HostClipRep[]): void;
+  resolveDialog(reqId: number, response: number, checkboxChecked: boolean, err: string, paths: string[]): void;
+  resolveShell(reqId: number, err: string): void;
+  notifyAppOpen(op: number, items: string[]): void;
   setDarkMode(dark: boolean): void;
   crash(): void;
 }

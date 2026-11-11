@@ -54,9 +54,21 @@ type Backend struct {
 	langs        []string
 	region       platform.Region
 	displays     []platform.Display
-	cursorPoint  platform.Point
-	nextPopupReq uint32
-	popupResults map[uint32]int32
+	cursorPoint     platform.Point
+	nextPopupReq    uint32
+	popupResults    map[uint32]int32
+	clipOwned       *clipboardSource
+	clipGen         uint64
+	clipExtMimes    []string
+	nextClipReq     uint32
+	clipResults     map[uint32]clipReadResult
+	nextDialogReq   uint32
+	pendingDialogs  map[uint32]pendingDialog
+	nextShellReq    uint32
+	shellResults    map[uint32]string
+	readyDone       bool
+	pendingAppOpens []appOpenEvent
+	schemes         map[string]bool
 }
 
 // New returns the backend from the arguments and environment the host started
@@ -190,6 +202,7 @@ func (b *Backend) Run() error {
 	if app != nil {
 		app.Ready()
 	}
+	b.flushPendingAppOpens()
 	for b.step() {
 	}
 	return nil
@@ -224,11 +237,14 @@ func (b *Backend) popNextLocked() (event, bool) {
 	if b.events[0].kind == kindFrame {
 		for i := 1; i < len(b.events); i++ {
 			k := b.events[i].kind
-			if k == kindInput || k == kindPopupResult || k == kindEnvInfo {
+			switch k {
+			case kindInput, kindPopupResult, kindEnvInfo,
+				kindClipChanged, kindClipData, kindDialogResult, kindShellResult, kindAppOpen:
 				idx = i
-				break
+			case kindQuit, kindSurface:
+				i = len(b.events)
 			}
-			if k == kindQuit || k == kindSurface {
+			if idx != 0 {
 				break
 			}
 		}
@@ -315,6 +331,9 @@ func (b *Backend) Signal() {
 }
 
 func (b *Backend) Quit() {
+	if b.IsMainThread() {
+		b.syncOwnedClipboardToHost()
+	}
 	b.mu.Lock()
 	sendQuit := !b.quitSent && b.conn != nil
 	b.quitSent = true
@@ -326,9 +345,7 @@ func (b *Backend) Quit() {
 	if sendQuit {
 		_ = b.conn.write(kindQuit, nil)
 	}
-	if b.conn != nil {
-		syscall.Close(b.conn.fd)
-	}
+	b.conn.close()
 }
 
 func (b *Backend) NewWindow(opts *platform.WindowOptions, h platform.WindowHandler) (platform.Window, error) {
@@ -459,6 +476,16 @@ func (b *Backend) dispatch(ev event) {
 		b.onEnvInfo(ev.payload)
 	case kindPopupResult:
 		b.onPopupResult(ev.payload)
+	case kindClipChanged:
+		b.onClipChanged(ev.payload)
+	case kindClipData:
+		b.onClipData(ev.payload)
+	case kindDialogResult:
+		b.onDialogResult(ev.payload)
+	case kindShellResult:
+		b.onShellResult(ev.payload)
+	case kindAppOpen:
+		b.onAppOpen(ev.payload)
 	}
 }
 

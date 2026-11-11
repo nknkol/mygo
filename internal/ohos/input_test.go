@@ -70,21 +70,23 @@ func newTestSurface(t *testing.T) (*Backend, *Surface, *conn, *testWindowHandler
 	if err != nil {
 		t.Fatalf("socketpair: %v", err)
 	}
-	t.Cleanup(func() {
-		syscall.Close(fds[0])
-		syscall.Close(fds[1])
-	})
 	b := NewWithFD(fds[0])
 	b.initW, b.initH, b.initScale = 1600, 1000, 2
 	if err := b.Init(nil, platform.AppOptions{}); err != nil {
+		syscall.Close(fds[0])
+		syscall.Close(fds[1])
 		t.Fatalf("Init: %v", err)
 	}
+	hostConn := &conn{fd: fds[1]}
+	t.Cleanup(func() {
+		b.conn.close()
+		hostConn.close()
+	})
 	h := &testWindowHandler{}
 	w, err := b.NewWindow(&platform.WindowOptions{Surface: true}, h)
 	if err != nil {
 		t.Fatalf("NewWindow: %v", err)
 	}
-	hostConn := &conn{fd: fds[1]}
 	kind, payload, _, err := hostConn.read()
 	if err != nil || kind != kindWinCreate {
 		t.Fatalf("initial NewWindow message = (kind=%d, err=%v), want kindWinCreate", kind, err)
@@ -375,20 +377,32 @@ func TestIMEPreviewCommitAndDeleteSurrounding(t *testing.T) {
 
 type testAppHandler struct {
 	platform.AppHandler
+	ready           func()
 	dispatched      int
 	themeChanged    int
 	becameActive    int
 	resigned        int
 	displaysChanged int
 	localeChanged   int
+	openURLs        []string
+	openFiles       []string
+	activated       []bool
 }
 
-func (h *testAppHandler) Dispatch()        { h.dispatched++ }
-func (h *testAppHandler) ThemeChanged()    { h.themeChanged++ }
-func (h *testAppHandler) DidBecomeActive() { h.becameActive++ }
-func (h *testAppHandler) DidResignActive() { h.resigned++ }
-func (h *testAppHandler) DisplaysChanged() { h.displaysChanged++ }
-func (h *testAppHandler) LocaleChanged()   { h.localeChanged++ }
+func (h *testAppHandler) Ready() {
+	if h.ready != nil {
+		h.ready()
+	}
+}
+func (h *testAppHandler) Dispatch()                { h.dispatched++ }
+func (h *testAppHandler) ThemeChanged()            { h.themeChanged++ }
+func (h *testAppHandler) DidBecomeActive()         { h.becameActive++ }
+func (h *testAppHandler) DidResignActive()         { h.resigned++ }
+func (h *testAppHandler) DisplaysChanged()         { h.displaysChanged++ }
+func (h *testAppHandler) LocaleChanged()           { h.localeChanged++ }
+func (h *testAppHandler) OpenURLs(urls []string)   { h.openURLs = append(h.openURLs, urls...) }
+func (h *testAppHandler) OpenFiles(paths []string) { h.openFiles = append(h.openFiles, paths...) }
+func (h *testAppHandler) Activated(vis bool)       { h.activated = append(h.activated, vis) }
 
 // Signaling the backend before Init (such as Application.SetLanguages posting before Run) does not panic on a nil sync.Cond and dispatches on the first step.
 func TestSignalBeforeInitDispatchesOnFirstStep(t *testing.T) {
