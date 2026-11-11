@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "0.1.28",
+  "description": "MyGo Music",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {
+    "libmygo_host.so": "file:./src/main/cpp/types/libmygo_host"
+  }
+}

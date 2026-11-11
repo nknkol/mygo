@@ -1,0 +1,4 @@
+# Obfuscation rules of the release build. Keep names the shell reaches for
+# by string, such as the ability's and the page's.
+-enable-property-obfuscation
+-keep-global-name

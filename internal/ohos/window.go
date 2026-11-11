@@ -1,0 +1,561 @@
+//go:build linux && (amd64 || arm64)
+
+package ohos
+
+import (
+	"math"
+
+	"github.com/egoist/mygo/internal/platform"
+)
+
+// Window is a HarmonyOS window backed by an OHNativeWindow surface in the
+// host process: Window 1 is the UIAbility's main window, and subsequent
+// windows are freeform or modal subwindows on WindowStage.
+type Window struct {
+	b        *Backend
+	id       uint32
+	parentID uint32
+	surface  *Surface
+	h        platform.WindowHandler
+	opts     platform.WindowOptions
+
+	title       string
+	visible     bool
+	minimized   bool
+	maximized   bool
+	fullscreen  bool
+	focused     bool
+	alwaysOnTop bool
+	hasShadow   bool
+	closed      bool
+	zoom        float64
+	ua          string
+	muted       bool
+	bounds      platform.Rect
+	minSize     platform.Size
+	maxSize     platform.Size
+	bgColor     platform.Color
+	hasBg       bool
+	rawTitleBar platform.TitleBar
+	hasTitleBar bool
+}
+
+func newWindow(b *Backend, id uint32, scale float64, opts *platform.WindowOptions, h platform.WindowHandler) *Window {
+	if scale <= 0 {
+		scale = 1
+	}
+	w := &Window{
+		b:         b,
+		id:        id,
+		h:         h,
+		focused:   id == 1,
+		hasShadow: true,
+		zoom:      1,
+		opts: platform.WindowOptions{
+			Resizable:   true,
+			Movable:     true,
+			Minimizable: true,
+			Maximizable: true,
+			Closable:    true,
+			HasShadow:   true,
+		},
+	}
+	if opts != nil {
+		w.opts = *opts
+		w.title = opts.Title
+		w.minSize = opts.MinSize
+		w.maxSize = opts.MaxSize
+		w.alwaysOnTop = opts.AlwaysOnTop
+		w.maximized = opts.Maximized
+		w.fullscreen = opts.FullScreen
+		w.hasShadow = opts.HasShadow
+		if opts.BackgroundColor != nil {
+			w.bgColor = *opts.BackgroundColor
+			w.hasBg = true
+		}
+		if pw, ok := opts.Parent.(*Window); ok && pw != nil {
+			w.parentID = pw.id
+		}
+		w.bounds = platform.Rect{
+			X:      opts.X,
+			Y:      opts.Y,
+			Width:  opts.Width,
+			Height: opts.Height,
+		}
+	}
+
+	pxW, pxH := 0, 0
+	if id == 1 && b.initW > 0 && b.initH > 0 {
+		pxW, pxH = b.initW, b.initH
+		if b.initScale > 0 {
+			scale = b.initScale
+		}
+		w.updateBoundsFromPixels(pxW, pxH, scale)
+	} else {
+		dipW := max(w.bounds.Width, 1)
+		dipH := max(w.bounds.Height, 1)
+		if w.bounds.Width <= 0 {
+			w.bounds.Width = dipW
+		}
+		if w.bounds.Height <= 0 {
+			w.bounds.Height = dipH
+		}
+		pxW = max(1, int(math.Round(float64(dipW)*scale)))
+		pxH = max(1, int(math.Round(float64(dipH)*scale)))
+	}
+
+	w.surface = &Surface{
+		w:      w,
+		width:  pxW,
+		height: pxH,
+		scale:  scale,
+		hz:     120,
+	}
+	return w
+}
+
+func (w *Window) hiddenTitleBar() bool {
+	return !w.opts.Frameless && (w.opts.TitleBarStyle == "hidden" || w.opts.TitleBarStyle == "hiddenInset")
+}
+
+func (w *Window) styleFlags() uint32 {
+	var f uint32
+	if w.opts.Resizable {
+		f |= winFlagResizable
+	}
+	if w.opts.Minimizable {
+		f |= winFlagMinimizable
+	}
+	if w.opts.Maximizable {
+		f |= winFlagMaximizable
+	}
+	if w.opts.Closable {
+		f |= winFlagClosable
+	}
+	if w.opts.Modal {
+		f |= winFlagModal
+	}
+	if w.hiddenTitleBar() {
+		f |= winFlagHiddenTitleBar
+	}
+	if w.opts.HideWindowButtons {
+		f |= winFlagHideWinButtons
+	}
+	if w.alwaysOnTop {
+		f |= winFlagAlwaysOnTop
+	}
+	if w.maximized {
+		f |= winFlagMaximized
+	}
+	if w.fullscreen {
+		f |= winFlagFullScreen
+	}
+	if w.opts.Center {
+		f |= winFlagCenter
+	}
+	if w.opts.Frameless {
+		f |= winFlagFrameless
+	}
+	if w.hasBg {
+		f |= winFlagHasBg
+	}
+	if w.opts.Movable {
+		f |= winFlagMovable
+	}
+	return f
+}
+
+func (w *Window) packedBgRGBA() uint32 {
+	return uint32(w.bgColor.R)<<24 | uint32(w.bgColor.G)<<16 | uint32(w.bgColor.B)<<8 | uint32(w.bgColor.A)
+}
+
+func (w *Window) wireConfig(parentOrMask uint32) winConfigWire {
+	return winConfigWire{
+		winID:          w.id,
+		parentOrMask:   parentOrMask,
+		x:              int32(w.bounds.X),
+		y:              int32(w.bounds.Y),
+		w:              int32(w.bounds.Width),
+		h:              int32(w.bounds.Height),
+		minW:           int32(w.minSize.Width),
+		minH:           int32(w.minSize.Height),
+		maxW:           int32(w.maxSize.Width),
+		maxH:           int32(w.maxSize.Height),
+		flags:          w.styleFlags(),
+		titleBarHeight: int32(w.opts.TitleBarHeight),
+		bgRGBA:         w.packedBgRGBA(),
+		title:          w.title,
+	}
+}
+
+func (w *Window) sendConfig(mask uint32) {
+	if w.closed || w.b == nil {
+		return
+	}
+	w.b.send(kindWinConfig, winConfigMessage(w.wireConfig(mask)))
+}
+
+func (w *Window) sendAction(act byte) {
+	if w.closed || w.b == nil {
+		return
+	}
+	w.b.send(kindWinAction, winActionMessage(w.id, act))
+}
+
+func (w *Window) updateBoundsFromPixels(pxW, pxH int, scale float64) {
+	if pxW <= 0 || pxH <= 0 {
+		return
+	}
+	if scale <= 0 {
+		scale = 1
+	}
+	w.bounds.Width = int(math.Round(float64(pxW) / scale))
+	w.bounds.Height = int(math.Round(float64(pxH) / scale))
+}
+
+func (w *Window) Handle() uintptr           { return uintptr(w.id) }
+func (w *Window) Surface() platform.Surface { return w.surface }
+
+func (w *Window) SetTitle(title string) {
+	if w.title == title {
+		return
+	}
+	w.title = title
+	w.sendConfig(cfgMaskTitle)
+}
+
+func (w *Window) Title() string             { return w.title }
+func (w *Window) SetRepresentedFile(string) {}
+func (w *Window) SetDocumentEdited(bool)    {}
+func (w *Window) Bounds() platform.Rect     { return w.bounds }
+
+func (w *Window) SetBounds(r platform.Rect) {
+	w.bounds = r
+	w.opts.Center = false
+	w.sendConfig(cfgMaskBounds)
+}
+
+func (w *Window) ContentBounds() platform.Rect { return w.bounds }
+
+func (w *Window) SetContentBounds(r platform.Rect) {
+	w.SetBounds(r)
+}
+
+func (w *Window) SetMinimumSize(s platform.Size) {
+	if w.minSize == s {
+		return
+	}
+	w.minSize = s
+	w.sendConfig(cfgMaskMinSize)
+}
+
+func (w *Window) SetMaximumSize(s platform.Size) {
+	if w.maxSize == s {
+		return
+	}
+	w.maxSize = s
+	w.sendConfig(cfgMaskMaxSize)
+}
+
+func (w *Window) SetResizable(v bool) {
+	if w.opts.Resizable == v {
+		return
+	}
+	w.opts.Resizable = v
+	w.sendConfig(cfgMaskFlags)
+}
+
+func (w *Window) IsResizable() bool { return w.opts.Resizable }
+
+func (w *Window) SetMovable(v bool) {
+	if w.opts.Movable == v {
+		return
+	}
+	w.opts.Movable = v
+	w.sendConfig(cfgMaskFlags)
+}
+
+func (w *Window) IsMovable() bool { return w.opts.Movable }
+
+func (w *Window) SetMinimizable(v bool) {
+	if w.opts.Minimizable == v {
+		return
+	}
+	w.opts.Minimizable = v
+	w.sendConfig(cfgMaskFlags)
+}
+
+func (w *Window) IsMinimizable() bool { return w.opts.Minimizable }
+
+func (w *Window) SetMaximizable(v bool) {
+	if w.opts.Maximizable == v {
+		return
+	}
+	w.opts.Maximizable = v
+	w.sendConfig(cfgMaskFlags)
+}
+
+func (w *Window) IsMaximizable() bool { return w.opts.Maximizable }
+
+func (w *Window) SetClosable(v bool) {
+	if w.opts.Closable == v {
+		return
+	}
+	w.opts.Closable = v
+	w.sendConfig(cfgMaskFlags)
+}
+
+func (w *Window) IsClosable() bool { return w.opts.Closable }
+
+func (w *Window) SetAlwaysOnTop(v bool) {
+	if w.alwaysOnTop == v {
+		return
+	}
+	w.alwaysOnTop = v
+	w.sendConfig(cfgMaskFlags)
+}
+
+func (w *Window) IsAlwaysOnTop() bool { return w.alwaysOnTop }
+
+func (w *Window) Show() {
+	if w.closed {
+		return
+	}
+	w.visible = true
+	w.minimized = false
+	w.surface.setHostHidden(false)
+	w.sendAction(winActShow)
+}
+
+func (w *Window) ShowInactive() {
+	if w.closed {
+		return
+	}
+	w.visible = true
+	w.minimized = false
+	w.surface.setHostHidden(false)
+	w.sendAction(winActShowInactive)
+}
+
+func (w *Window) Hide() {
+	if w.closed {
+		return
+	}
+	w.visible = false
+	w.surface.setHostHidden(true)
+	w.sendAction(winActHide)
+}
+
+func (w *Window) IsVisible() bool { return w.visible }
+
+func (w *Window) Focus() {
+	if w.closed {
+		return
+	}
+	w.focused = true
+	w.sendAction(winActFocus)
+}
+
+func (w *Window) Blur() {
+	if w.closed {
+		return
+	}
+	w.focused = false
+	w.sendAction(winActBlur)
+}
+
+func (w *Window) IsFocused() bool { return w.focused }
+
+func (w *Window) Minimize() {
+	if w.closed {
+		return
+	}
+	w.minimized = true
+	w.sendAction(winActMinimize)
+}
+
+func (w *Window) IsMinimized() bool { return w.minimized }
+
+func (w *Window) Maximize() {
+	if w.closed {
+		return
+	}
+	w.maximized = true
+	w.minimized = false
+	w.sendAction(winActMaximize)
+}
+
+func (w *Window) Unmaximize() {
+	if w.closed {
+		return
+	}
+	w.maximized = false
+	w.sendAction(winActUnmaximize)
+}
+
+func (w *Window) IsMaximized() bool { return w.maximized }
+
+func (w *Window) Restore() {
+	if w.closed {
+		return
+	}
+	w.minimized = false
+	w.maximized = false
+	w.surface.setHostHidden(false)
+	w.sendAction(winActRestore)
+}
+
+func (w *Window) SetFullScreen(v bool) {
+	if w.closed || w.fullscreen == v {
+		return
+	}
+	prevTB := w.TitleBar()
+	w.fullscreen = v
+	if v {
+		w.sendAction(winActEnterFullScreen)
+	} else {
+		w.sendAction(winActExitFullScreen)
+	}
+	if w.TitleBar() != prevTB && w.h != nil {
+		w.h.TitleBarChanged()
+	}
+}
+
+func (w *Window) IsFullScreen() bool { return w.fullscreen }
+
+func (w *Window) Center() {
+	w.sendAction(winActCenter)
+}
+
+func (w *Window) SetBackgroundColor(c platform.Color) {
+	if w.hasBg && w.bgColor == c {
+		return
+	}
+	w.bgColor = c
+	w.hasBg = true
+	w.sendConfig(cfgMaskBg)
+}
+
+func (w *Window) SetOpacity(float64)              {}
+func (w *Window) Opacity() float64                { return 1 }
+func (w *Window) SetHasShadow(v bool)             { w.hasShadow = v }
+func (w *Window) HasShadow() bool                 { return w.hasShadow }
+func (w *Window) SetIgnoreMouseEvents(bool)       {}
+func (w *Window) SetContentProtection(bool)       {}
+func (w *Window) SetVibrancy(string)              {}
+func (w *Window) SetVibrancyTint(*platform.Color) {}
+func (w *Window) SetActiveAppearance(bool)        {}
+func (w *Window) SetWindowButtonsTheme(string)    {}
+func (w *Window) SetProgressBar(string, float64)  {}
+func (w *Window) FlashFrame(bool)                 {}
+func (w *Window) SetSkipTaskbar(bool)             {}
+func (w *Window) SetVisibleOnAllWorkspaces(bool)  {}
+func (w *Window) SetIcon([]byte) error            { return platform.ErrUnsupported }
+func (w *Window) SetMenu(*platform.Menu)          {}
+func (w *Window) SetAutoHideMenu(bool)            {}
+
+func (w *Window) TitleBar() platform.TitleBar {
+	if !w.hiddenTitleBar() || w.opts.HideWindowButtons || w.fullscreen {
+		return platform.TitleBar{}
+	}
+	if w.hasTitleBar {
+		tb := w.rawTitleBar
+		if w.opts.TitleBarHeight > tb.Height {
+			tb.Height = w.opts.TitleBarHeight
+		}
+		return tb
+	}
+	return platform.TitleBar{
+		Height: max(36, w.opts.TitleBarHeight),
+		Right:  128,
+	}
+}
+
+func (w *Window) StartDrag() {
+	if !w.opts.Movable || w.fullscreen {
+		return
+	}
+	w.sendAction(winActStartDrag)
+}
+
+func (w *Window) TitleBarDoubleClicked() {
+	if w.IsMaximized() {
+		w.Unmaximize()
+	} else if w.IsMaximizable() {
+		w.Maximize()
+	}
+}
+
+func (w *Window) PlaceFlyout(platform.Flyout, platform.Size) {}
+
+// Close destroys the window without asking ShouldClose.
+func (w *Window) Close() {
+	w.closeInternal(true)
+}
+
+func (w *Window) closeInternal(notifyHost bool) {
+	if w.closed {
+		return
+	}
+	if notifyHost {
+		w.sendAction(winActClose)
+	}
+	w.closed = true
+	w.focused = false
+	w.visible = false
+	if w.surface != nil {
+		w.surface.Idle()
+	}
+	if w.b != nil {
+		w.b.removeWindow(w.id)
+	}
+	if w.h != nil {
+		w.h.Closed()
+	}
+}
+
+// The page half. A window showing a surface has no web view, so the web
+// page methods do nothing and report nothing.
+
+func (w *Window) WebViewHandle() uintptr                        { return 0 }
+func (w *Window) LoadURL(string)                                {}
+func (w *Window) LoadHTML(string, string)                       {}
+func (w *Window) LoadFile(string, string)                       {}
+func (w *Window) Reload(bool)                                   {}
+func (w *Window) StopLoading()                                  {}
+func (w *Window) GoBack()                                       {}
+func (w *Window) GoForward()                                    {}
+func (w *Window) CanGoBack() bool                               { return false }
+func (w *Window) CanGoForward() bool                            { return false }
+func (w *Window) URL() string                                   { return "" }
+func (w *Window) IsLoading() bool                               { return false }
+func (w *Window) Eval(string)                                   {}
+func (w *Window) SetUserScripts([]platform.UserScript)          {}
+func (w *Window) SetContentRules([]any)                         {}
+func (w *Window) CallAsyncFunction(string, func(string, error)) {}
+func (w *Window) SetZoom(f float64)                             { w.zoom = f }
+func (w *Window) Zoom() float64                                 { return w.zoom }
+func (w *Window) SetUserAgent(ua string)                        { w.ua = ua }
+func (w *Window) UserAgent() string                             { return w.ua }
+func (w *Window) ProcessID() int                                { return 0 }
+func (w *Window) GPUProcessID() int                             { return 0 }
+func (w *Window) IsAudible() bool                               { return false }
+func (w *Window) SetAudioMuted(m bool)                          { w.muted = m }
+func (w *Window) IsAudioMuted() bool                            { return w.muted }
+func (w *Window) CaptureState(platform.CaptureKind) platform.CaptureState {
+	return platform.CaptureNone
+}
+func (w *Window) SetCaptureState(platform.CaptureKind, platform.CaptureState) {}
+func (w *Window) TogglePictureInPicture()                                     {}
+func (w *Window) PictureInPictureActive(cb func(bool))                        { cb(false) }
+func (w *Window) SessionState() []byte                                        { return nil }
+func (w *Window) RestoreSessionState([]byte) bool                             { return false }
+func (w *Window) OpenDevTools()                                               {}
+func (w *Window) CloseDevTools()                                              {}
+func (w *Window) IsDevToolsOpened() bool                                      { return false }
+func (w *Window) CapturePage(cb func([]byte, error))                          { cb(nil, platform.ErrUnsupported) }
+func (w *Window) PrintToPDF(platform.PDFOptions, func([]byte, error)) {
+	// No web view to print.
+}
+func (w *Window) DroppedFiles() []string { return nil }
+func (w *Window) Print()                 {}

@@ -1,0 +1,11 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "mygo-music",
+  "version": "0.1.22",
+  "description": "MyGo Music",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {},
+  "devDependencies": {}
+}
