@@ -47,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -152,6 +153,11 @@ constexpr uint8_t kAccessEvent     = 63; // host -> engine: accessibility enable
 constexpr uint8_t kWinActEnableWebLayer = 17;
 constexpr uint8_t kWinActFocusSurface   = 18;
 constexpr uint8_t kWinActQuitDeny       = 19;
+constexpr uint8_t kWinActPerfHUDOn      = 23;
+constexpr uint8_t kWinActPerfHUDOff     = 24;
+constexpr uint8_t kWinActPerfHUDToggle  = 25;
+
+constexpr int32_t kArkKeyF12 = 2101;
 
 constexpr uint32_t kMediaPause = 1u << 1;
 
@@ -464,6 +470,21 @@ bool gNetOnline = true;
 bool gNetMetered = false;
 std::atomic<bool> gNowPlayingActive{false};
 std::atomic<uint32_t> gNowPlayingCmds{0};
+std::atomic<bool> gPerfHudEnabled{false};
+
+struct PerfHudData {
+    uint32_t winId = 1;
+    bool visible = false;
+    bool live = false;
+    std::string headerLine;
+    std::string pacingLine;
+    std::string stageLine;
+    std::string inputLine;
+    std::vector<double> dtMs;
+    std::vector<double> uiGlMs;
+    std::vector<double> gpuMs;
+    std::vector<double> copySwapMs;
+};
 
 // ---------- Per-Window Session ----------
 
@@ -493,6 +514,7 @@ struct WinSession {
     bool nodeFocused = false;
     bool metaLeftDown = false;
     bool metaRightDown = false;
+    bool f12Down = false;
     float lastPointerX = 0.0f;
     float lastPointerY = 0.0f;
     int32_t appliedPointerStyle = -1;
@@ -502,6 +524,12 @@ struct WinSession {
     std::atomic<bool> webLayerEnabled{false};
     std::atomic<int64_t> lastInputNs{0};
     std::atomic<bool> inputSincePresent{false};
+
+    // Performance HUD input cadence & last snapshot (guarded by perfMu).
+    std::mutex perfMu;
+    int64_t lastScrollInputNs = 0;
+    std::deque<double> scrollDtMs;
+    PerfHudData lastPerfSnapshot;
 
     // Render thread state (guarded by mu).
     std::mutex mu;
@@ -522,9 +550,14 @@ struct WinSession {
     double scale = 1.0;
     double hz = 120.0;
     bool wantFrame = false;
+    bool forcePerfPush = false;
     BufReply reply = BufReply::None;
     uint32_t replySeq = 0;
     uint32_t replyRectCount = 0;
+    uint32_t replyUiGLUs = 0;
+    uint32_t replyGpuFinishUs = 0;
+    uint32_t replyCopyUs = 0;
+    uint32_t replyPerfMeta = 0;
     uint32_t requestedFps = 0;
     bool fpsDirty = true;
 
@@ -582,6 +615,7 @@ enum class BridgeEventKind {
     SchemeRes,
     TrayUpdate,
     FirstFrame,
+    PerfHud,
     EngineQuit,
     EngineRestart,
 };
@@ -798,6 +832,7 @@ struct BridgeEvent {
     WebAsyncReqData webAsyncReq;
     SchemeResData schemeRes;
     TrayUpdateData trayUpdate;
+    PerfHudData perfHud;
 };
 
 std::mutex gBridgeMu;
@@ -1372,6 +1407,44 @@ void BridgeCallJs(napi_env env, napi_value, void *, void *data) {
         callBridgeMethod(env, cbObj, "onFirstFrame", 1, &arg);
         break;
     }
+    case BridgeEventKind::PerfHud: {
+        const auto &ph = ev->perfHud;
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_value vWin = nullptr, vVis = nullptr, vLive = nullptr;
+        napi_value vHdr = nullptr, vPac = nullptr, vStg = nullptr, vInp = nullptr;
+        napi_create_uint32(env, ph.winId, &vWin);
+        napi_get_boolean(env, ph.visible, &vVis);
+        napi_get_boolean(env, ph.live, &vLive);
+        napi_create_string_utf8(env, ph.headerLine.c_str(), ph.headerLine.size(), &vHdr);
+        napi_create_string_utf8(env, ph.pacingLine.c_str(), ph.pacingLine.size(), &vPac);
+        napi_create_string_utf8(env, ph.stageLine.c_str(), ph.stageLine.size(), &vStg);
+        napi_create_string_utf8(env, ph.inputLine.c_str(), ph.inputLine.size(), &vInp);
+        napi_set_named_property(env, obj, "winId", vWin);
+        napi_set_named_property(env, obj, "visible", vVis);
+        napi_set_named_property(env, obj, "live", vLive);
+        napi_set_named_property(env, obj, "headerLine", vHdr);
+        napi_set_named_property(env, obj, "pacingLine", vPac);
+        napi_set_named_property(env, obj, "stageLine", vStg);
+        napi_set_named_property(env, obj, "inputLine", vInp);
+
+        auto setArr = [&](const char *k, const std::vector<double> &vals) {
+            napi_value arr = nullptr;
+            napi_create_array_with_length(env, vals.size(), &arr);
+            for (size_t i = 0; i < vals.size(); ++i) {
+                napi_value nv = nullptr;
+                napi_create_double(env, vals[i], &nv);
+                napi_set_element(env, arr, static_cast<uint32_t>(i), nv);
+            }
+            napi_set_named_property(env, obj, k, arr);
+        };
+        setArr("dtMs", ph.dtMs);
+        setArr("uiGlMs", ph.uiGlMs);
+        setArr("gpuMs", ph.gpuMs);
+        setArr("copySwapMs", ph.copySwapMs);
+        callBridgeMethod(env, cbObj, "onPerfHud", 1, &obj);
+        break;
+    }
     case BridgeEventKind::EngineQuit:
         callBridgeMethod(env, cbObj, "onEngineQuit", 0, nullptr);
         break;
@@ -1543,7 +1616,24 @@ void sendScrollInput(WinSession *ws, uint8_t flags, uint32_t mods, float x, floa
     if (ws == nullptr) {
         return;
     }
-    markInputArrival(ws);
+    const int64_t now = monoNs();
+    ws->lastInputNs.store(now, std::memory_order_relaxed);
+    ws->inputSincePresent.store(true, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(ws->perfMu);
+        if (ws->lastScrollInputNs > 0) {
+            double dt = static_cast<double>(now - ws->lastScrollInputNs) / 1e6;
+            if (dt > 400.0) {
+                ws->scrollDtMs.clear();
+            } else if (dt >= 0.4) {
+                if (ws->scrollDtMs.size() >= 120) {
+                    ws->scrollDtMs.pop_front();
+                }
+                ws->scrollDtMs.push_back(dt);
+            }
+        }
+        ws->lastScrollInputNs = now;
+    }
     uint8_t p[28] = {0};
     memcpy(p + 0, &ws->winId, 4);
     p[4] = kInputScroll;
@@ -1554,6 +1644,49 @@ void sendScrollInput(WinSession *ws, uint8_t flags, uint32_t mods, float x, floa
     memcpy(p + 20, &dx, 4);
     memcpy(p + 24, &dy, 4);
     sendMessage(kInput, p, sizeof(p), -1);
+}
+
+void setPerfHudEnabled(uint32_t winId, int mode) {
+    bool prev = gPerfHudEnabled.load(std::memory_order_relaxed);
+    bool next = (mode < 0) ? !prev : (mode != 0);
+    gPerfHudEnabled.store(next, std::memory_order_relaxed);
+    uint32_t targetId = winId > 0 ? winId : 1;
+    auto ws = getOrCreateSession(targetId);
+    if (!ws) {
+        return;
+    }
+    PerfHudData snap;
+    int32_t w = 0, h = 0;
+    double sc = 1.0, hz = 120.0;
+    {
+        std::lock_guard<std::mutex> lk(ws->mu);
+        w = ws->curW > 0 ? ws->curW : ws->targetW;
+        h = ws->curH > 0 ? ws->curH : ws->targetH;
+        sc = ws->scale;
+        hz = ws->hz;
+        ws->forcePerfPush = true;
+    }
+    {
+        std::lock_guard<std::mutex> lk(ws->perfMu);
+        snap = ws->lastPerfSnapshot;
+        snap.winId = ws->winId;
+        snap.visible = next;
+        if (snap.headerLine.empty()) {
+            char hdr[160];
+            snprintf(hdr, sizeof(hdr), "FPS --.-  (1%%L --.-)  |  %.0fHz · %dx%d @%.2fx  [F12]",
+                     hz, w, h, sc);
+            snap.headerLine = hdr;
+            snap.pacingLine = "Frame dt  waiting for active frames...";
+            snap.stageLine = "Stages    UI+GL -- | GPU -- | Copy -- | Swap -- | VSync --";
+            snap.inputLine = "Input     Scroll --Hz  |  Whole --%  Abort 0";
+        }
+        ws->lastPerfSnapshot = snap;
+    }
+    auto bev = std::make_unique<BridgeEvent>();
+    bev->kind = BridgeEventKind::PerfHud;
+    bev->perfHud = std::move(snap);
+    postBridgeEvent(std::move(bev));
+    ws->cv.notify_all();
 }
 
 void sendZoomInput(WinSession *ws, uint8_t op, uint32_t mods, float x, float y, float scale) {
@@ -3768,6 +3901,7 @@ void OnNodeEvent(ArkUI_NodeEvent *event) {
         ws->nodeFocused = false;
         ws->metaLeftDown = false;
         ws->metaRightDown = false;
+        ws->f12Down = false;
         if (attachedImeWinId == ws->winId) {
             detachIME();
         }
@@ -3976,6 +4110,18 @@ void OnNodeEvent(ArkUI_NodeEvent *event) {
             return;
         }
         int32_t code = OH_ArkUI_KeyEvent_GetKeyCode(ev);
+        if (code == kArkKeyF12) {
+            if (kt == ARKUI_KEY_EVENT_DOWN) {
+                if (!ws->f12Down) {
+                    ws->f12Down = true;
+                    setPerfHudEnabled(ws->winId, -1);
+                }
+            } else {
+                ws->f12Down = false;
+            }
+            OH_ArkUI_KeyEvent_SetConsumed(ev, true);
+            return;
+        }
         if (code == ARKUI_KEYCODE_META_LEFT) {
             ws->metaLeftDown = (kt == ARKUI_KEY_EVENT_DOWN);
         } else if (code == ARKUI_KEYCODE_META_RIGHT) {
@@ -4062,6 +4208,191 @@ void logLatencyStats(uint32_t winId, const char *reason, const LatencyRing &draw
                 static_cast<unsigned long long>(intervalRing.totalCount()), fp50, fp90, fp99, fmax);
 }
 
+struct PerfFrameSample {
+    double dtMs = 0.0;
+    double uiGlMs = 0.0;
+    double gpuMs = 0.0;
+    double copyMs = 0.0;
+    double swapMs = 0.0;
+    double vsyncMs = 0.0;
+    double in2FlushMs = -1.0;
+    bool wholeCopy = false;
+    uint8_t coalesced = 0;
+    uint8_t scrollEvs = 0;
+};
+
+double percentileOfSorted(const std::vector<double> &sorted, double q) {
+    if (sorted.empty()) {
+        return 0.0;
+    }
+    size_t idx = static_cast<size_t>(std::ceil(q * static_cast<double>(sorted.size())));
+    if (idx > 0) {
+        idx--;
+    }
+    if (idx >= sorted.size()) {
+        idx = sorted.size() - 1;
+    }
+    return sorted[idx];
+}
+
+PerfHudData buildPerfHudSnapshot(WinSession *ws, int32_t w, int32_t h, double sc, double refresh,
+                                 int aborted, bool live, bool visible,
+                                 const std::deque<PerfFrameSample> &window) {
+    PerfHudData out;
+    out.winId = ws->winId;
+    out.visible = visible;
+    out.live = live;
+
+    std::vector<double> dts;
+    std::vector<double> uiGls;
+    std::vector<double> gpus;
+    std::vector<double> inLats;
+    dts.reserve(window.size());
+    uiGls.reserve(window.size());
+    gpus.reserve(window.size());
+    inLats.reserve(window.size());
+
+    double sumDt = 0.0;
+    double sumUiGl = 0.0, sumGpu = 0.0, sumCopy = 0.0, sumSwap = 0.0, sumVsync = 0.0;
+    int tier120 = 0, tier60 = 0, tierDrop = 0;
+    int wholeCnt = 0;
+    int coalSum = 0;
+
+    for (const auto &s : window) {
+        if (s.dtMs > 0.2) {
+            dts.push_back(s.dtMs);
+            sumDt += s.dtMs;
+            if (s.dtMs <= 10.5) {
+                tier120++;
+            } else if (s.dtMs <= 19.0) {
+                tier60++;
+            } else {
+                tierDrop++;
+            }
+        }
+        uiGls.push_back(s.uiGlMs);
+        gpus.push_back(s.gpuMs);
+        sumUiGl += s.uiGlMs;
+        sumGpu += s.gpuMs;
+        sumCopy += s.copyMs;
+        sumSwap += s.swapMs;
+        sumVsync += s.vsyncMs;
+        if (s.in2FlushMs >= 0.0) {
+            inLats.push_back(s.in2FlushMs);
+        }
+        if (s.wholeCopy) {
+            wholeCnt++;
+        }
+        coalSum += s.coalesced;
+    }
+
+    const double nFrames = window.empty() ? 1.0 : static_cast<double>(window.size());
+    std::sort(dts.begin(), dts.end());
+    std::sort(uiGls.begin(), uiGls.end());
+    std::sort(gpus.begin(), gpus.end());
+    std::sort(inLats.begin(), inLats.end());
+
+    const double avgDt = dts.empty() ? 0.0 : (sumDt / static_cast<double>(dts.size()));
+    const double p50Dt = percentileOfSorted(dts, 0.50);
+    const double p90Dt = percentileOfSorted(dts, 0.90);
+    const double p99Dt = percentileOfSorted(dts, 0.99);
+    const double maxDt = dts.empty() ? 0.0 : dts.back();
+
+    const double fps = avgDt > 0.1 ? (1000.0 / avgDt) : 0.0;
+    const double low1Fps = p99Dt > 0.1 ? (1000.0 / p99Dt) : 0.0;
+
+    const int nDt = static_cast<int>(dts.size());
+    const int pct120 = nDt > 0 ? static_cast<int>(std::lround(100.0 * tier120 / nDt)) : 0;
+    const int pct60 = nDt > 0 ? static_cast<int>(std::lround(100.0 * tier60 / nDt)) : 0;
+    const int pctDrop = nDt > 0 ? std::max(0, 100 - pct120 - pct60) : 0;
+
+    const double avgUiGl = sumUiGl / nFrames;
+    const double p90UiGl = percentileOfSorted(uiGls, 0.90);
+    const double avgGpu = sumGpu / nFrames;
+    const double p90Gpu = percentileOfSorted(gpus, 0.90);
+    const double avgCopy = sumCopy / nFrames;
+    const double avgSwap = sumSwap / nFrames;
+    const double avgVsync = sumVsync / nFrames;
+    const int wholePct = window.empty() ? 0 : static_cast<int>(std::lround(100.0 * wholeCnt / nFrames));
+    const double p50InLat = percentileOfSorted(inLats, 0.50);
+
+    std::vector<double> scDts;
+    {
+        std::lock_guard<std::mutex> lk(ws->perfMu);
+        scDts.assign(ws->scrollDtMs.begin(), ws->scrollDtMs.end());
+    }
+    double scHz = 0.0, scP50 = 0.0, scP99 = 0.0;
+    if (!scDts.empty()) {
+        double scSum = 0.0;
+        for (double v : scDts) {
+            scSum += v;
+        }
+        double scAvg = scSum / static_cast<double>(scDts.size());
+        if (scAvg > 0.1) {
+            scHz = 1000.0 / scAvg;
+        }
+        std::sort(scDts.begin(), scDts.end());
+        scP50 = percentileOfSorted(scDts, 0.50);
+        scP99 = percentileOfSorted(scDts, 0.99);
+    }
+
+    char buf[220];
+    if (nDt > 0) {
+        snprintf(buf, sizeof(buf), "FPS %5.1f  (1%%L %4.1f)  |  %.0fHz · %dx%d @%.2fx  [F12]",
+                 fps, low1Fps, refresh, w, h, sc);
+    } else {
+        snprintf(buf, sizeof(buf), "FPS  --.-  (1%%L --.-)  |  %.0fHz · %dx%d @%.2fx  [F12]",
+                 refresh, w, h, sc);
+    }
+    out.headerLine = buf;
+
+    if (nDt > 0) {
+        snprintf(buf, sizeof(buf),
+                 "dt(ms)  p50 %4.1f  p90 %4.1f  p99 %4.1f  max %4.1f  |  120f %d%% · 60f %d%% · <60f %d%%",
+                 p50Dt, p90Dt, p99Dt, maxDt, pct120, pct60, pctDrop);
+    } else {
+        snprintf(buf, sizeof(buf), "dt(ms)  waiting for continuous motion frames...");
+    }
+    out.pacingLine = buf;
+
+    snprintf(buf, sizeof(buf),
+             "Stage   UI+GL %.1f(p90 %.1f) | GPU %.1f(%.1f) | Copy %.1f | Swap %.1f | VSync %.1fms",
+             avgUiGl, p90UiGl, avgGpu, p90Gpu, avgCopy, avgSwap, avgVsync);
+    out.stageLine = buf;
+
+    if (scHz > 0.1) {
+        snprintf(buf, sizeof(buf),
+                 "Input   Scroll %.0fHz (dt %.1f/%.1fms)  Coal %d  In->Flush %.1fms  |  Whole %d%%  Abt %d",
+                 scHz, scP50, scP99, coalSum, p50InLat, wholePct, aborted);
+    } else {
+        snprintf(buf, sizeof(buf),
+                 "Input   Scroll --Hz  In->Flush %.1fms  |  Whole %d%%  Abt %d",
+                 p50InLat, wholePct, aborted);
+    }
+    out.inputLine = buf;
+
+    const size_t kBars = 60;
+    const size_t startIdx = window.size() > kBars ? (window.size() - kBars) : 0;
+    const size_t barCount = window.size() - startIdx;
+    out.dtMs.reserve(barCount);
+    out.uiGlMs.reserve(barCount);
+    out.gpuMs.reserve(barCount);
+    out.copySwapMs.reserve(barCount);
+    for (size_t i = startIdx; i < window.size(); ++i) {
+        const auto &s = window[i];
+        out.dtMs.push_back(s.dtMs > 0.2 ? s.dtMs : 8.33);
+        out.uiGlMs.push_back(s.uiGlMs);
+        out.gpuMs.push_back(s.gpuMs);
+        out.copySwapMs.push_back(s.copyMs + s.swapMs);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(ws->perfMu);
+        ws->lastPerfSnapshot = out;
+    }
+    return out;
+}
+
 void WinSession::renderLoop() {
     OHNativeWindow *win = nullptr;
     int32_t w = 0, h = 0;
@@ -4097,18 +4428,40 @@ void WinSession::renderLoop() {
     int unloggedFrames = 0;
     int64_t lastFlushNs = 0;
     int64_t frameAnchorNs = 0;
+    int64_t lastHudPushNs = 0;
+    bool hudSettled = true;
     LatencyRing drawRing, inRing, intervalRing;
+    std::deque<PerfFrameSample> perfWindow;
 
     for (;;) {
+        bool pushNow = false;
         {
             std::unique_lock<std::mutex> lk(mu);
             bool woke = cv.wait_for(lk, std::chrono::milliseconds(250), [&] {
-                return stopRender || forceResendSurface || targetW != curW || targetH != curH || fpsDirty || wantFrame;
+                return stopRender || forceResendSurface || targetW != curW || targetH != curH ||
+                       fpsDirty || wantFrame || forcePerfPush;
             });
             if (stopRender) {
                 break;
             }
+            if (forcePerfPush) {
+                forcePerfPush = false;
+                pushNow = true;
+            }
             if (!woke) {
+                if (!hudSettled && !perfWindow.empty()) {
+                    hudSettled = true;
+                    bool vis = gPerfHudEnabled.load(std::memory_order_relaxed);
+                    PerfHudData snap = buildPerfHudSnapshot(this, w, h, sc, refresh, aborted, false, vis, perfWindow);
+                    OH_LOG_INFO(LOG_APP, "win=%{public}u perf[settle] %{public}s | %{public}s | %{public}s",
+                                winId, snap.pacingLine.c_str(), snap.stageLine.c_str(), snap.inputLine.c_str());
+                    if (vis) {
+                        auto bev = std::make_unique<BridgeEvent>();
+                        bev->kind = BridgeEventKind::PerfHud;
+                        bev->perfHud = std::move(snap);
+                        postBridgeEvent(std::move(bev));
+                    }
+                }
                 if (unloggedFrames > 0) {
                     logLatencyStats(winId, "settle", drawRing, inRing, intervalRing);
                     unloggedFrames = 0;
@@ -4145,6 +4498,16 @@ void WinSession::renderLoop() {
                     break;
                 }
             }
+            if (pushNow && !wantFrame) {
+                lk.unlock();
+                bool vis = gPerfHudEnabled.load(std::memory_order_relaxed);
+                PerfHudData snap = buildPerfHudSnapshot(this, w, h, sc, refresh, aborted, !hudSettled, vis, perfWindow);
+                auto bev = std::make_unique<BridgeEvent>();
+                bev->kind = BridgeEventKind::PerfHud;
+                bev->perfHud = std::move(snap);
+                postBridgeEvent(std::move(bev));
+                continue;
+            }
             if (!wantFrame) {
                 continue;
             }
@@ -4152,13 +4515,17 @@ void WinSession::renderLoop() {
         }
 
         const int64_t vsyncPeriodNs = static_cast<int64_t>(1e9 / std::max(60.0, refresh));
-        if (frameAnchorNs != 0 && (monoNs() - frameAnchorNs) < (vsyncPeriodNs * 9) / 10) {
+        double vsyncWaitMs = 0.0;
+        const int64_t vsCheckNs = monoNs();
+        if (frameAnchorNs != 0 && (vsCheckNs - frameAnchorNs) < (vsyncPeriodNs * 9) / 10) {
             lastVsyncNs.store(0, std::memory_order_relaxed);
             waitVsync();
+            const int64_t afterVsNs = monoNs();
+            vsyncWaitMs = static_cast<double>(std::max<int64_t>(0, afterVsNs - vsCheckNs)) / 1e6;
             int64_t vsNs = lastVsyncNs.load(std::memory_order_relaxed);
-            frameAnchorNs = vsNs > 0 ? vsNs : monoNs();
+            frameAnchorNs = vsNs > 0 ? vsNs : afterVsNs;
         } else {
-            frameAnchorNs = monoNs();
+            frameAnchorNs = vsCheckNs;
         }
 
         {
@@ -4191,6 +4558,7 @@ void WinSession::renderLoop() {
             }
         }
 
+        const int64_t reqStartNs = monoNs();
         OHNativeWindowBuffer *buf = nullptr;
         int fence = -1;
         int32_t rc = OH_NativeWindow_NativeWindowRequestBuffer(win, &buf, &fence);
@@ -4209,6 +4577,8 @@ void WinSession::renderLoop() {
             } while (prc == -1 && (errno == EINTR || errno == EAGAIN));
             close(fence);
         }
+        const double reqFenceMs = static_cast<double>(std::max<int64_t>(0, monoNs() - reqStartNs)) / 1e6;
+
         BufferHandle *bh = OH_NativeWindow_GetBufferHandleFromNative(buf);
         if (bh == nullptr || bh->fd < 0) {
             OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
@@ -4238,6 +4608,7 @@ void WinSession::renderLoop() {
 
         BufReply gotReply = BufReply::None;
         uint32_t rectCount = 0;
+        uint32_t uiGLUs = 0, gpuFinishUs = 0, copyUs = 0, perfMeta = 0;
         bool timedOut = false;
         {
             std::unique_lock<std::mutex> lk(mu);
@@ -4250,6 +4621,10 @@ void WinSession::renderLoop() {
             } else {
                 gotReply = reply;
                 rectCount = replyRectCount;
+                uiGLUs = replyUiGLUs;
+                gpuFinishUs = replyGpuFinishUs;
+                copyUs = replyCopyUs;
+                perfMeta = replyPerfMeta;
                 reply = BufReply::None;
             }
         }
@@ -4280,6 +4655,7 @@ void WinSession::renderLoop() {
             continue;
         }
 
+        const int64_t flushStartNs = monoNs();
         Region region = {nullptr, 0};
         rc = OH_NativeWindow_NativeWindowFlushBuffer(win, buf, -1, region);
         if (rc != 0) {
@@ -4287,23 +4663,54 @@ void WinSession::renderLoop() {
             continue;
         }
 
-        int64_t nowNs = monoNs();
+        const int64_t nowNs = monoNs();
+        const double flushMs = static_cast<double>(std::max<int64_t>(0, nowNs - flushStartNs)) / 1e6;
+        const double totalDrawMs = static_cast<double>(std::max<int64_t>(0, nowNs - sendFrameNs)) / 1e6;
         if (frames > 0 && sendFrameNs > 0) {
-            drawRing.add(static_cast<double>(nowNs - sendFrameNs) / 1e6);
+            drawRing.add(totalDrawMs);
         }
+        double in2FlushMs = -1.0;
         if (inputSincePresent.exchange(false, std::memory_order_relaxed)) {
             int64_t inNs = lastInputNs.load(std::memory_order_relaxed);
             if (inNs > 0 && nowNs >= inNs) {
-                inRing.add(static_cast<double>(nowNs - inNs) / 1e6);
+                in2FlushMs = static_cast<double>(nowNs - inNs) / 1e6;
+                inRing.add(in2FlushMs);
             }
         }
+        double ivMs = 0.0;
         if (lastFlushNs > 0) {
-            double ivMs = static_cast<double>(nowNs - lastFlushNs) / 1e6;
-            if (ivMs > 0.1 && ivMs < 50.0) {
-                intervalRing.add(ivMs);
+            double rawIv = static_cast<double>(nowNs - lastFlushNs) / 1e6;
+            if (rawIv >= 350.0) {
+                perfWindow.clear();
+            } else if (rawIv > 0.2) {
+                ivMs = rawIv;
+                if (rawIv < 200.0) {
+                    intervalRing.add(rawIv);
+                }
             }
         }
         lastFlushNs = nowNs;
+
+        PerfFrameSample sample;
+        sample.dtMs = ivMs;
+        if (uiGLUs > 0 || gpuFinishUs > 0 || copyUs > 0) {
+            sample.uiGlMs = static_cast<double>(uiGLUs) / 1000.0;
+            sample.gpuMs = static_cast<double>(gpuFinishUs) / 1000.0;
+            sample.copyMs = static_cast<double>(copyUs) / 1000.0;
+        } else {
+            sample.uiGlMs = std::max(0.0, totalDrawMs - flushMs);
+        }
+        sample.swapMs = reqFenceMs + flushMs;
+        sample.vsyncMs = vsyncWaitMs;
+        sample.in2FlushMs = in2FlushMs;
+        sample.wholeCopy = (rectCount == 0) || ((perfMeta & (1u << 1)) != 0);
+        sample.coalesced = static_cast<uint8_t>((perfMeta >> 8) & 0xFFu);
+        sample.scrollEvs = static_cast<uint8_t>((perfMeta >> 16) & 0xFFu);
+        if (perfWindow.size() >= 120) {
+            perfWindow.pop_front();
+        }
+        perfWindow.push_back(sample);
+        hudSettled = false;
 
         if (rectCount == 0) {
             whole++;
@@ -4317,6 +4724,17 @@ void WinSession::renderLoop() {
             fev->winId = winId;
             postBridgeEvent(std::move(fev));
         }
+
+        const bool hudVis = gPerfHudEnabled.load(std::memory_order_relaxed);
+        if (hudVis && (pushNow || lastHudPushNs == 0 || (nowNs - lastHudPushNs) >= 90000000LL)) {
+            lastHudPushNs = nowNs;
+            PerfHudData snap = buildPerfHudSnapshot(this, w, h, sc, refresh, aborted, true, true, perfWindow);
+            auto bev = std::make_unique<BridgeEvent>();
+            bev->kind = BridgeEventKind::PerfHud;
+            bev->perfHud = std::move(snap);
+            postBridgeEvent(std::move(bev));
+        }
+
         unloggedFrames++;
         if (frames <= 3 || frames % 60 == 0) {
             OH_LOG_INFO(LOG_APP, "win=%{public}u frames=%{public}d damaged=%{public}d whole=%{public}d aborted=%{public}d",
@@ -4324,6 +4742,9 @@ void WinSession::renderLoop() {
         }
         if (frames % 60 == 0) {
             logLatencyStats(winId, "periodic", drawRing, inRing, intervalRing);
+            PerfHudData snap = buildPerfHudSnapshot(this, w, h, sc, refresh, aborted, true, hudVis, perfWindow);
+            OH_LOG_INFO(LOG_APP, "win=%{public}u perf[periodic] %{public}s | %{public}s | %{public}s",
+                        winId, snap.pacingLine.c_str(), snap.stageLine.c_str(), snap.inputLine.c_str());
             unloggedFrames = 0;
         }
     }
@@ -5420,6 +5841,16 @@ bool pumpEngineMessages() {
                 memcpy(&wid, payload.data() + 0, 4);
                 memcpy(&seq, payload.data() + 4, 4);
                 memcpy(&rects, payload.data() + 8, 4);
+                uint32_t uiGLUs = 0, gpuFinishUs = 0, copyUs = 0, perfMeta = 0;
+                if (rects <= 4096) {
+                    size_t perfOff = 12 + static_cast<size_t>(rects) * 16;
+                    if (payload.size() >= perfOff + 16) {
+                        memcpy(&uiGLUs, payload.data() + perfOff + 0, 4);
+                        memcpy(&gpuFinishUs, payload.data() + perfOff + 4, 4);
+                        memcpy(&copyUs, payload.data() + perfOff + 8, 4);
+                        memcpy(&perfMeta, payload.data() + perfOff + 12, 4);
+                    }
+                }
                 auto ws = findSession(wid > 0 ? wid : 1);
                 if (ws) {
                     {
@@ -5427,6 +5858,10 @@ bool pumpEngineMessages() {
                         ws->reply = BufReply::Present;
                         ws->replySeq = seq;
                         ws->replyRectCount = rects;
+                        ws->replyUiGLUs = uiGLUs;
+                        ws->replyGpuFinishUs = gpuFinishUs;
+                        ws->replyCopyUs = copyUs;
+                        ws->replyPerfMeta = perfMeta;
                     }
                     ws->cv.notify_all();
                 }
@@ -5516,6 +5951,11 @@ bool pumpEngineMessages() {
                                             reinterpret_cast<void *>(static_cast<uintptr_t>(ws->winId)),
                                             focusSurfaceOnUI);
                     }
+                    break;
+                }
+                if (act == kWinActPerfHUDOn || act == kWinActPerfHUDOff || act == kWinActPerfHUDToggle) {
+                    int mode = (act == kWinActPerfHUDToggle) ? -1 : (act == kWinActPerfHUDOn ? 1 : 0);
+                    setPerfHudEnabled(wid, mode);
                     break;
                 }
                 auto ev = std::make_unique<BridgeEvent>();

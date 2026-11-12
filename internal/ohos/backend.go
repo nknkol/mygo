@@ -21,6 +21,18 @@ import (
 	"github.com/egoist/mygo/internal/unsupported"
 )
 
+// defaultPerfHUD can be set via -ldflags "-X github.com/egoist/mygo/internal/ohos.defaultPerfHUD=1"
+// or overridden at runtime with MYGO_PERF_HUD=1 / MYGO_PERF_HUD=0.
+var defaultPerfHUD string
+
+func perfHUDDefaultEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("MYGO_PERF_HUD"))
+	if v == "" {
+		v = strings.TrimSpace(defaultPerfHUD)
+	}
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "on")
+}
+
 // Backend is the HarmonyOS one. The app's loop runs here, in the engine's
 // own process, and its events arrive as messages from the process that
 // owns the windows.
@@ -111,6 +123,7 @@ type Backend struct {
 	nextTrayID    uint32
 	trays         map[uint32]*trayItem
 	dragSessions  map[string]*Surface
+	perfHUDSent   bool
 }
 
 // New returns the backend from the arguments and environment the host started
@@ -427,6 +440,7 @@ func (b *Backend) popNextLocked() (event, bool) {
 		}
 	} else if wid, fl, mods, ok := isPreciseScroll(ev); ok {
 		var copied bool
+		var merged uint32
 		dx := getF32(ev.payload[20:])
 		dy := getF32(ev.payload[24:])
 		for idx < len(b.events) {
@@ -449,6 +463,12 @@ func (b *Backend) popNextLocked() (event, bool) {
 			copy(b.events[idx:], b.events[idx+1:])
 			b.events[len(b.events)-1] = event{}
 			b.events = b.events[:len(b.events)-1]
+			merged++
+		}
+		if merged > 0 {
+			if win := b.windows[wid]; win != nil && win.surface != nil {
+				win.surface.coalescedScrolls.Add(merged)
+			}
 		}
 	}
 	return ev, true
@@ -546,9 +566,16 @@ func (b *Backend) NewWindow(opts *platform.WindowOptions, h platform.WindowHandl
 	}
 	b.windows[id] = w
 	b.winOrder = append(b.winOrder, id)
+	enableHUD := !w.isWeb && !b.perfHUDSent && perfHUDDefaultEnabled()
+	if enableHUD {
+		b.perfHUDSent = true
+	}
 	b.mu.Unlock()
 
 	b.send(kindWinCreate, winConfigMessage(w.wireConfig(w.parentID)))
+	if enableHUD {
+		b.send(kindWinAction, winActionMessage(id, winActPerfHUDOn))
+	}
 	if w.isWeb {
 		if w.needsWebSetup() {
 			w.sendWebSetup(false)
@@ -827,6 +854,11 @@ func (b *Backend) onFrame(payload []byte, fd int) {
 	bufs.inFrame = true
 	bufs.wantNext = false
 	bufs.mu.Unlock()
+
+	bufs.frameStart = time.Now()
+	bufs.dmaSyncStart = time.Time{}
+	bufs.lastUIGLUs = 0
+	bufs.lastGPUFinishUs = 0
 
 	if bufs.touch.fling.active {
 		dt := 1.0 / 120.0

@@ -7,7 +7,9 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/egoist/mygo/internal/platform"
@@ -78,6 +80,13 @@ type Surface struct {
 	dragEscaped       bool
 	dropFormats       []transfer.Format
 	accessEnabled     bool
+
+	frameStart       time.Time
+	dmaSyncStart     time.Time
+	lastUIGLUs       uint32
+	lastGPUFinishUs  uint32
+	scrollEvents     atomic.Uint32
+	coalescedScrolls atomic.Uint32
 }
 
 type buffer struct {
@@ -151,18 +160,33 @@ func (s *Surface) RequestFrame() {
 }
 
 func (s *Surface) PresentPixels(pix []byte, stride, width, height int) {
-	s.presentInternal(pix, stride, width, height, nil, true, false)
+	s.presentInternal(pix, stride, width, height, nil, true, false, -1)
 }
 
 func (s *Surface) PresentDamage(pix []byte, stride, width, height int, damage []image.Rectangle) {
-	s.presentInternal(pix, stride, width, height, damage, false, false)
+	s.presentInternal(pix, stride, width, height, damage, false, false, -1)
 }
 
-func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage []image.Rectangle, whole, fromGPU bool) {
+func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage []image.Rectangle, whole, fromGPU bool, dmaFD int) {
+	copyStart := time.Now()
+	if fromGPU && !s.dmaSyncStart.IsZero() {
+		copyStart = s.dmaSyncStart
+	}
+	var uiGLUs, gpuFinishUs uint32
+	if fromGPU {
+		uiGLUs = s.lastUIGLUs
+		gpuFinishUs = s.lastGPUFinishUs
+	} else if !s.frameStart.IsZero() {
+		uiGLUs = uint32(max(0, copyStart.Sub(s.frameStart).Microseconds()))
+	}
+
 	s.mu.Lock()
 	b := s.cur
 	if b == nil {
 		s.mu.Unlock()
+		if dmaFD >= 0 {
+			dmaBufSync(dmaFD, dmaBufSyncEnd|dmaBufSyncRead)
+		}
 		return
 	}
 	s.cur = nil
@@ -262,6 +286,11 @@ func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage 
 			rects = append(rects, rect{int32(r.Min.X), int32(r.Min.Y), uint32(r.Dx()), uint32(r.Dy())})
 		}
 	}
+	if dmaFD >= 0 {
+		dmaBufSync(dmaFD, dmaBufSyncEnd|dmaBufSyncRead)
+	}
+	copyUs := uint32(max(0, time.Since(copyStart).Microseconds()))
+
 	b.lastSeq = rseq
 	b.lastW = width
 	b.lastH = height
@@ -269,8 +298,25 @@ func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage 
 	s.seq++
 	s.mu.Unlock()
 
+	coal := min(255, s.coalescedScrolls.Swap(0))
+	scEv := min(255, s.scrollEvents.Swap(0))
+	var meta uint32
+	if fromGPU {
+		meta |= presentPerfFromGPU
+	}
+	if paintWhole {
+		meta |= presentPerfWholeCopy
+	}
+	meta |= (coal & 0xFF) << 8
+	meta |= (scEv & 0xFF) << 16
+
 	if s.w != nil && s.w.b != nil {
-		s.w.b.send(kindPresent, presentMessage(s.w.id, seq, rects))
+		s.w.b.send(kindPresent, presentMessageWithPerf(s.w.id, seq, rects, presentPerf{
+			uiGLUs:      uiGLUs,
+			gpuFinishUs: gpuFinishUs,
+			copyUs:      copyUs,
+			meta:        meta,
+		}))
 	}
 }
 

@@ -1474,3 +1474,53 @@ func TestPreciseScrollCoalescesAheadOfFrame(t *testing.T) {
 		t.Fatalf("discrete wheel events = %+v %+v, want two separate DY=-1 notches", h.events[1], h.events[2])
 	}
 }
+
+// Enabling the performance HUD via MYGO_PERF_HUD sends winActPerfHUDOn on window creation, and present messages append stage timings and scroll coalescing counts.
+func TestPerfHUDStartupAndPresentTrailer(t *testing.T) {
+	t.Setenv("MYGO_PERF_HUD", "1")
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
+	}
+	hostConn := &conn{fd: fds[0]}
+	defer hostConn.close()
+
+	b := NewWithFD(fds[1])
+	if err := b.Init(&testAppHandler{}, platform.AppOptions{}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	defer b.Quit()
+
+	pw, err := b.NewWindow(&platform.WindowOptions{Surface: true, Width: 4, Height: 4}, &testWindowHandler{})
+	if err != nil {
+		t.Fatalf("NewWindow: %v", err)
+	}
+	kind, _, _, err := hostConn.read()
+	if err != nil || kind != kindWinCreate {
+		t.Fatalf("first msg = (%d, %v), want kindWinCreate", kind, err)
+	}
+	kind, payload, _, err := hostConn.read()
+	if err != nil || kind != kindWinAction || len(payload) < 5 || payload[4] != winActPerfHUDOn {
+		t.Fatalf("second msg = (kind=%d payload=%v err=%v), want winActPerfHUDOn", kind, payload, err)
+	}
+
+	s := pw.(*Window).surface
+	s.mu.Lock()
+	s.cur = &buffer{id: 1, mem: make([]byte, 4*4*4), stride: 16, w: 4, h: 4, size: 64}
+	s.mu.Unlock()
+	s.scrollEvents.Store(3)
+	s.coalescedScrolls.Store(2)
+	s.PresentPixels(make([]byte, 64), 16, 4, 4)
+
+	kind, payload, _, err = hostConn.read()
+	if err != nil || kind != kindPresent {
+		t.Fatalf("present msg = (%d, %v), want kindPresent", kind, err)
+	}
+	winID, seq, rects, perf, ok := decodePresentPerf(payload)
+	if !ok || winID != 1 || seq != 0 || rects != 0 {
+		t.Fatalf("decodePresentPerf = (win=%d seq=%d rects=%d ok=%v)", winID, seq, rects, ok)
+	}
+	if perf.meta&presentPerfWholeCopy == 0 || (perf.meta>>8)&0xFF != 2 || (perf.meta>>16)&0xFF != 3 {
+		t.Fatalf("perf.meta = 0x%x, want wholeCopy + coal=2 + scEv=3", perf.meta)
+	}
+}

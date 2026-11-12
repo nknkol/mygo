@@ -431,6 +431,7 @@ func (s *Surface) onScroll(p []byte) {
 	if dx == 0 && dy == 0 {
 		return
 	}
+	s.scrollEvents.Add(1)
 	s.send(platform.SurfaceEvent{
 		Kind:     platform.PointerScroll,
 		X:        x,

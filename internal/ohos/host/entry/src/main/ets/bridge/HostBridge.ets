@@ -11,6 +11,7 @@ import host, {
   HostMessageBox,
   HostNotifShow,
   HostNowPlaying,
+  HostPerfHud,
   HostPlaceWebViews,
   HostPlacedWebView,
   HostPowerReq,
@@ -221,6 +222,7 @@ export type WebCommandRunner = (op: number, arg1: string, arg2: string) => void;
 export type WebAsyncRunner = (req: HostWebAsyncReq) => void;
 export type WebSetupUpdater = () => void;
 export type EmbeddedWebSyncer = () => void;
+export type PerfHudListener = (hud: HostPerfHud) => void;
 
 export class BridgeWebCmd {
   op: number = 0;
@@ -408,6 +410,8 @@ class HostBridgeManager {
   private webAsyncRunners: Map<number, WebAsyncRunner> = new Map<number, WebAsyncRunner>();
   private webSetupUpdaters: Map<number, WebSetupUpdater> = new Map<number, WebSetupUpdater>();
   private embeddedSyncers: Map<number, EmbeddedWebSyncer> = new Map<number, EmbeddedWebSyncer>();
+  private perfHudListeners: Map<number, PerfHudListener> = new Map<number, PerfHudListener>();
+  private latestPerfHuds: Map<number, HostPerfHud> = new Map<number, HostPerfHud>();
   private webStates: Map<number, ManagedWebState> = new Map<number, ManagedWebState>();
   private embeddedByWin: Map<number, EmbeddedWinState> = new Map<number, EmbeddedWinState>();
   private customSchemes: string[] = ['mygo'];
@@ -523,6 +527,9 @@ class HostBridgeManager {
         },
         onFirstFrame: (winId: number): void => {
           this.handleFirstFrame(winId);
+        },
+        onPerfHud: (hud: HostPerfHud): void => {
+          this.handlePerfHud(hud);
         },
         onPopupMenu: (reqId: number, winId: number, x: number, y: number, rtl: boolean, items: HostMenuItem[]): void => {
           this.handlePopupMenu(reqId, winId, x, y, rtl, items);
@@ -770,6 +777,8 @@ class HostBridgeManager {
     this.webAsyncRunners.clear();
     this.webSetupUpdaters.clear();
     this.embeddedSyncers.clear();
+    this.perfHudListeners.clear();
+    this.latestPerfHuds.clear();
     this.webStates.clear();
     this.embeddedByWin.clear();
     this.schemeTasks.clear();
@@ -859,6 +868,18 @@ class HostBridgeManager {
 
   unregisterEmbeddedSyncer(winId: number): void {
     this.embeddedSyncers.delete(winId);
+  }
+
+  registerPerfHudListener(winId: number, listener: PerfHudListener): void {
+    this.perfHudListeners.set(winId, listener);
+    const cached: HostPerfHud | undefined = this.latestPerfHuds.get(winId);
+    if (cached !== undefined) {
+      listener(cached);
+    }
+  }
+
+  unregisterPerfHudListener(winId: number): void {
+    this.perfHudListeners.delete(winId);
   }
 
   getEmbeddedWebIds(winId: number): number[] {
@@ -2117,6 +2138,15 @@ class HostBridgeManager {
     }
     mw.firstFrameReady = true;
     this.revealSubWindow(mw);
+  }
+
+  private handlePerfHud(hud: HostPerfHud): void {
+    const targetId: number = hud.winId > 0 ? hud.winId : 1;
+    this.latestPerfHuds.set(targetId, hud);
+    const listener: PerfHudListener | undefined = this.perfHudListeners.get(targetId);
+    if (listener !== undefined) {
+      listener(hud);
+    }
   }
 
   private showManagedWindowNow(mw: ManagedWindow, action: number): void {

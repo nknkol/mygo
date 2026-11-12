@@ -1,6 +1,7 @@
 import host, {
   HostMenuItem,
   HostMessageBox,
+  HostPerfHud,
   HostPlacedWebView,
   HostSurfaceRegion,
   HostUserScript,
@@ -1659,6 +1660,13 @@ struct Index {
   private activeMsgReqId: number = 0;
   private activeMsgCancelId: number = 0;
   private activeMsgChecked: boolean = false;
+  private perfCanvasSettings: RenderingContextSettings = new RenderingContextSettings(true);
+  private perfCanvasCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.perfCanvasSettings);
+  private perfCanvasReady: boolean = false;
+  private perfDtBars: number[] = [];
+  private perfUiGlBars: number[] = [];
+  private perfGpuBars: number[] = [];
+  private perfCopySwapBars: number[] = [];
 
   @State isWebWindow: boolean = false;
   @State winBgHex: string = '#FFF4F4F6';
@@ -1668,6 +1676,12 @@ struct Index {
   @State mainDocEndScripts: Array<ScriptItem> = [];
   @State embeddedSlots: Array<EmbeddedWebSlotModel> = [];
   @State surfaceHitRects: Array<Rectangle> = [{ x: 0, y: 0, width: '100%', height: '100%' }];
+  @State perfHudVisible: boolean = false;
+  @State perfHudLive: boolean = false;
+  @State perfHudHeader: string = '';
+  @State perfHudPacing: string = '';
+  @State perfHudStages: string = '';
+  @State perfHudInput: string = '';
 
   aboutToAppear(): void {
     const uiCtx: UIContext = this.getUIContext();
@@ -1702,6 +1716,9 @@ struct Index {
     hostBridge.registerEmbeddedSyncer(this.winId, (): void => {
       this.onEmbeddedOrModeSync();
     });
+    hostBridge.registerPerfHudListener(this.winId, (hud: HostPerfHud): void => {
+      this.applyPerfHud(hud);
+    });
 
     if (this.isWebWindow) {
       this.bindStandaloneWebWindow();
@@ -1731,6 +1748,7 @@ struct Index {
     hostBridge.unregisterPopupMenuOpener(this.winId);
     hostBridge.unregisterMessageBoxOpener(this.winId);
     hostBridge.unregisterEmbeddedSyncer(this.winId);
+    hostBridge.unregisterPerfHudListener(this.winId);
     if (this.webDriverBound) {
       this.mainWebDriver.unbind();
       this.webDriverBound = false;
@@ -2085,6 +2103,97 @@ struct Index {
     return 'mygo_root_' + this.winId.toString();
   }
 
+  private applyPerfHud(hud: HostPerfHud): void {
+    this.perfHudVisible = hud.visible;
+    if (!hud.visible) {
+      this.perfCanvasReady = false;
+      return;
+    }
+    this.perfHudLive = hud.live;
+    this.perfHudHeader = hud.headerLine;
+    this.perfHudPacing = hud.pacingLine;
+    this.perfHudStages = hud.stageLine;
+    this.perfHudInput = hud.inputLine;
+    this.perfDtBars = hud.dtMs;
+    this.perfUiGlBars = hud.uiGlMs;
+    this.perfGpuBars = hud.gpuMs;
+    this.perfCopySwapBars = hud.copySwapMs;
+    if (this.perfCanvasReady) {
+      this.drawPerfCanvas();
+    }
+  }
+
+  private drawPerfCanvas(): void {
+    const ctx: CanvasRenderingContext2D = this.perfCanvasCtx;
+    const w: number = 396;
+    const h: number = 56;
+    ctx.clearRect(0, 0, w, h);
+
+    // Top track (y: 2..30): 60-frame interval dt (0..34ms scale)
+    ctx.fillStyle = '#40000000';
+    ctx.fillRect(0, 2, w, 28);
+    // 120Hz (8.33ms) & 60Hz (16.67ms) reference guide lines
+    const y120: number = 30 - (8.33 / 34.0) * 28.0;
+    const y60: number = 30 - (16.67 / 34.0) * 28.0;
+    ctx.fillStyle = '#5534D399';
+    ctx.fillRect(0, y120, w, 1);
+    ctx.fillStyle = '#5538BDF8';
+    ctx.fillRect(0, y60, w, 1);
+
+    // Bottom track (y: 34..54): stacked active render cost (0..24ms scale)
+    ctx.fillStyle = '#40000000';
+    ctx.fillRect(0, 34, w, 20);
+    const yBudget: number = 54 - (8.33 / 24.0) * 20.0;
+    ctx.fillStyle = '#44FFFFFF';
+    ctx.fillRect(0, yBudget, w, 1);
+
+    const maxBars: number = 60;
+    const n: number = Math.min(maxBars, this.perfDtBars.length);
+    const startSlot: number = maxBars - n;
+    const slotW: number = w / maxBars;
+    const barW: number = Math.max(2.0, slotW - 1.5);
+
+    for (let i: number = 0; i < n; i++) {
+      const x: number = (startSlot + i) * slotW + 0.75;
+      const dt: number = this.perfDtBars[i] ?? 0;
+      if (dt <= 10.5) {
+        ctx.fillStyle = '#34D399';
+      } else if (dt <= 19.0) {
+        ctx.fillStyle = '#38BDF8';
+      } else if (dt <= 35.0) {
+        ctx.fillStyle = '#FBBF24';
+      } else {
+        ctx.fillStyle = '#F87171';
+      }
+      const dtH: number = Math.max(1.5, Math.min(28.0, (dt / 34.0) * 28.0));
+      ctx.fillRect(x, 30.0 - dtH, barW, dtH);
+
+      const uiGl: number = Math.max(0, this.perfUiGlBars[i] ?? 0);
+      const gpu: number = Math.max(0, this.perfGpuBars[i] ?? 0);
+      const cs: number = Math.max(0, this.perfCopySwapBars[i] ?? 0);
+
+      const hUi: number = Math.min(20.0, (uiGl / 24.0) * 20.0);
+      const hGpu: number = Math.min(20.0 - hUi, (gpu / 24.0) * 20.0);
+      const hCs: number = Math.min(20.0 - hUi - hGpu, (cs / 24.0) * 20.0);
+
+      let curBottom: number = 54.0;
+      if (hUi > 0.2) {
+        ctx.fillStyle = '#60A5FA';
+        ctx.fillRect(x, curBottom - hUi, barW, hUi);
+        curBottom -= hUi;
+      }
+      if (hGpu > 0.2) {
+        ctx.fillStyle = '#C084FC';
+        ctx.fillRect(x, curBottom - hGpu, barW, hGpu);
+        curBottom -= hGpu;
+      }
+      if (hCs > 0.2) {
+        ctx.fillStyle = '#FB923C';
+        ctx.fillRect(x, curBottom - hCs, barW, hCs);
+      }
+    }
+  }
+
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
       if (this.isWebWindow) {
@@ -2174,6 +2283,97 @@ struct Index {
         .zIndex(10000)
         .responseRegion(this.surfaceHitRects)
         .mouseResponseRegion(this.surfaceHitRects)
+
+        if (this.perfHudVisible) {
+          Stack({ alignContent: Alignment.TopEnd }) {
+            Column() {
+              Row() {
+                Text(this.perfHudLive ? '● LIVE' : '○ IDLE')
+                  .fontSize(10.5)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.perfHudLive ? '#34D399' : '#9CA3AF')
+                  .margin({ right: 8 })
+                  .hitTestBehavior(HitTestMode.None)
+                Text(this.perfHudHeader)
+                  .fontSize(11)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor('#F9FAFB')
+                  .fontFamily('monospace')
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Clip })
+                  .layoutWeight(1)
+                  .hitTestBehavior(HitTestMode.None)
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Center)
+              .margin({ bottom: 3 })
+              .hitTestBehavior(HitTestMode.None)
+
+              Text(this.perfHudPacing)
+                .width('100%')
+                .fontSize(10.5)
+                .fontColor('#E5E7EB')
+                .fontFamily('monospace')
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Clip })
+                .margin({ bottom: 2 })
+                .hitTestBehavior(HitTestMode.None)
+
+              Text(this.perfHudStages)
+                .width('100%')
+                .fontSize(10.5)
+                .fontColor('#CBD5E1')
+                .fontFamily('monospace')
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Clip })
+                .margin({ bottom: 2 })
+                .hitTestBehavior(HitTestMode.None)
+
+              Text(this.perfHudInput)
+                .width('100%')
+                .fontSize(10.5)
+                .fontColor('#CBD5E1')
+                .fontFamily('monospace')
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Clip })
+                .margin({ bottom: 5 })
+                .hitTestBehavior(HitTestMode.None)
+
+              Canvas(this.perfCanvasCtx)
+                .width(396)
+                .height(56)
+                .onReady((): void => {
+                  this.perfCanvasReady = true;
+                  this.drawPerfCanvas();
+                })
+                .hitTestBehavior(HitTestMode.None)
+
+              Text('上图 帧间隔: 绿<=10.5ms(120Hz) 蓝<=19ms(60Hz) 黄<=35ms 红>35ms | 下图 耗时: 蓝UI+GL 紫GPU 橙Copy+Swap')
+                .width('100%')
+                .fontSize(9.5)
+                .fontColor('#94A3B8')
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Clip })
+                .margin({ top: 4 })
+                .hitTestBehavior(HitTestMode.None)
+            }
+            .width(416)
+            .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+            .margin({ top: 42, right: 12 })
+            .borderRadius(10)
+            .backgroundColor('#DC0F1218')
+            .border({ width: 1, color: '#38FFFFFF' })
+            .hitTestBehavior(HitTestMode.None)
+            .responseRegion({ x: 0, y: 0, width: 0, height: 0 })
+            .mouseResponseRegion({ x: 0, y: 0, width: 0, height: 0 })
+          }
+          .width('100%')
+          .height('100%')
+          .zIndex(20000)
+          .hitTestBehavior(HitTestMode.None)
+          .responseRegion({ x: 0, y: 0, width: 0, height: 0 })
+          .mouseResponseRegion({ x: 0, y: 0, width: 0, height: 0 })
+        }
       }
     }
     .id(this.rootStackId())

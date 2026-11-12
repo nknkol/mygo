@@ -336,6 +336,23 @@ const (
 	winActThemeSystem     byte = 20
 	winActThemeLight      byte = 21
 	winActThemeDark       byte = 22
+	winActPerfHUDOn       byte = 23
+	winActPerfHUDOff      byte = 24
+	winActPerfHUDToggle   byte = 25
+)
+
+// presentPerf carries optional per-frame stage timings (microseconds) and
+// scroll/damage metadata appended after presentMessage's rect list.
+type presentPerf struct {
+	uiGLUs      uint32
+	gpuFinishUs uint32
+	copyUs      uint32
+	meta        uint32
+}
+
+const (
+	presentPerfFromGPU   uint32 = 1 << 0
+	presentPerfWholeCopy uint32 = 1 << 1
 )
 
 // rect is a rectangle in the content's own coordinates, origin top left, as
@@ -537,6 +554,48 @@ func presentMessage(winID, seq uint32, rects []rect) []byte {
 		binary.LittleEndian.PutUint32(at[12:], r.h)
 	}
 	return p
+}
+
+// presentMessageWithPerf appends a 16-byte stage-timing trailer to presentMessage
+// so the native host can report Go UI+GL, glFinish, and buffer copy durations.
+func presentMessageWithPerf(winID, seq uint32, rects []rect, perf presentPerf) []byte {
+	base := 12 + len(rects)*16
+	p := make([]byte, base+16)
+	binary.LittleEndian.PutUint32(p[0:], winID)
+	binary.LittleEndian.PutUint32(p[4:], seq)
+	binary.LittleEndian.PutUint32(p[8:], uint32(len(rects)))
+	for i, r := range rects {
+		at := p[12+i*16:]
+		binary.LittleEndian.PutUint32(at[0:], uint32(r.x))
+		binary.LittleEndian.PutUint32(at[4:], uint32(r.y))
+		binary.LittleEndian.PutUint32(at[8:], r.w)
+		binary.LittleEndian.PutUint32(at[12:], r.h)
+	}
+	binary.LittleEndian.PutUint32(p[base+0:], perf.uiGLUs)
+	binary.LittleEndian.PutUint32(p[base+4:], perf.gpuFinishUs)
+	binary.LittleEndian.PutUint32(p[base+8:], perf.copyUs)
+	binary.LittleEndian.PutUint32(p[base+12:], perf.meta)
+	return p
+}
+
+func decodePresentPerf(p []byte) (winID, seq uint32, rects int, perf presentPerf, ok bool) {
+	if len(p) < 12 {
+		return 0, 0, 0, presentPerf{}, false
+	}
+	winID = binary.LittleEndian.Uint32(p[0:])
+	seq = binary.LittleEndian.Uint32(p[4:])
+	n := int(binary.LittleEndian.Uint32(p[8:]))
+	base := 12 + n*16
+	if n < 0 || len(p) < base+16 {
+		return winID, seq, n, presentPerf{}, false
+	}
+	perf = presentPerf{
+		uiGLUs:      binary.LittleEndian.Uint32(p[base+0:]),
+		gpuFinishUs: binary.LittleEndian.Uint32(p[base+4:]),
+		copyUs:      binary.LittleEndian.Uint32(p[base+8:]),
+		meta:        binary.LittleEndian.Uint32(p[base+12:]),
+	}
+	return winID, seq, n, perf, true
 }
 
 func abortMessage(winID, seq uint32) []byte {

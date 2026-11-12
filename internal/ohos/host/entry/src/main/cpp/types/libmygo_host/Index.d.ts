@@ -230,11 +230,26 @@ export interface HostTrayUpdate {
   items: HostMenuItem[];
 }
 
+export interface HostPerfHud {
+  winId: number;
+  visible: boolean;
+  live: boolean;
+  headerLine: string;
+  pacingLine: string;
+  stageLine: string;
+  inputLine: string;
+  dtMs: number[];
+  uiGlMs: number[];
+  gpuMs: number[];
+  copySwapMs: number[];
+}
+
 export interface HostBridgeCallbacks {
   onWinCreate: (cfg: HostWinConfig) => void;
   onWinConfig: (cfg: HostWinConfig) => void;
   onWinAction: (winId: number, action: number) => void;
   onFirstFrame: (winId: number) => void;
+  onPerfHud: (hud: HostPerfHud) => void;
   onPopupMenu: (reqId: number, winId: number, x: number, y: number, rtl: boolean, items: HostMenuItem[]) => void;
   onClipWrite: (data: HostClipWrite) => void;
   onClipRead: (reqId: number, formats: string[]) => void;

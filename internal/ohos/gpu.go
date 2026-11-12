@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -445,10 +446,16 @@ func (s *Surface) EndGL(w, h int, damage []image.Rectangle, whole, unchanged boo
 	if t == nil || t.w != w || t.h != h {
 		return fmt.Errorf("ohos: EndGL without matching %dx%d target", w, h)
 	}
+	t0 := time.Now()
+	if !s.frameStart.IsZero() {
+		s.lastUIGLUs = uint32(max(0, t0.Sub(s.frameStart).Microseconds()))
+	}
 	drv.glFinish()
+	t1 := time.Now()
+	s.lastGPUFinishUs = uint32(max(0, t1.Sub(t0).Microseconds()))
+	s.dmaSyncStart = t1
 	dmaBufSync(t.fd, dmaBufSyncStart|dmaBufSyncRead)
-	s.presentInternal(t.pix, t.stride, w, h, damage, whole, true)
-	dmaBufSync(t.fd, dmaBufSyncEnd|dmaBufSyncRead)
+	s.presentInternal(t.pix, t.stride, w, h, damage, whole, true, t.fd)
 	return nil
 }
 
