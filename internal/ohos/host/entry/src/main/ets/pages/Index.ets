@@ -1557,12 +1557,14 @@ struct MygoPopupMenuLevel1 {
 
 @Builder
 function buildPopupMenuRoot(ctx: PopupMenuContext): void {
-  MygoPopupMenuLevel1({
-    menuLevel: ctx.root,
-    isDark: ctx.darkMode,
-    menuDir: ctx.direction,
-    onMenuSelect: ctx.onSelect
-  })
+  WithTheme({ colorMode: ctx.darkMode ? ThemeColorMode.DARK : ThemeColorMode.LIGHT }) {
+    MygoPopupMenuLevel1({
+      menuLevel: ctx.root,
+      isDark: ctx.darkMode,
+      menuDir: ctx.direction,
+      onMenuSelect: ctx.onSelect
+    })
+  }
 }
 
 @Builder
@@ -2066,6 +2068,10 @@ struct Index {
         anchorPosition: { x: Math.max(0, x), y: Math.max(0, y) },
         enableArrow: false,
         showInSubWindow: this.winId === 1,
+        backgroundBlurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
+        backgroundBlurStyleOptions: {
+          colorMode: ctx.darkMode ? ThemeColorMode.DARK : ThemeColorMode.LIGHT
+        },
         onDisappear: (): void => {
           finish(0, false);
         }

@@ -342,6 +342,12 @@ export interface OHOSConfig {
   deviceTypes?: string[];
   /** Extra HarmonyOS permission names added to `requestPermissions` in module.json5. */
   permissions?: string[];
+  /** Custom user-visible reason text by permission name for `user_grant` permissions in module.json5. */
+  permissionReasons?: Record<string, string>;
+  /** Explicit 1024x1024 foreground layer PNG for HarmonyOS `$media:layered_image` (default: synthesized from `icon`). */
+  iconForeground?: string;
+  /** Explicit 1024x1024 opaque background layer PNG or `#RRGGBB` color for HarmonyOS `$media:layered_image` (default: extrapolated from `icon`). */
+  iconBackground?: string;
   /** EntryAbility `backgroundModes` in module.json5 (default: `["audioPlayback"]`). */
   backgroundModes?: string[];
   /** Sign the assembled `.hap` with `hda install --keep-signed` (default: `false`). */

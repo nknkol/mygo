@@ -36,13 +36,14 @@ const (
 	glColorAttach0        = 0x8CE0
 	glFramebufferComplete = 0x8CD5
 
-	nbFmtRGBA8888      = 12
-	nbUsageCPURead     = 1 << 0
-	nbUsageCPUWrite    = 1 << 1
-	nbUsageMemDMA      = 1 << 3
-	nbUsageMemMMZCache = 1 << 5
-	nbUsageHWRender    = 1 << 8
-	nbUsageHWTexture   = 1 << 9
+	nbFmtRGBA8888       = 12
+	nbUsageCPURead      = 1 << 0
+	nbUsageCPUWrite     = 1 << 1
+	nbUsageMemDMA       = 1 << 3
+	nbUsageMemMMZCache  = 1 << 5
+	nbUsageHWRender     = 1 << 8
+	nbUsageHWTexture    = 1 << 9
+	nbUsageCPUReadOften = 1 << 16
 
 	dmaBufIoctlSync = 0x40086200 // _IOW('b', 0, uint64)
 	dmaBufSyncRead  = 1 << 0
@@ -278,9 +279,14 @@ type glTarget struct {
 }
 
 func (d *gpuDriver) newTarget(w, h int) (*glTarget, error) {
-	baseUsage := int32(nbUsageCPURead | nbUsageCPUWrite | nbUsageMemDMA | nbUsageHWRender | nbUsageHWTexture)
+	baseUsage := int32(nbUsageCPURead | nbUsageMemDMA | nbUsageHWRender | nbUsageHWTexture)
 	var nb uintptr
-	for _, usage := range []int32{baseUsage | nbUsageMemMMZCache, baseUsage} {
+	for _, usage := range []int32{
+		baseUsage | nbUsageCPUReadOften | nbUsageMemMMZCache,
+		baseUsage | nbUsageCPUReadOften,
+		baseUsage | nbUsageCPUWrite | nbUsageMemMMZCache,
+		baseUsage | nbUsageCPUWrite,
+	} {
 		cfg := ohNativeBufferConfig{
 			width:  int32(w),
 			height: int32(h),

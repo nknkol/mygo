@@ -77,8 +77,22 @@ func TestOhosHostProjectGeneration(t *testing.T) {
 	}
 
 	proj := t.TempDir()
+	// Draw an inset squircle-like 1024x1024 icon (transparent 100px outer margin
+	// and transparent corners) to verify full-bleed 1024x1024 opaque background extrapolation.
 	img := image.NewNRGBA(image.Rect(0, 0, 1024, 1024))
-	img.SetNRGBA(0, 0, color.NRGBA{R: 255, G: 120, B: 40, A: 255})
+	for y := 100; y < 924; y++ {
+		for x := 100; x < 924; x++ {
+			// Leave 80x80 corners of the 824x824 box transparent like a squircle.
+			inTL := x < 180 && y < 180 && (x-180)*(x-180)+(y-180)*(y-180) > 80*80
+			inTR := x >= 844 && y < 180 && (x-844)*(x-844)+(y-180)*(y-180) > 80*80
+			inBL := x < 180 && y >= 844 && (x-180)*(x-180)+(y-844)*(y-844) > 80*80
+			inBR := x >= 844 && y >= 844 && (x-844)*(x-844)+(y-844)*(y-844) > 80*80
+			if inTL || inTR || inBL || inBR {
+				continue
+			}
+			img.SetNRGBA(x, y, color.NRGBA{R: 220, G: 50, B: 70, A: 255})
+		}
+	}
 	var iconBuf bytes.Buffer
 	if err := png.Encode(&iconBuf, img); err != nil {
 		t.Fatal(err)
@@ -107,7 +121,13 @@ func TestOhosHostProjectGeneration(t *testing.T) {
 		"fileAssociations": [{"ext": ["flac", "mp3"], "mimeType": "audio/flac"}],
 		"i18n": {"dir": "locales", "source": "en"},
 		"linux": {"comment": "Music player"},
-		"ohos": {"permissions": ["ohos.permission.MICROPHONE"]}
+		"ohos": {
+			"permissions": [
+				"ohos.permission.MICROPHONE",
+				"ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY",
+				"ohos.permission.CUSTOM_SANDBOX"
+			]
+		}
 	}`
 	if err := os.WriteFile(filepath.Join(proj, "mygo.json"), []byte(cfgJSON), 0o644); err != nil {
 		t.Fatal(err)
@@ -147,34 +167,88 @@ func TestOhosHostProjectGeneration(t *testing.T) {
 			Vendor      string `json:"vendor"`
 			VersionCode int    `json:"versionCode"`
 			VersionName string `json:"versionName"`
+			Icon        string `json:"icon"`
 		} `json:"app"`
 	}
 	if err := json.Unmarshal(appRaw, &appDoc); err != nil {
 		t.Fatal(err)
 	}
-	if appDoc.App.BundleName != "dev.egoist.music" || appDoc.App.Vendor != "egoist" || appDoc.App.VersionCode != 1022 || appDoc.App.VersionName != "0.1.22" {
+	if appDoc.App.BundleName != "dev.egoist.music" || appDoc.App.Vendor != "egoist" || appDoc.App.VersionCode != 1022 || appDoc.App.VersionName != "0.1.22" || appDoc.App.Icon != "$media:layered_image" {
 		t.Fatalf("unexpected app.json5: %+v", appDoc.App)
 	}
 
-	// Verify module.json5 URL schemes, file association MIME types, and extra permission.
+	// Verify module.json5 URL schemes, file association MIME types, layered icon, and permission classification.
 	modRaw, err := os.ReadFile(filepath.Join(stageHost, "entry", "src", "main", "module.json5"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	modText := string(modRaw)
-	for _, want := range []string{`"scheme": "mygo-music"`, `"scheme": "mygo-music-plugin"`, `"type": "audio/flac"`, `"ohos.permission.MICROPHONE"`} {
+	for _, want := range []string{
+		`"scheme": "mygo-music"`,
+		`"scheme": "mygo-music-plugin"`,
+		`"type": "audio/flac"`,
+		`"icon": "$media:layered_image"`,
+		`"$string:microphone_reason"`,
+		`"$string:read_write_download_directory_reason"`,
+	} {
 		if !strings.Contains(modText, want) {
 			t.Fatalf("module.json5 missing %s:\n%s", want, modText)
 		}
 	}
+	var modDoc struct {
+		Module struct {
+			RequestPermissions []struct {
+				Name      string         `json:"name"`
+				Reason    string         `json:"reason"`
+				UsedScene map[string]any `json:"usedScene"`
+			} `json:"requestPermissions"`
+		} `json:"module"`
+	}
+	if err := json.Unmarshal(modRaw, &modDoc); err != nil {
+		t.Fatal(err)
+	}
+	permMap := map[string]struct {
+		Reason    string
+		UsedScene map[string]any
+	}{}
+	for _, p := range modDoc.Module.RequestPermissions {
+		permMap[p.Name] = struct {
+			Reason    string
+			UsedScene map[string]any
+		}{p.Reason, p.UsedScene}
+	}
+	if got := permMap["ohos.permission.MICROPHONE"]; got.Reason != "$string:microphone_reason" || got.UsedScene == nil {
+		t.Fatalf("MICROPHONE perm = %+v, want reason + usedScene", got)
+	}
+	if got := permMap["ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY"]; got.Reason != "$string:read_write_download_directory_reason" || got.UsedScene == nil {
+		t.Fatalf("READ_WRITE_DOWNLOAD_DIRECTORY perm = %+v, want reason + usedScene", got)
+	}
+	if got, ok := permMap["ohos.permission.CUSTOM_SANDBOX"]; !ok || got.Reason != "" || got.UsedScene != nil {
+		t.Fatalf("CUSTOM_SANDBOX perm = %+v (ok=%v), want plain system/sandbox permission without reason/usedScene", got, ok)
+	}
 
-	// Verify localized zh_CN string table was generated.
+	// Verify localized zh_CN string tables include both app label and user_grant permission reasons.
 	zhRaw, err := os.ReadFile(filepath.Join(stageHost, "AppScope", "resources", "zh_CN", "element", "string.json"))
 	if err != nil || !strings.Contains(string(zhRaw), "云音乐") {
 		t.Fatalf("zh_CN string.json = %q, %v", zhRaw, err)
 	}
+	for _, strPath := range []string{
+		"entry/src/main/resources/base/element/string.json",
+		"entry/src/main/resources/zh_CN/element/string.json",
+	} {
+		raw, err := os.ReadFile(filepath.Join(stageHost, filepath.FromSlash(strPath)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, wantKey := range []string{"microphone_reason", "read_write_download_directory_reason"} {
+			if !strings.Contains(string(raw), wantKey) {
+				t.Fatalf("%s missing %s:\n%s", strPath, wantKey, raw)
+			}
+		}
+	}
 
-	// Verify icons were resized to 512x512 and 256x256.
+	// Verify 1024x1024 layered icons and 512/256 auxiliary icons were generated,
+	// and that background.png extrapolated opaque color into all four corners.
 	checkDim := func(rel string, want int) {
 		t.Helper()
 		f, err := os.Open(filepath.Join(stageHost, filepath.FromSlash(rel)))
@@ -187,9 +261,30 @@ func TestOhosHostProjectGeneration(t *testing.T) {
 			t.Fatalf("%s dimensions = %dx%d (%v), want %dx%d", rel, cfg.Width, cfg.Height, err, want, want)
 		}
 	}
+	checkDim("AppScope/resources/base/media/background.png", 1024)
+	checkDim("AppScope/resources/base/media/foreground.png", 1024)
+	checkDim("entry/src/main/resources/base/media/background.png", 1024)
+	checkDim("entry/src/main/resources/base/media/foreground.png", 1024)
 	checkDim("AppScope/resources/base/media/app_icon.png", 512)
 	checkDim("entry/src/main/resources/base/media/app_icon.png", 512)
 	checkDim("entry/src/main/resources/base/media/startIcon.png", 256)
+
+	bgFile, err := os.Open(filepath.Join(stageHost, "AppScope/resources/base/media/background.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bgFile.Close()
+	bgDecoded, err := png.Decode(bgFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bgNRGBA := toNRGBA(bgDecoded)
+	for _, pt := range [][2]int{{0, 0}, {1023, 0}, {0, 1023}, {1023, 1023}, {512, 512}} {
+		px := bgNRGBA.NRGBAAt(pt[0], pt[1])
+		if px != (color.NRGBA{R: 220, G: 50, B: 70, A: 255}) {
+			t.Fatalf("background.png pixel (%d,%d) = %+v, want opaque extrapolated coral {220 50 70 255}", pt[0], pt[1], px)
+		}
+	}
 }
 
 // packOhosHNP sets 0755 permissions on the engine and executable resources, and injectHNPIntoHAP embeds the HNP archive uncompressed via zip.Store.

@@ -5,6 +5,7 @@ package ohos
 import (
 	"image"
 	"math"
+	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -63,6 +64,9 @@ type Surface struct {
 	pinch             float64
 	lastX, lastY      float64
 	pointerIn         bool
+	pressDown         bool
+	pressX, pressY    float64
+	dragPending       bool
 	layered           bool
 	placed            []platform.WebViewPlacement
 	glCtx             uintptr
@@ -112,6 +116,11 @@ func (s *Surface) setHostHidden(hidden bool) {
 	s.mu.Lock()
 	s.hostHidden = hidden
 	s.mu.Unlock()
+}
+
+func (s *Surface) clearWindowDrag() {
+	s.pressDown = false
+	s.dragPending = false
 }
 
 // RequestFrame asks the host for the next buffer of this window, at the
@@ -263,6 +272,33 @@ func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage 
 	}
 }
 
+const parallelCopyMinPixels = 256 * 1024
+
+func copyRowBands(r image.Rectangle, fn func(y0, y1 int)) {
+	rows := r.Dy()
+	if rows <= 0 {
+		return
+	}
+	if r.Dx()*rows >= parallelCopyMinPixels && rows >= 16 {
+		workers := min(4, runtime.GOMAXPROCS(0))
+		if workers > 1 {
+			var wg sync.WaitGroup
+			wg.Add(workers)
+			for k := range workers {
+				ya := r.Min.Y + k*rows/workers
+				yb := r.Min.Y + (k+1)*rows/workers
+				go func(y0, y1 int) {
+					defer wg.Done()
+					fn(y0, y1)
+				}(ya, yb)
+			}
+			wg.Wait()
+			return
+		}
+	}
+	fn(r.Min.Y, r.Max.Y)
+}
+
 // copyRectBGRAtoRGBA copies top-down premultiplied BGRA pixels from raster.Image
 // into OHNativeWindow's top-down premultiplied RGBA_8888 buffer.
 func copyRectBGRAtoRGBA(b *buffer, pix []byte, stride, width, height int, r image.Rectangle) {
@@ -271,22 +307,25 @@ func copyRectBGRAtoRGBA(b *buffer, pix []byte, stride, width, height int, r imag
 		return
 	}
 	n := r.Dx() * 4
-	if r.Min.X == 0 && n == stride && stride == b.stride {
-		src := r.Min.Y * stride
-		end := r.Max.Y * stride
-		if end <= len(pix) && end <= len(b.mem) {
-			swizzleBGRAtoRGBA(b.mem[src:end], pix[src:end])
-			return
+	contig := r.Min.X == 0 && n == stride && stride == b.stride
+	copyRowBands(r, func(y0, y1 int) {
+		if contig {
+			src := y0 * stride
+			end := y1 * stride
+			if end <= len(pix) && end <= len(b.mem) {
+				swizzleBGRAtoRGBA(b.mem[src:end], pix[src:end])
+				return
+			}
 		}
-	}
-	for y := r.Min.Y; y < r.Max.Y; y++ {
-		src := y*stride + r.Min.X*4
-		dst := y*b.stride + r.Min.X*4
-		if src+n > len(pix) || dst+n > len(b.mem) {
-			return
+		for y := y0; y < y1; y++ {
+			src := y*stride + r.Min.X*4
+			dst := y*b.stride + r.Min.X*4
+			if src+n > len(pix) || dst+n > len(b.mem) {
+				return
+			}
+			swizzleBGRAtoRGBA(b.mem[dst:dst+n], pix[src:src+n])
 		}
-		swizzleBGRAtoRGBA(b.mem[dst:dst+n], pix[src:src+n])
-	}
+	})
 }
 
 func swizzleBGRAtoRGBA(dst, src []byte) {
@@ -318,15 +357,17 @@ func copyRectGPUFlipY(b *buffer, pix []byte, stride, width, height int, r image.
 	}
 	n := r.Dx() * 4
 	xOff := r.Min.X * 4
-	for y := r.Min.Y; y < r.Max.Y; y++ {
-		srcY := height - 1 - y
-		src := srcY*stride + xOff
-		dst := y*b.stride + xOff
-		if src < 0 || src+n > len(pix) || dst+n > len(b.mem) {
-			return
+	copyRowBands(r, func(y0, y1 int) {
+		for y := y0; y < y1; y++ {
+			srcY := height - 1 - y
+			src := srcY*stride + xOff
+			dst := y*b.stride + xOff
+			if src < 0 || src+n > len(pix) || dst+n > len(b.mem) {
+				return
+			}
+			copy(b.mem[dst:dst+n], pix[src:src+n])
 		}
-		copy(b.mem[dst:dst+n], pix[src:src+n])
-	}
+	})
 }
 
 func (s *Surface) SetCursor(c platform.Cursor) {

@@ -524,6 +524,7 @@ struct WinSession {
     BufReply reply = BufReply::None;
     uint32_t replySeq = 0;
     uint32_t replyRectCount = 0;
+    std::vector<Region::Rect> replyRects;
     uint32_t requestedFps = 0;
     bool fpsDirty = true;
 
@@ -4012,7 +4013,7 @@ void WinSession::applyExpectedFrameRateLocked(uint32_t fps) {
     int32_t maxHz = std::max<int32_t>(60, static_cast<int32_t>(std::lround(hz)));
     OH_NativeVSync_ExpectedRateRange range;
     if (fps == 0) {
-        range = {0, maxHz, maxHz};
+        range = {maxHz, maxHz, maxHz};
     } else {
         int32_t target = std::clamp<int32_t>(static_cast<int32_t>(fps), 1, maxHz);
         range = {target, maxHz, target};
@@ -4069,6 +4070,8 @@ void WinSession::renderLoop() {
         curH = h;
         sc = scale;
         refresh = hz;
+        fpsDirty = false;
+        applyExpectedFrameRateLocked(requestedFps);
     }
     if (win == nullptr || w <= 0 || h <= 0) {
         return;
@@ -4142,7 +4145,10 @@ void WinSession::renderLoop() {
             wantFrame = false;
         }
 
-        waitVsync();
+        const int64_t vsyncPeriodNs = static_cast<int64_t>(1e9 / std::max(60.0, refresh));
+        if (lastFlushNs != 0 && (monoNs() - lastFlushNs) < vsyncPeriodNs) {
+            waitVsync();
+        }
 
         {
             std::unique_lock<std::mutex> lk(mu);
@@ -4221,6 +4227,7 @@ void WinSession::renderLoop() {
 
         BufReply gotReply = BufReply::None;
         uint32_t rectCount = 0;
+        std::vector<Region::Rect> localRects;
         bool timedOut = false;
         {
             std::unique_lock<std::mutex> lk(mu);
@@ -4233,6 +4240,7 @@ void WinSession::renderLoop() {
             } else {
                 gotReply = reply;
                 rectCount = replyRectCount;
+                localRects.swap(replyRects);
                 reply = BufReply::None;
             }
         }
@@ -4264,6 +4272,10 @@ void WinSession::renderLoop() {
         }
 
         Region region = {nullptr, 0};
+        if (!localRects.empty()) {
+            region.rects = localRects.data();
+            region.rectNumber = static_cast<int32_t>(localRects.size());
+        }
         rc = OH_NativeWindow_NativeWindowFlushBuffer(win, buf, -1, region);
         if (rc != 0) {
             OH_LOG_ERROR(LOG_APP, "win=%{public}u FlushBuffer failed rc=%{public}d", winId, rc);
@@ -5405,11 +5417,24 @@ bool pumpEngineMessages() {
                 memcpy(&rects, payload.data() + 8, 4);
                 auto ws = findSession(wid > 0 ? wid : 1);
                 if (ws) {
+                    std::vector<Region::Rect> parsedRects;
+                    if (rects > 0 && rects <= 256 &&
+                        payload.size() >= 12 + static_cast<size_t>(rects) * 16) {
+                        parsedRects.resize(rects);
+                        for (uint32_t i = 0; i < rects; ++i) {
+                            const uint8_t *rp = payload.data() + 12 + static_cast<size_t>(i) * 16;
+                            memcpy(&parsedRects[i].x, rp + 0, 4);
+                            memcpy(&parsedRects[i].y, rp + 4, 4);
+                            memcpy(&parsedRects[i].w, rp + 8, 4);
+                            memcpy(&parsedRects[i].h, rp + 12, 4);
+                        }
+                    }
                     {
                         std::lock_guard<std::mutex> lk(ws->mu);
                         ws->reply = BufReply::Present;
                         ws->replySeq = seq;
                         ws->replyRectCount = rects;
+                        ws->replyRects.swap(parsedRects);
                     }
                     ws->cv.notify_all();
                 }
@@ -6526,7 +6551,11 @@ napi_value BindWindow(napi_env env, napi_callback_info info) {
     {
         std::lock_guard<std::mutex> lk(ws->mu);
         ws->scale = scale > 0 ? scale : 1.0;
-        ws->hz = hz > 0 ? hz : 120.0;
+        double nextHz = hz > 0 ? hz : 120.0;
+        if (ws->hz != nextHz) {
+            ws->hz = nextHz;
+            ws->fpsDirty = true;
+        }
     }
     ws->appliedPointerStyle = -1;
 

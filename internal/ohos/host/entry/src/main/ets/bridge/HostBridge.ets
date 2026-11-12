@@ -23,7 +23,7 @@ import host, {
   HostWebSetup,
   HostWinConfig
 } from 'libmygo_host.so';
-import { Permissions, Want, WantAgent, abilityAccessCtrl, bundleManager, common, wantAgent } from '@kit.AbilityKit';
+import { ConfigurationConstant, Permissions, Want, WantAgent, abilityAccessCtrl, bundleManager, common, wantAgent } from '@kit.AbilityKit';
 import { avSession } from '@kit.AVSessionKit';
 import { preferences } from '@kit.ArkData';
 import { util } from '@kit.ArkTS';
@@ -59,6 +59,8 @@ const WIN_FLAG_HAS_BG: number = 1 << 12;
 const WIN_FLAG_WEBVIEW: number = 1 << 14;
 const WIN_FLAG_WEB_INCOGNITO: number = 1 << 15;
 const WIN_FLAG_TRANSPARENT: number = 1 << 16;
+const WIN_FLAG_BTN_THEME_DARK_BG: number = 1 << 17;
+const WIN_FLAG_BTN_THEME_LIGHT_BG: number = 1 << 18;
 
 const CFG_MASK_TITLE: number = 1 << 0;
 const CFG_MASK_BOUNDS: number = 1 << 1;
@@ -85,6 +87,9 @@ const WIN_ACT_START_DRAG: number = 14;
 const WIN_ACT_CLOSE_ALLOW: number = 15;
 const WIN_ACT_CLOSE_DENY: number = 16;
 const WIN_ACT_QUIT_DENY: number = 19;
+const WIN_ACT_THEME_SYSTEM: number = 20;
+const WIN_ACT_THEME_LIGHT: number = 21;
+const WIN_ACT_THEME_DARK: number = 22;
 
 const WIN_OP_FOCUS: number = 1;
 const WIN_OP_BLUR: number = 2;
@@ -278,6 +283,12 @@ class ManagedWindow {
   cfg: HostWinConfig | undefined = undefined;
   pendingActions: number[] = [];
   willCloseResolve: ((prevent: boolean) => void) | undefined = undefined;
+  deferredAfterCloseDeny: number = 0;
+  hasLastRect: boolean = false;
+  lastRectX: number = 0;
+  lastRectY: number = 0;
+  lastRectW: number = 0;
+  lastRectH: number = 0;
 }
 
 function rgbaToHexColor(rgba: number): string {
@@ -439,6 +450,8 @@ class HostBridgeManager {
   private trayTooltip: string = '';
   private quitting: boolean = false;
   private quitFallbackTimer: number = -1;
+  private systemDarkMode: boolean = false;
+  private appThemeOverride: number = 0; // 0 = system, 1 = light, 2 = dark
   private trayIconClickHandler: (ev: emitter.EventData) => void = (_ev: emitter.EventData): void => {
     if (this.activeTrayId > 0) {
       host.notifyTrayEvent(this.activeTrayId, TRAY_EV_CLICK, 0);
@@ -474,8 +487,10 @@ class HostBridgeManager {
     this.onSystemPasteboardUpdated();
   };
 
-  init(ctx: common.UIAbilityContext): void {
+  init(ctx: common.UIAbilityContext, initialDark: boolean = false): void {
     this.context = ctx;
+    this.systemDarkMode = initialDark;
+    AppStorage.setOrCreate<boolean>('darkMode', this.effectiveDarkMode());
     try {
       const bInfo: bundleManager.BundleInfo = bundleManager.getBundleInfoForSelfSync(
         bundleManager.BundleFlag.GET_BUNDLE_INFO_WITH_APPLICATION
@@ -583,6 +598,65 @@ class HostBridgeManager {
     this.reactivatePersistedUris();
   }
 
+  effectiveDarkMode(): boolean {
+    if (this.appThemeOverride === 1) {
+      return false;
+    }
+    if (this.appThemeOverride === 2) {
+      return true;
+    }
+    return this.systemDarkMode;
+  }
+
+  onSystemDarkModeChanged(dark: boolean): void {
+    this.systemDarkMode = dark;
+    host.setDarkMode(dark);
+    this.refreshThemeOnWindows();
+  }
+
+  private refreshThemeOnWindows(): void {
+    const darkMode: boolean = this.effectiveDarkMode();
+    AppStorage.setOrCreate<boolean>('darkMode', darkMode);
+    this.windows.forEach((mw: ManagedWindow): void => {
+      if (!mw.ready || mw.win === undefined) {
+        return;
+      }
+      const bgPair: [string, number] = resolveWindowBg(mw.cfg, mw.isWeb, darkMode);
+      try {
+        mw.win.setWindowBackgroundColor(bgPair[0]);
+      } catch (_) {}
+      this.applyDecorButtonStyle(mw);
+    });
+  }
+
+  private applyDecorButtonStyle(mw: ManagedWindow): void {
+    const w: window.Window | undefined = mw.win;
+    if (w === undefined) {
+      return;
+    }
+    const cfg: HostWinConfig | undefined = mw.cfg;
+    let darkBg: boolean = this.effectiveDarkMode();
+    if (cfg !== undefined) {
+      if ((cfg.flags & WIN_FLAG_BTN_THEME_DARK_BG) !== 0) {
+        darkBg = true;
+      } else if ((cfg.flags & WIN_FLAG_BTN_THEME_LIGHT_BG) !== 0) {
+        darkBg = false;
+      } else if ((cfg.flags & WIN_FLAG_HAS_BG) !== 0 && (cfg.bgRGBA & 0xFF) >= 128) {
+        const r: number = (cfg.bgRGBA >>> 24) & 0xFF;
+        const g: number = (cfg.bgRGBA >>> 16) & 0xFF;
+        const b: number = (cfg.bgRGBA >>> 8) & 0xFF;
+        darkBg = (r * 299 + g * 587 + b * 114) < 128000;
+      }
+    }
+    try {
+      w.setDecorButtonStyle({
+        colorMode: darkBg
+          ? ConfigurationConstant.ColorMode.COLOR_MODE_DARK
+          : ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT
+      });
+    } catch (_) {}
+  }
+
   onAppForeground(): void {
     const mainMw: ManagedWindow | undefined = this.windows.get(1);
     if (mainMw !== undefined) {
@@ -666,6 +740,8 @@ class HostBridgeManager {
     this.reportWindowRect(mw);
     if (mw.cfg !== undefined) {
       this.applyWindowConfig(mw, mw.cfg, CFG_MASK_ALL, true);
+    } else {
+      this.applyDecorButtonStyle(mw);
     }
     if (this.powerKeepDisplay) {
       try { mw.win.setWindowKeepScreenOn(true).catch((): void => {}); } catch (_) {}
@@ -1836,11 +1912,12 @@ class HostBridgeManager {
     }
 
     if ((mask & CFG_MASK_BG) !== 0 || isCreate) {
-      const darkMode: boolean = AppStorage.get<boolean>('darkMode') ?? false;
+      const darkMode: boolean = this.effectiveDarkMode();
       const bgPair: [string, number] = resolveWindowBg(cfg, mw.isWeb, darkMode);
       try {
         w.setWindowBackgroundColor(bgPair[0]);
       } catch (_) {}
+      this.applyDecorButtonStyle(mw);
     }
 
     if ((mask & (CFG_MASK_MIN_SIZE | CFG_MASK_MAX_SIZE | CFG_MASK_FLAGS)) !== 0) {
@@ -1918,6 +1995,7 @@ class HostBridgeManager {
       if (hiddenTB && !hideBtns && !frameless) {
         this.reportTitleButtonRect(mw);
       }
+      this.applyDecorButtonStyle(mw);
 
       if (mw.winId >= 2 && (cfg.flags & WIN_FLAG_MODAL) === 0) {
         const zLevel: number = (cfg.flags & WIN_FLAG_ALWAYS_ON_TOP) !== 0 ? 100 : 0;
@@ -1957,6 +2035,17 @@ class HostBridgeManager {
   }
 
   private handleWinAction(winId: number, action: number): void {
+    if (action === WIN_ACT_THEME_SYSTEM || action === WIN_ACT_THEME_LIGHT || action === WIN_ACT_THEME_DARK) {
+      if (action === WIN_ACT_THEME_LIGHT) {
+        this.appThemeOverride = 1;
+      } else if (action === WIN_ACT_THEME_DARK) {
+        this.appThemeOverride = 2;
+      } else {
+        this.appThemeOverride = 0;
+      }
+      this.refreshThemeOnWindows();
+      return;
+    }
     if (action === WIN_ACT_QUIT_DENY) {
       if (this.quitFallbackTimer >= 0) {
         clearTimeout(this.quitFallbackTimer);
@@ -1972,6 +2061,7 @@ class HostBridgeManager {
       const resolve: ((prevent: boolean) => void) | undefined = mw.willCloseResolve;
       mw.willCloseResolve = undefined;
       if (action === WIN_ACT_CLOSE_ALLOW) {
+        mw.deferredAfterCloseDeny = 0;
         mw.closingFromEngine = true;
         if (resolve !== undefined) {
           resolve(false);
@@ -1984,6 +2074,13 @@ class HostBridgeManager {
       } else {
         if (resolve !== undefined) {
           resolve(true);
+        }
+        if (mw.deferredAfterCloseDeny !== 0) {
+          const deferred: number = mw.deferredAfterCloseDeny;
+          mw.deferredAfterCloseDeny = 0;
+          setTimeout((): void => {
+            this.executeWindowAction(mw, deferred);
+          }, 0);
         }
       }
       return;
@@ -2082,6 +2179,10 @@ class HostBridgeManager {
   private executeWindowAction(mw: ManagedWindow, action: number): void {
     const w: window.Window | undefined = mw.win;
     if (w === undefined) {
+      return;
+    }
+    if ((action === WIN_ACT_HIDE || action === WIN_ACT_MINIMIZE) && mw.willCloseResolve !== undefined) {
+      mw.deferredAfterCloseDeny = action;
       return;
     }
     switch (action) {
@@ -2271,7 +2372,7 @@ class HostBridgeManager {
         const yDip: number = Math.round(opts.rect.top / sc);
         const wDip: number = Math.round(opts.rect.width / sc);
         const hDip: number = Math.round(opts.rect.height / sc);
-        host.notifyWindowRect(winId, xDip, yDip, wDip, hDip);
+        this.emitWindowRect(mw, xDip, yDip, wDip, hDip);
       });
     } catch (_) {}
 
@@ -2336,6 +2437,22 @@ class HostBridgeManager {
     }
   }
 
+  private emitWindowRect(mw: ManagedWindow, xDip: number, yDip: number, wDip: number, hDip: number): void {
+    if (mw.hasLastRect &&
+        mw.lastRectX === xDip &&
+        mw.lastRectY === yDip &&
+        mw.lastRectW === wDip &&
+        mw.lastRectH === hDip) {
+      return;
+    }
+    mw.hasLastRect = true;
+    mw.lastRectX = xDip;
+    mw.lastRectY = yDip;
+    mw.lastRectW = wDip;
+    mw.lastRectH = hDip;
+    host.notifyWindowRect(mw.winId, xDip, yDip, wDip, hDip);
+  }
+
   private reportWindowRect(mw: ManagedWindow): void {
     if (mw.win === undefined) {
       return;
@@ -2343,8 +2460,8 @@ class HostBridgeManager {
     try {
       const r: window.Rect = mw.win.getWindowProperties().windowRect;
       const sc: number = this.currentScale();
-      host.notifyWindowRect(
-        mw.winId,
+      this.emitWindowRect(
+        mw,
         Math.round(r.left / sc),
         Math.round(r.top / sc),
         Math.round(r.width / sc),

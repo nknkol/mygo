@@ -52,6 +52,7 @@ type Window struct {
 	maxSize      platform.Size
 	bgColor      platform.Color
 	hasBg        bool
+	btnTheme     string
 	rawTitleBar  platform.TitleBar
 	hasTitleBar  bool
 	flyout       platform.Flyout
@@ -227,6 +228,12 @@ func (w *Window) styleFlags() uint32 {
 	}
 	if w.opts.Transparent {
 		f |= winFlagTransparent
+	}
+	switch w.btnTheme {
+	case "dark":
+		f |= winFlagBtnThemeDarkBg
+	case "light":
+		f |= winFlagBtnThemeLightBg
 	}
 	return f
 }
@@ -412,6 +419,7 @@ func (w *Window) hideSurface() {
 	s.hostHidden = true
 	s.mu.Unlock()
 	if !wasHidden {
+		s.clearWindowDrag()
 		s.touch.cancelFling()
 		if s.pointerIn {
 			s.send(platform.SurfaceEvent{Kind: platform.PointerLeave})
@@ -556,9 +564,22 @@ func (w *Window) SetIgnoreMouseEvents(bool)       {}
 func (w *Window) SetContentProtection(bool)       {}
 func (w *Window) SetVibrancy(string)              {}
 func (w *Window) SetVibrancyTint(*platform.Color) {}
-func (w *Window) SetActiveAppearance(bool)        {}
-func (w *Window) SetWindowButtonsTheme(string)    {}
-func (w *Window) SetProgressBar(string, float64)  {}
+func (w *Window) SetActiveAppearance(bool) {}
+
+func (w *Window) SetWindowButtonsTheme(source string) {
+	switch source {
+	case "dark", "light":
+	default:
+		source = ""
+	}
+	if w.btnTheme == source {
+		return
+	}
+	w.btnTheme = source
+	w.sendConfig(cfgMaskFlags)
+}
+
+func (w *Window) SetProgressBar(string, float64) {}
 func (w *Window) FlashFrame(bool)                 {}
 func (w *Window) SetSkipTaskbar(bool)             {}
 func (w *Window) SetVisibleOnAllWorkspaces(bool)  {}
@@ -583,14 +604,48 @@ func (w *Window) TitleBar() platform.TitleBar {
 	}
 }
 
+func (w *Window) inTitleButtons(x, y float64) bool {
+	tb := w.TitleBar()
+	if tb.Height <= 0 || y < 0 || y >= float64(tb.Height)+4 {
+		return false
+	}
+	if tb.Left > 0 && x >= 0 && x < float64(tb.Left)+4 {
+		return true
+	}
+	if tb.Right > 0 {
+		winW := float64(w.bounds.Width)
+		if w.surface != nil {
+			if sw, _, _ := w.surface.Size(); sw > 0 {
+				winW = sw
+			}
+		}
+		if winW > 0 && x >= winW-float64(tb.Right)-4 {
+			return true
+		}
+	}
+	return false
+}
+
 func (w *Window) StartDrag() {
 	if !w.opts.Movable || w.fullscreen {
 		return
+	}
+	if s := w.surface; s != nil {
+		if (s.pointerIn || s.pressDown) && w.inTitleButtons(s.lastX, s.lastY) {
+			return
+		}
+		if s.pressDown {
+			s.dragPending = true
+			return
+		}
 	}
 	w.sendAction(winActStartDrag)
 }
 
 func (w *Window) TitleBarDoubleClicked() {
+	if s := w.surface; s != nil && (s.pointerIn || s.pressDown) && w.inTitleButtons(s.lastX, s.lastY) {
+		return
+	}
 	if w.IsMaximized() {
 		w.Unmaximize()
 	} else if w.IsMaximizable() {

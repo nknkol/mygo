@@ -174,29 +174,70 @@ func (b *Backend) Theme() platform.Theme { return themeBackend{b} }
 
 type themeBackend struct{ b *Backend }
 
+func (b *Backend) effectiveDarkLocked() bool {
+	switch b.themeSource {
+	case "dark":
+		return true
+	case "light":
+		return false
+	default:
+		return b.systemDark
+	}
+}
+
+func (b *Backend) notifyThemeChanged(app platform.AppHandler, trays []*trayItem) {
+	if app != nil {
+		app.ThemeChanged()
+	}
+	for _, tr := range trays {
+		if tr != nil && !tr.destroyed && tr.h != nil {
+			tr.h.AppearanceChanged()
+		}
+	}
+}
+
 func (t themeBackend) IsDark() bool {
 	if t.b == nil {
 		return false
 	}
 	t.b.mu.Lock()
 	defer t.b.mu.Unlock()
-	switch t.b.themeSource {
-	case "dark":
-		return true
-	case "light":
-		return false
-	default:
-		return t.b.systemDark
-	}
+	return t.b.effectiveDarkLocked()
 }
 
 func (t themeBackend) SetSource(src string) {
 	if t.b == nil {
 		return
 	}
+	act := winActThemeSystem
+	switch src {
+	case "dark":
+		act = winActThemeDark
+	case "light":
+		act = winActThemeLight
+	default:
+		src = ""
+	}
 	t.b.mu.Lock()
+	prevDark := t.b.effectiveDarkLocked()
+	srcChanged := t.b.themeSource != src
 	t.b.themeSource = src
+	nowDark := t.b.effectiveDarkLocked()
+	app := t.b.app
+	var trays []*trayItem
+	if nowDark != prevDark && len(t.b.trays) > 0 {
+		trays = make([]*trayItem, 0, len(t.b.trays))
+		for _, tr := range t.b.trays {
+			trays = append(trays, tr)
+		}
+	}
 	t.b.mu.Unlock()
+	if srcChanged {
+		t.b.send(kindWinAction, winActionMessage(0, act))
+	}
+	if nowDark != prevDark {
+		t.b.notifyThemeChanged(app, trays)
+	}
 }
 
 func (themeBackend) UIFont() string { return "HarmonyOS Sans" }
@@ -214,8 +255,10 @@ func (themeBackend) FontRendering() platform.FontRendering {
 
 func (b *Backend) setSystemDark(dark bool) {
 	b.mu.Lock()
-	changed := b.systemDark != dark
+	prevDark := b.effectiveDarkLocked()
 	b.systemDark = dark
+	nowDark := b.effectiveDarkLocked()
+	changed := nowDark != prevDark
 	app := b.app
 	var trays []*trayItem
 	if changed && len(b.trays) > 0 {
@@ -226,14 +269,7 @@ func (b *Backend) setSystemDark(dark bool) {
 	}
 	b.mu.Unlock()
 	if changed {
-		if app != nil {
-			app.ThemeChanged()
-		}
-		for _, tr := range trays {
-			if tr != nil && !tr.destroyed && tr.h != nil {
-				tr.h.AppearanceChanged()
-			}
-		}
+		b.notifyThemeChanged(app, trays)
 	}
 }
 

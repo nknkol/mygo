@@ -1268,3 +1268,149 @@ func TestFlyoutPlacementAndAutoDismissOnBlur(t *testing.T) {
 		t.Fatalf("after modal closed + blur: kind=%d payload=%v err=%v closed=%v fh.closed=%d", kind, payload, err, fw.closed, fh.closed)
 	}
 }
+
+// Drag handles wait for pointer motion past the drag threshold before moving the window, and caption button rects ignore drags and zoom double clicks.
+func TestWindowDragThresholdAndTitleButtonExclusion(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+
+	b := NewWithFD(fds[0])
+	b.initW, b.initH, b.initScale = 1920, 1280, 2 // 960x640 DIP
+	if err := b.Init(nil, platform.AppOptions{}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	hostConn := &conn{fd: fds[1]}
+	h := &testWindowHandler{}
+	pw, err := b.NewWindow(&platform.WindowOptions{
+		Surface:        true,
+		Width:          960,
+		Height:         640,
+		TitleBarStyle:  "hidden",
+		TitleBarHeight: 40,
+		Resizable:      true,
+		Maximizable:    true,
+		Movable:        true,
+		Maximized:      true,
+	}, h)
+	if err != nil {
+		t.Fatalf("NewWindow: %v", err)
+	}
+	w := pw.(*Window)
+	_, _, _, _ = hostConn.read() // drain winCreate
+	b.onInput(encodeWindowTitleBarInput(1, 36, 0, 138))
+
+	h.take = func(ev platform.SurfaceEvent) bool {
+		if ev.Kind == platform.PointerDown {
+			w.StartDrag()
+		}
+		return false
+	}
+
+	assertNoPendingHostMsg := func(step string) {
+		t.Helper()
+		_ = syscall.SetNonblock(fds[1], true)
+		defer syscall.SetNonblock(fds[1], false)
+		var probe [8]byte
+		n, rerr := syscall.Read(fds[1], probe[:])
+		if n > 0 {
+			t.Fatalf("%s: unexpected host msg bytes=%v", step, probe[:n])
+		}
+		if rerr != nil && rerr != syscall.EAGAIN && rerr != syscall.EWOULDBLOCK {
+			t.Fatalf("%s: unexpected read err=%v", step, rerr)
+		}
+	}
+
+	// 1. Clicking and jittering < 6 DIP on a drag region (such as a maximized sidebar) does NOT detach/drag the window.
+	b.onInput(encodeMouseInput(1, mouseDown, 0, 0, 0, 100, 80, 200, 0.5))
+	b.onInput(encodeMouseInput(1, mouseMove, 0, 0, 0, 110, 83, 203, 0.5))
+	b.onInput(encodeMouseInput(1, mouseUp, 0, 0, 0, 120, 83, 203, 0))
+	assertNoPendingHostMsg("sidebar click without drag")
+	if !w.IsMaximized() {
+		t.Fatal("window lost maximized state on click without drag")
+	}
+
+	// 2. Dragging >= 6 DIP cancels the surface press and starts native window move once.
+	h.events = nil
+	b.onInput(encodeMouseInput(1, mouseDown, 0, 0, 0, 900, 80, 200, 0.5))
+	b.onInput(encodeMouseInput(1, mouseMove, 0, 0, 0, 915, 88, 206, 0.5))
+	kind, payload, _, err := hostConn.read()
+	if err != nil || kind != kindWinAction || payload[4] != winActStartDrag {
+		t.Fatalf("drag >=6 DIP msg = (%d, %v, %v), want winActStartDrag", kind, payload, err)
+	}
+	if len(h.events) != 2 || h.events[0].Kind != platform.PointerDown || h.events[1].Kind != platform.PointerCancel {
+		t.Fatalf("drag events = %+v, want [PointerDown PointerCancel]", h.events)
+	}
+	b.onInput(encodeMouseInput(1, mouseMove, 0, 0, 0, 930, 110, 220, 0.5))
+	b.onInput(encodeMouseInput(1, mouseUp, 0, 0, 0, 950, 110, 220, 0))
+	assertNoPendingHostMsg("subsequent moves after winActStartDrag")
+
+	// 3. Pressing, dragging, or double-clicking inside the top-right caption buttons (960-138..960, 0..40) ignores drag and zoom.
+	b.onInput(encodeMouseInput(1, mouseDown, 0, 0, 0, 1800, 940, 18, 0.5))
+	b.onInput(encodeMouseInput(1, mouseMove, 0, 0, 0, 1815, 910, 28, 0.5))
+	w.TitleBarDoubleClicked()
+	b.onInput(encodeMouseInput(1, mouseUp, 0, 0, 0, 1830, 910, 28, 0))
+	assertNoPendingHostMsg("top-right caption button exclusion")
+	if !w.IsMaximized() {
+		t.Fatal("caption button click unmaximized window")
+	}
+}
+
+// Theme source overrides forward host color mode actions, mask OS theme flips while pinned, and window button themes update style flags.
+func TestThemeSourceOverrideAndWindowButtonsTheme(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+
+	b := NewWithFD(fds[0])
+	appH := &testAppHandler{}
+	if err := b.Init(appH, platform.AppOptions{}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	hostConn := &conn{fd: fds[1]}
+
+	b.Theme().SetSource("dark")
+	kind, payload, _, err := hostConn.read()
+	if err != nil || kind != kindWinAction || payload[4] != winActThemeDark || !b.Theme().IsDark() || appH.themeChanged != 1 {
+		t.Fatalf("SetSource(dark): kind=%d payload=%v dark=%v changed=%d", kind, payload, b.Theme().IsDark(), appH.themeChanged)
+	}
+
+	// OS flipping to light while pinned to dark keeps IsDark() true and does not emit spurious ThemeChanged.
+	b.onInput(encodeWindowInput(1, winThemeLight))
+	if !b.Theme().IsDark() || appH.themeChanged != 1 {
+		t.Fatalf("pinned dark after OS light: dark=%v changed=%d", b.Theme().IsDark(), appH.themeChanged)
+	}
+
+	// Returning to system source picks up OS light and emits ThemeChanged.
+	b.Theme().SetSource("system")
+	kind, payload, _, err = hostConn.read()
+	if err != nil || kind != kindWinAction || payload[4] != winActThemeSystem || b.Theme().IsDark() || appH.themeChanged != 2 {
+		t.Fatalf("SetSource(system): kind=%d payload=%v dark=%v changed=%d", kind, payload, b.Theme().IsDark(), appH.themeChanged)
+	}
+
+	pw, err := b.NewWindow(&platform.WindowOptions{Surface: true, TitleBarStyle: "hidden"}, &testWindowHandler{})
+	if err != nil {
+		t.Fatalf("NewWindow: %v", err)
+	}
+	_, _, _, _ = hostConn.read() // drain winCreate
+
+	pw.SetWindowButtonsTheme("dark")
+	kind, payload, _, err = hostConn.read()
+	cfg, ok := decodeWinConfigMessage(payload)
+	if err != nil || kind != kindWinConfig || !ok || cfg.parentOrMask != cfgMaskFlags || cfg.flags&winFlagBtnThemeDarkBg == 0 {
+		t.Fatalf("SetWindowButtonsTheme(dark): kind=%d ok=%v cfg=%+v", kind, ok, cfg)
+	}
+
+	pw.SetWindowButtonsTheme("light")
+	kind, payload, _, err = hostConn.read()
+	cfg, ok = decodeWinConfigMessage(payload)
+	if err != nil || kind != kindWinConfig || !ok || cfg.flags&winFlagBtnThemeLightBg == 0 || cfg.flags&winFlagBtnThemeDarkBg != 0 {
+		t.Fatalf("SetWindowButtonsTheme(light): kind=%d ok=%v cfg=%+v", kind, ok, cfg)
+	}
+}

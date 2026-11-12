@@ -296,8 +296,10 @@ const (
 	winFlagHasBg          uint32 = 1 << 12
 	winFlagMovable        uint32 = 1 << 13
 	winFlagWebView        uint32 = 1 << 14
-	winFlagWebIncognito   uint32 = 1 << 15
-	winFlagTransparent    uint32 = 1 << 16
+	winFlagWebIncognito    uint32 = 1 << 15
+	winFlagTransparent     uint32 = 1 << 16
+	winFlagBtnThemeDarkBg  uint32 = 1 << 17
+	winFlagBtnThemeLightBg uint32 = 1 << 18
 )
 
 // Configuration field mask (kindWinConfig).
@@ -331,6 +333,9 @@ const (
 	winActEnableWebLayer  byte = 17
 	winActFocusSurface    byte = 18
 	winActQuitDeny        byte = 19
+	winActThemeSystem     byte = 20
+	winActThemeLight      byte = 21
+	winActThemeDark       byte = 22
 )
 
 // rect is a rectangle in the content's own coordinates, origin top left, as

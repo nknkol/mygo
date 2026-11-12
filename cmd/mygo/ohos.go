@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
 	"image/png"
 	"io"
 	"io/fs"
@@ -33,7 +35,18 @@ type OHOS struct {
 	// (default: ["2in1", "tablet"]).
 	DeviceTypes []string `json:"deviceTypes"`
 	// Permissions adds extra requestPermissions names to module.json5.
+	// User-grant permissions automatically receive a localized reason and
+	// EntryAbility usedScene; system-grant and sandbox permissions (such as
+	// ohos.permission.CUSTOM_SANDBOX) are emitted as plain name entries.
 	Permissions []string `json:"permissions"`
+	// PermissionReasons overrides or supplies usage-description text for
+	// permissions in requestPermissions, keyed by permission name.
+	PermissionReasons map[string]string `json:"permissionReasons"`
+	// IconForeground and IconBackground optionally supply dedicated 1024x1024
+	// square PNG layers for HarmonyOS's $media:layered_image icon. When unset,
+	// MyGo derives compliant 1024x1024 layers from Config.Icon.
+	IconForeground string `json:"iconForeground"`
+	IconBackground string `json:"iconBackground"`
 	// BackgroundModes lists EntryAbility backgroundModes in module.json5
 	// (default: ["audioPlayback"]).
 	BackgroundModes []string `json:"backgroundModes"`
@@ -45,6 +58,11 @@ type OHOS struct {
 func (o *OHOS) validate() error {
 	if o.VersionCode < 0 {
 		return fmt.Errorf("ohos.versionCode %d must be positive", o.VersionCode)
+	}
+	for k, v := range o.PermissionReasons {
+		if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
+			return fmt.Errorf("ohos.permissionReasons maps a permission name to a non-empty reason, not %q to %q", k, v)
+		}
 	}
 	return nil
 }
@@ -507,7 +525,7 @@ func writeOhosHostProject(c *Config, hostTemplateDir, stageHostDir string, debug
 			"vendor":      c.ohosVendor(),
 			"versionCode": c.ohosVersionCode(),
 			"versionName": c.Version,
-			"icon":        "$media:app_icon",
+			"icon":        "$media:layered_image",
 			"label":       "$string:app_name",
 		},
 	}); err != nil {
@@ -576,11 +594,13 @@ func writeOhosHostProject(c *Config, hostTemplateDir, stageHostDir string, debug
 		return err
 	}
 
-	// 4. Base & localized string resources
-	const (
-		pasteboardReason = "Used to paste text, links, files, and images from the system clipboard into the application."
-		backgroundReason = "Used to keep audio playing smoothly while windows are minimized or in the background."
-	)
+	// 4. Base & localized string resources (including auto-classified permission reasons)
+	modCfg, permStrings := ohosModuleAndPermStrings(c)
+	baseStrings := append([]ohosStringEntry{
+		{Name: "module_desc", Value: desc},
+		{Name: "EntryAbility_desc", Value: desc},
+		{Name: "EntryAbility_label", Value: c.Name},
+	}, permStrings...)
 	if err := writeOhosStringTable(
 		filepath.Join(stageHostDir, "AppScope", "resources", "base", "element", "string.json"),
 		[]ohosStringEntry{{Name: "app_name", Value: c.Name}},
@@ -589,13 +609,7 @@ func writeOhosHostProject(c *Config, hostTemplateDir, stageHostDir string, debug
 	}
 	if err := writeOhosStringTable(
 		filepath.Join(stageHostDir, "entry", "src", "main", "resources", "base", "element", "string.json"),
-		[]ohosStringEntry{
-			{Name: "module_desc", Value: desc},
-			{Name: "EntryAbility_desc", Value: desc},
-			{Name: "EntryAbility_label", Value: c.Name},
-			{Name: "read_pasteboard_reason", Value: pasteboardReason},
-			{Name: "keep_background_reason", Value: backgroundReason},
-		},
+		baseStrings,
 	); err != nil {
 		return err
 	}
@@ -622,15 +636,14 @@ func writeOhosHostProject(c *Config, hostTemplateDir, stageHostDir string, debug
 			); err != nil {
 				return err
 			}
+			locStrings := append([]ohosStringEntry{
+				{Name: "module_desc", Value: locDesc},
+				{Name: "EntryAbility_desc", Value: locDesc},
+				{Name: "EntryAbility_label", Value: locName},
+			}, permStrings...)
 			if err := writeOhosStringTable(
 				filepath.Join(stageHostDir, "entry", "src", "main", "resources", qual, "element", "string.json"),
-				[]ohosStringEntry{
-					{Name: "module_desc", Value: locDesc},
-					{Name: "EntryAbility_desc", Value: locDesc},
-					{Name: "EntryAbility_label", Value: locName},
-					{Name: "read_pasteboard_reason", Value: pasteboardReason},
-					{Name: "keep_background_reason", Value: backgroundReason},
-				},
+				locStrings,
 			); err != nil {
 				return err
 			}
@@ -640,21 +653,202 @@ func writeOhosHostProject(c *Config, hostTemplateDir, stageHostDir string, debug
 	// 5. entry/src/main/module.json5
 	if err := writeOhosJSON(
 		filepath.Join(stageHostDir, "entry", "src", "main", "module.json5"),
-		ohosModuleConfig(c),
+		modCfg,
 	); err != nil {
 		return err
 	}
 
-	// 6. Icons (AppScope app_icon.png, entry app_icon.png, entry startIcon.png)
-	if c.Icon != "" {
-		if err := writeOhosIcons(c, stageHostDir); err != nil {
-			return err
-		}
+	// 6. Layered icons ($media:layered_image: 1024x1024 background.png + foreground.png, startIcon.png, app_icon.png)
+	if err := writeOhosIcons(c, stageHostDir); err != nil {
+		return err
 	}
 	return nil
 }
 
+// ohosKnownReasonPermissions maps HarmonyOS permissions that require (or benefit
+// from) reason + EntryAbility usedScene in module.json5 to their string key and
+// default English usage description. System-grant and sandbox permissions such
+// as ohos.permission.CUSTOM_SANDBOX intentionally stay out of this table so
+// hvigor packages them as clean {"name": "..."} entries.
+var ohosKnownReasonPermissions = map[string][2]string{
+	"ohos.permission.READ_PASTEBOARD": {
+		"read_pasteboard_reason",
+		"Used to paste text, links, files, and images from the system clipboard into the application.",
+	},
+	"ohos.permission.KEEP_BACKGROUND_RUNNING": {
+		"keep_background_reason",
+		"Used to keep audio playing smoothly while windows are minimized or in the background.",
+	},
+	"ohos.permission.MICROPHONE": {
+		"microphone_reason",
+		"Used to capture audio input from the microphone when requested by the user.",
+	},
+	"ohos.permission.CAMERA": {
+		"camera_reason",
+		"Used to capture photos or video from the camera when requested by the user.",
+	},
+	"ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY": {
+		"read_write_download_directory_reason",
+		"Used to read and save files in the user's Downloads folder.",
+	},
+	"ohos.permission.READ_WRITE_DOCUMENTS_DIRECTORY": {
+		"read_write_documents_directory_reason",
+		"Used to read and save files in the user's Documents folder.",
+	},
+	"ohos.permission.READ_WRITE_DESKTOP_DIRECTORY": {
+		"read_write_desktop_directory_reason",
+		"Used to read and save files on the user's Desktop.",
+	},
+	"ohos.permission.READ_WRITE_IMAGES": {
+		"read_write_images_reason",
+		"Used to read and save images in the user's media library.",
+	},
+	"ohos.permission.READ_WRITE_VIDEO": {
+		"read_write_video_reason",
+		"Used to read and save videos in the user's media library.",
+	},
+	"ohos.permission.READ_WRITE_AUDIO": {
+		"read_write_audio_reason",
+		"Used to read and save audio files in the user's media library.",
+	},
+	"ohos.permission.READ_IMAGEVIDEO": {
+		"read_imagevideo_reason",
+		"Used to read images and videos selected by the user.",
+	},
+	"ohos.permission.WRITE_IMAGEVIDEO": {
+		"write_imagevideo_reason",
+		"Used to save images and videos to the user's media library.",
+	},
+	"ohos.permission.SHORT_TERM_WRITE_IMAGEVIDEO": {
+		"short_term_write_imagevideo_reason",
+		"Used to save images and videos to the user's media library.",
+	},
+	"ohos.permission.READ_AUDIO": {
+		"read_audio_reason",
+		"Used to read audio files from the user's media library.",
+	},
+	"ohos.permission.WRITE_AUDIO": {
+		"write_audio_reason",
+		"Used to save audio files to the user's media library.",
+	},
+	"ohos.permission.MEDIA_LOCATION": {
+		"media_location_reason",
+		"Used to read location metadata attached to user media files.",
+	},
+	"ohos.permission.LOCATION": {
+		"location_reason",
+		"Used to provide location-aware features when requested by the user.",
+	},
+	"ohos.permission.APPROXIMATELY_LOCATION": {
+		"approximately_location_reason",
+		"Used to provide approximate location features when requested by the user.",
+	},
+	"ohos.permission.LOCATION_IN_BACKGROUND": {
+		"location_in_background_reason",
+		"Used to update location while the application is in the background.",
+	},
+	"ohos.permission.ACCESS_BLUETOOTH": {
+		"access_bluetooth_reason",
+		"Used to discover and connect to nearby Bluetooth devices.",
+	},
+	"ohos.permission.READ_CALENDAR": {
+		"read_calendar_reason",
+		"Used to read calendar events when requested by the user.",
+	},
+	"ohos.permission.WRITE_CALENDAR": {
+		"write_calendar_reason",
+		"Used to create or update calendar events when requested by the user.",
+	},
+	"ohos.permission.READ_WHOLE_CALENDAR": {
+		"read_whole_calendar_reason",
+		"Used to read calendar events when requested by the user.",
+	},
+	"ohos.permission.WRITE_WHOLE_CALENDAR": {
+		"write_whole_calendar_reason",
+		"Used to create or update calendar events when requested by the user.",
+	},
+	"ohos.permission.READ_CONTACTS": {
+		"read_contacts_reason",
+		"Used to read contacts when requested by the user.",
+	},
+	"ohos.permission.WRITE_CONTACTS": {
+		"write_contacts_reason",
+		"Used to save contacts when requested by the user.",
+	},
+	"ohos.permission.ACTIVITY_MOTION": {
+		"activity_motion_reason",
+		"Used to read motion and fitness activity when requested by the user.",
+	},
+	"ohos.permission.READ_HEALTH_DATA": {
+		"read_health_data_reason",
+		"Used to read health data when requested by the user.",
+	},
+	"ohos.permission.DISTRIBUTED_DATASYNC": {
+		"distributed_datasync_reason",
+		"Used to synchronize application data across the user's HarmonyOS devices.",
+	},
+	"ohos.permission.APP_TRACKING_CONSENT": {
+		"app_tracking_consent_reason",
+		"Used to request user consent for cross-application tracking.",
+	},
+}
+
+func ohosPermReasonKey(perm string) string {
+	trimmed := strings.TrimPrefix(perm, "ohos.permission.")
+	var b strings.Builder
+	for _, r := range strings.ToLower(trimmed) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	s := strings.Trim(b.String(), "_")
+	if s == "" {
+		s = "custom"
+	}
+	return s + "_reason"
+}
+
+func ohosPermissionEntry(c *Config, name string) (map[string]any, *ohosStringEntry) {
+	customReason := ""
+	if c.OHOS.PermissionReasons != nil {
+		customReason = strings.TrimSpace(c.OHOS.PermissionReasons[name])
+	}
+	if known, ok := ohosKnownReasonPermissions[name]; ok {
+		reasonText := known[1]
+		if customReason != "" {
+			reasonText = customReason
+		}
+		return map[string]any{
+			"name":   name,
+			"reason": "$string:" + known[0],
+			"usedScene": map[string]any{
+				"abilities": []string{"EntryAbility"},
+				"when":      "inuse",
+			},
+		}, &ohosStringEntry{Name: known[0], Value: reasonText}
+	}
+	if customReason != "" {
+		key := ohosPermReasonKey(name)
+		return map[string]any{
+			"name":   name,
+			"reason": "$string:" + key,
+			"usedScene": map[string]any{
+				"abilities": []string{"EntryAbility"},
+				"when":      "inuse",
+			},
+		}, &ohosStringEntry{Name: key, Value: customReason}
+	}
+	return map[string]any{"name": name}, nil
+}
+
 func ohosModuleConfig(c *Config) map[string]any {
+	cfg, _ := ohosModuleAndPermStrings(c)
+	return cfg
+}
+
+func ohosModuleAndPermStrings(c *Config) (map[string]any, []ohosStringEntry) {
 	deviceTypes := c.OHOS.DeviceTypes
 	if len(deviceTypes) == 0 {
 		deviceTypes = []string{"2in1", "tablet"}
@@ -664,35 +858,36 @@ func ohosModuleConfig(c *Config) map[string]any {
 		bgModes = []string{"audioPlayback"}
 	}
 
-	perms := []map[string]any{
-		{"name": "ohos.permission.INTERNET"},
-		{"name": "ohos.permission.GET_NETWORK_INFO"},
-		{"name": "ohos.permission.PREPARE_APP_TERMINATE"},
-		{
-			"name":   "ohos.permission.KEEP_BACKGROUND_RUNNING",
-			"reason": "$string:keep_background_reason",
-			"usedScene": map[string]any{
-				"abilities": []string{"EntryAbility"},
-				"when":      "inuse",
-			},
-		},
-		{"name": "ohos.permission.FILE_ACCESS_PERSIST"},
-		{
-			"name":   "ohos.permission.READ_PASTEBOARD",
-			"reason": "$string:read_pasteboard_reason",
-			"usedScene": map[string]any{
-				"abilities": []string{"EntryAbility"},
-				"when":      "inuse",
-			},
-		},
+	defaultPerms := []string{
+		"ohos.permission.INTERNET",
+		"ohos.permission.GET_NETWORK_INFO",
+		"ohos.permission.PREPARE_APP_TERMINATE",
+		"ohos.permission.KEEP_BACKGROUND_RUNNING",
+		"ohos.permission.FILE_ACCESS_PERSIST",
+		"ohos.permission.READ_PASTEBOARD",
 	}
-	havePerm := func(name string) bool {
-		return slices.ContainsFunc(perms, func(p map[string]any) bool { return p["name"] == name })
+	var perms []map[string]any
+	var reasonStrings []ohosStringEntry
+	seenPerm := map[string]bool{}
+	seenKey := map[string]bool{}
+	addPerm := func(raw string) {
+		name := strings.TrimSpace(raw)
+		if name == "" || seenPerm[name] {
+			return
+		}
+		seenPerm[name] = true
+		entry, strEntry := ohosPermissionEntry(c, name)
+		perms = append(perms, entry)
+		if strEntry != nil && !seenKey[strEntry.Name] {
+			seenKey[strEntry.Name] = true
+			reasonStrings = append(reasonStrings, *strEntry)
+		}
+	}
+	for _, p := range defaultPerms {
+		addPerm(p)
 	}
 	for _, extra := range c.OHOS.Permissions {
-		if extra = strings.TrimSpace(extra); extra != "" && !havePerm(extra) {
-			perms = append(perms, map[string]any{"name": extra})
-		}
+		addPerm(extra)
 	}
 
 	skills := []any{
@@ -736,7 +931,7 @@ func ohosModuleConfig(c *Config) map[string]any {
 		"name":                  "EntryAbility",
 		"srcEntry":              "./ets/entryability/EntryAbility.ets",
 		"description":           "$string:EntryAbility_desc",
-		"icon":                  "$media:app_icon",
+		"icon":                  "$media:layered_image",
 		"label":                 "$string:EntryAbility_label",
 		"startWindowIcon":       "$media:startIcon",
 		"startWindowBackground": "$color:start_window_background",
@@ -767,44 +962,338 @@ func ohosModuleConfig(c *Config) map[string]any {
 			"requestPermissions": perms,
 			"abilities":          []any{ability},
 		},
+	}, reasonStrings
+}
+
+func toNRGBA(img image.Image) *image.NRGBA {
+	if n, ok := img.(*image.NRGBA); ok && n.Bounds().Min == (image.Point{}) {
+		return n
 	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	out := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := range h {
+		for x := range w {
+			out.SetNRGBA(x, y, color.NRGBAModel.Convert(img.At(b.Min.X+x, b.Min.Y+y)).(color.NRGBA))
+		}
+	}
+	return out
+}
+
+// solidIconCrop trims macOS-style transparent squircle margins and outer drop
+// shadows so the solid icon body fills HarmonyOS's 1024x1024 layered canvas.
+func solidIconCrop(src *image.NRGBA) image.Image {
+	w, h := src.Bounds().Dx(), src.Bounds().Dy()
+	if w <= 0 || h <= 0 {
+		return src
+	}
+	findBox := func(minAlpha uint8) (image.Rectangle, bool) {
+		minX, minY := w, h
+		maxX, maxY := -1, -1
+		for y := range h {
+			row := src.Pix[y*src.Stride : y*src.Stride+w*4]
+			for x := range w {
+				if row[x*4+3] >= minAlpha {
+					if x < minX {
+						minX = x
+					}
+					if x > maxX {
+						maxX = x
+					}
+					if y < minY {
+						minY = y
+					}
+					if y > maxY {
+						maxY = y
+					}
+				}
+			}
+		}
+		if maxX < minX || maxY < minY {
+			return image.Rectangle{}, false
+		}
+		return image.Rect(minX, minY, maxX+1, maxY+1), true
+	}
+	box, ok := findBox(224)
+	if !ok {
+		box, ok = findBox(16)
+	}
+	if !ok {
+		return src
+	}
+	side := max(box.Dx(), box.Dy())
+	// When the icon has a macOS transparent inset (>= 8% total margin), shave a
+	// thin outer rim to drop baked-in bevel/shadow pixels before corner fill.
+	if side <= w*92/100 && side > 32 {
+		trim := max(2, side/180)
+		if side-2*trim >= 16 {
+			side -= 2 * trim
+		}
+	}
+	cx := (box.Min.X + box.Max.X) / 2
+	cy := (box.Min.Y + box.Max.Y) / 2
+	x0 := min(max(cx-side/2, 0), max(0, w-side))
+	y0 := min(max(cy-side/2, 0), max(0, h-side))
+	return src.SubImage(image.Rect(x0, y0, min(w, x0+side), min(h, y0+side)))
+}
+
+func isFilledSquircleIcon(cropped *image.NRGBA) bool {
+	w, h := cropped.Bounds().Dx(), cropped.Bounds().Dy()
+	if w < 8 || h < 8 {
+		return true
+	}
+	d := max(2, min(w, h)*3/100)
+	mx, my := w/2, h/2
+	opaqueEdges := 0
+	for _, pt := range [4][2]int{{mx, d}, {mx, h - 1 - d}, {d, my}, {w - 1 - d, my}} {
+		if cropped.NRGBAAt(pt[0], pt[1]).A >= 224 {
+			opaqueEdges++
+		}
+	}
+	return opaqueEdges >= 3
+}
+
+// extrapolateOpaqueBackground produces a 1024x1024 100%-opaque HarmonyOS
+// background layer by extending interior opaque colors outward into rounded
+// corner cutouts via a two-pass Chamfer nearest-seed transform.
+func extrapolateOpaqueBackground(src *image.NRGBA) *image.NRGBA {
+	w, h := src.Bounds().Dx(), src.Bounds().Dy()
+	n := w * h
+	const inf = int32(1 << 29)
+	dist := make([]int32, n)
+	seed := make([]int32, n)
+	hasSeed := false
+	seedAlpha := uint8(248)
+	for pass := range 2 {
+		if pass == 1 && hasSeed {
+			break
+		}
+		if pass == 1 {
+			seedAlpha = 128
+		}
+		for i := range n {
+			if src.Pix[i*4+3] >= seedAlpha {
+				dist[i] = 0
+				seed[i] = int32(i)
+				hasSeed = true
+			} else {
+				dist[i] = inf
+				seed[i] = -1
+			}
+		}
+	}
+	out := image.NewNRGBA(image.Rect(0, 0, w, h))
+	if !hasSeed {
+		for i := range n {
+			c := src.Pix[i*4 : i*4+4]
+			a := uint16(c[3])
+			out.Pix[i*4+0] = uint8((uint16(c[0])*a + 255*(255-a) + 127) / 255)
+			out.Pix[i*4+1] = uint8((uint16(c[1])*a + 255*(255-a) + 127) / 255)
+			out.Pix[i*4+2] = uint8((uint16(c[2])*a + 255*(255-a) + 127) / 255)
+			out.Pix[i*4+3] = 255
+		}
+		return out
+	}
+
+	relax := func(idx, nb int, step int32) {
+		if d := dist[nb] + step; d < dist[idx] {
+			dist[idx] = d
+			seed[idx] = seed[nb]
+		}
+	}
+	for y := range h {
+		row := y * w
+		for x := range w {
+			idx := row + x
+			if dist[idx] == 0 {
+				continue
+			}
+			if y > 0 {
+				if x > 0 {
+					relax(idx, idx-w-1, 4)
+				}
+				relax(idx, idx-w, 3)
+				if x+1 < w {
+					relax(idx, idx-w+1, 4)
+				}
+			}
+			if x > 0 {
+				relax(idx, idx-1, 3)
+			}
+		}
+	}
+	for y := h - 1; y >= 0; y-- {
+		row := y * w
+		for x := w - 1; x >= 0; x-- {
+			idx := row + x
+			if dist[idx] == 0 {
+				continue
+			}
+			if y+1 < h {
+				if x+1 < w {
+					relax(idx, idx+w+1, 4)
+				}
+				relax(idx, idx+w, 3)
+				if x > 0 {
+					relax(idx, idx+w-1, 4)
+				}
+			}
+			if x+1 < w {
+				relax(idx, idx+1, 3)
+			}
+		}
+	}
+
+	for i := range n {
+		p := src.Pix[i*4 : i*4+4]
+		if p[3] >= seedAlpha || seed[i] < 0 {
+			out.Pix[i*4+0] = p[0]
+			out.Pix[i*4+1] = p[1]
+			out.Pix[i*4+2] = p[2]
+			out.Pix[i*4+3] = 255
+			continue
+		}
+		sp := src.Pix[int(seed[i])*4 : int(seed[i])*4+4]
+		out.Pix[i*4+0] = sp[0]
+		out.Pix[i*4+1] = sp[1]
+		out.Pix[i*4+2] = sp[2]
+		out.Pix[i*4+3] = 255
+	}
+	return out
+}
+
+func encodePNG(img image.Image) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func decodeSquareIconFile(path, label string) (*image.NRGBA, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateIcon(raw); err != nil {
+		return nil, fmt.Errorf("%s %s: %w", label, path, err)
+	}
+	img, err := png.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("%s %s: %w", label, path, err)
+	}
+	return toNRGBA(img), nil
 }
 
 func writeOhosIcons(c *Config, stageHostDir string) error {
-	src, err := os.ReadFile(c.path(c.Icon))
-	if err != nil {
-		return err
-	}
-	if err := validateIcon(src); err != nil {
-		return fmt.Errorf("icon %s: %w", c.Icon, err)
-	}
-	img, err := png.Decode(bytes.NewReader(src))
-	if err != nil {
-		return fmt.Errorf("icon %s: %w", c.Icon, err)
-	}
-	encodeSize := func(size int) ([]byte, error) {
-		if img.Bounds().Dx() == size && img.Bounds().Dy() == size {
-			return src, nil
+	const layerSide = 1024
+
+	var baseImg *image.NRGBA
+	if c.Icon != "" {
+		var err error
+		baseImg, err = decodeSquareIconFile(c.path(c.Icon), "icon")
+		if err != nil {
+			return err
 		}
-		var buf bytes.Buffer
-		if err := png.Encode(&buf, resize(img, size)); err != nil {
-			return nil, err
+	} else if c.OHOS.IconForeground == "" && c.OHOS.IconBackground == "" {
+		// If the host template already carries prebuilt background/foreground
+		// layers, keep them; otherwise synthesize layers from defaultIcon().
+		appBg := filepath.Join(stageHostDir, "AppScope", "resources", "base", "media", "background.png")
+		entBg := filepath.Join(stageHostDir, "entry", "src", "main", "resources", "base", "media", "background.png")
+		if fileExists(appBg) && fileExists(entBg) {
+			return nil
 		}
-		return buf.Bytes(), nil
+		img, err := png.Decode(bytes.NewReader(defaultIcon()))
+		if err != nil {
+			return err
+		}
+		baseImg = toNRGBA(img)
 	}
-	icon512, err := encodeSize(512)
+
+	var bgImg, fgImg *image.NRGBA
+	var croppedForAux image.Image
+
+	if c.OHOS.IconBackground != "" || c.OHOS.IconForeground != "" {
+		if c.OHOS.IconBackground != "" {
+			rawBg, err := decodeSquareIconFile(c.path(c.OHOS.IconBackground), "ohos.iconBackground")
+			if err != nil {
+				return err
+			}
+			bgImg = extrapolateOpaqueBackground(resize(rawBg, layerSide))
+		} else {
+			bgImg = image.NewNRGBA(image.Rect(0, 0, layerSide, layerSide))
+			for i := 0; i < len(bgImg.Pix); i += 4 {
+				bgImg.Pix[i+0], bgImg.Pix[i+1], bgImg.Pix[i+2], bgImg.Pix[i+3] = 255, 255, 255, 255
+			}
+		}
+		if c.OHOS.IconForeground != "" {
+			rawFg, err := decodeSquareIconFile(c.path(c.OHOS.IconForeground), "ohos.iconForeground")
+			if err != nil {
+				return err
+			}
+			fgImg = resize(rawFg, layerSide)
+		} else {
+			fgImg = image.NewNRGBA(image.Rect(0, 0, layerSide, layerSide))
+		}
+		if baseImg != nil {
+			croppedForAux = solidIconCrop(baseImg)
+		} else {
+			croppedForAux = bgImg
+		}
+	} else {
+		cropped := solidIconCrop(baseImg)
+		croppedForAux = cropped
+		scaled := resize(cropped, layerSide)
+		if isFilledSquircleIcon(scaled) {
+			bgImg = extrapolateOpaqueBackground(scaled)
+			fgImg = image.NewNRGBA(image.Rect(0, 0, layerSide, layerSide))
+		} else {
+			bgImg = image.NewNRGBA(image.Rect(0, 0, layerSide, layerSide))
+			for i := 0; i < len(bgImg.Pix); i += 4 {
+				bgImg.Pix[i+0], bgImg.Pix[i+1], bgImg.Pix[i+2], bgImg.Pix[i+3] = 255, 255, 255, 255
+			}
+			fgImg = image.NewNRGBA(image.Rect(0, 0, layerSide, layerSide))
+			const glyphSide = 680
+			glyph := resize(cropped, glyphSide)
+			pad := (layerSide - glyphSide) / 2
+			for y := range glyphSide {
+				copy(
+					fgImg.Pix[(pad+y)*fgImg.Stride+pad*4:(pad+y)*fgImg.Stride+(pad+glyphSide)*4],
+					glyph.Pix[y*glyph.Stride:y*glyph.Stride+glyphSide*4],
+				)
+			}
+		}
+	}
+
+	bgPNG, err := encodePNG(bgImg)
 	if err != nil {
 		return err
 	}
-	icon256, err := encodeSize(256)
+	fgPNG, err := encodePNG(fgImg)
 	if err != nil {
 		return err
 	}
+	icon512, err := encodePNG(resize(croppedForAux, 512))
+	if err != nil {
+		return err
+	}
+	icon256, err := encodePNG(resize(croppedForAux, 256))
+	if err != nil {
+		return err
+	}
+	layeredJSON := []byte("{\n  \"layered-image\": {\n    \"background\": \"$media:background\",\n    \"foreground\": \"$media:foreground\"\n  }\n}\n")
+
 	targets := []struct {
 		path string
 		data []byte
 	}{
+		{filepath.Join(stageHostDir, "AppScope", "resources", "base", "media", "layered_image.json"), layeredJSON},
+		{filepath.Join(stageHostDir, "AppScope", "resources", "base", "media", "background.png"), bgPNG},
+		{filepath.Join(stageHostDir, "AppScope", "resources", "base", "media", "foreground.png"), fgPNG},
 		{filepath.Join(stageHostDir, "AppScope", "resources", "base", "media", "app_icon.png"), icon512},
+		{filepath.Join(stageHostDir, "entry", "src", "main", "resources", "base", "media", "layered_image.json"), layeredJSON},
+		{filepath.Join(stageHostDir, "entry", "src", "main", "resources", "base", "media", "background.png"), bgPNG},
+		{filepath.Join(stageHostDir, "entry", "src", "main", "resources", "base", "media", "foreground.png"), fgPNG},
 		{filepath.Join(stageHostDir, "entry", "src", "main", "resources", "base", "media", "app_icon.png"), icon512},
 		{filepath.Join(stageHostDir, "entry", "src", "main", "resources", "base", "media", "startIcon.png"), icon256},
 	}

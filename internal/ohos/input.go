@@ -212,6 +212,27 @@ func (s *Surface) send(ev platform.SurfaceEvent) bool {
 	return s.w.h.SurfaceEvent(ev)
 }
 
+const windowDragThreshold = 6.0
+
+func (s *Surface) checkWindowDragMove(x, y float64, mods platform.Modifiers) bool {
+	if !s.dragPending || !s.pressDown {
+		return false
+	}
+	dx := x - s.pressX
+	dy := y - s.pressY
+	if dx*dx+dy*dy < windowDragThreshold*windowDragThreshold {
+		return false
+	}
+	s.clearWindowDrag()
+	s.touch.cancelFling()
+	s.touch.fingers = s.touch.fingers[:0]
+	s.send(platform.SurfaceEvent{Kind: platform.PointerCancel, X: x, Y: y, Mods: mods})
+	if s.w != nil && !s.w.closed && s.w.opts.Movable && !s.w.fullscreen {
+		s.w.sendAction(winActStartDrag)
+	}
+	return true
+}
+
 func (s *Surface) onMouse(p []byte) {
 	if len(p) < 24 {
 		return
@@ -236,6 +257,9 @@ func (s *Surface) onMouse(p []byte) {
 
 	switch op {
 	case mouseMove:
+		if s.checkWindowDragMove(x, y, mods) {
+			return
+		}
 		s.send(platform.SurfaceEvent{
 			Kind:     platform.PointerMove,
 			X:        x,
@@ -255,6 +279,12 @@ func (s *Surface) onMouse(p []byte) {
 			return
 		}
 		if button <= 2 {
+			if button == 0 {
+				s.pressDown = true
+				s.pressX = x
+				s.pressY = y
+				s.dragPending = false
+			}
 			clicks := s.clicks.Press(int(button), x, y, timeMs, platform.DefaultDoubleClick)
 			s.send(platform.SurfaceEvent{
 				Kind:     platform.PointerDown,
@@ -268,6 +298,9 @@ func (s *Surface) onMouse(p []byte) {
 			})
 		}
 	case mouseUp:
+		if button == 0 {
+			s.clearWindowDrag()
+		}
 		if button == 3 || button == 4 {
 			k := platform.KeyBack
 			if button == 4 {
@@ -288,6 +321,7 @@ func (s *Surface) onMouse(p []byte) {
 			})
 		}
 	case mouseCancel:
+		s.clearWindowDrag()
 		s.send(platform.SurfaceEvent{Kind: platform.PointerCancel, X: x, Y: y, Mods: mods})
 	case mouseLeave:
 		s.send(platform.SurfaceEvent{Kind: platform.PointerLeave, Mods: mods})
@@ -338,16 +372,33 @@ func (s *Surface) onTouch(p []byte) {
 		evs = s.touch.cancelAll()
 	}
 
+	if len(s.touch.fingers) > 1 {
+		s.clearWindowDrag()
+	}
+
 	for _, ev := range evs {
 		ev.Mods = mods
 		if ev.Kind == platform.PointerDown || ev.Kind == platform.PointerUp || ev.Kind == platform.PointerMove {
 			ev.Pointer = platform.PointerTouch
 			ev.Pressure = pressure
 		}
-		if ev.Kind == platform.PointerDown {
+		switch ev.Kind {
+		case platform.PointerDown:
+			if ev.Button == 0 {
+				s.pressDown = true
+				s.pressX = ev.X
+				s.pressY = ev.Y
+				s.dragPending = false
+			}
 			dc := platform.DefaultDoubleClick
 			dc.DX, dc.DY = max(dc.DX, touchSlop), max(dc.DY, touchSlop)
 			ev.Clicks = s.clicks.Press(ev.Button, ev.X, ev.Y, timeMs, dc)
+		case platform.PointerMove:
+			if s.checkWindowDragMove(ev.X, ev.Y, mods) {
+				return
+			}
+		case platform.PointerUp, platform.PointerCancel:
+			s.clearWindowDrag()
 		}
 		s.send(ev)
 	}
@@ -522,6 +573,7 @@ func (w *Window) onWindowInput(p []byte) {
 		if w.focused {
 			w.focused = false
 			if s != nil {
+				s.clearWindowDrag()
 				s.touch.cancelFling()
 				s.touch.fingers = s.touch.fingers[:0]
 				s.down.clear()
@@ -591,6 +643,7 @@ func (w *Window) onWindowInput(p []byte) {
 			w.minimized = true
 		}
 		if wasVisible && s != nil {
+			s.clearWindowDrag()
 			s.touch.cancelFling()
 			if s.pointerIn {
 				s.send(platform.SurfaceEvent{Kind: platform.PointerLeave})

@@ -1,4 +1,3 @@
-import host from 'libmygo_host.so';
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
@@ -14,9 +13,10 @@ function isDarkMode(mode: ConfigurationConstant.ColorMode | undefined): boolean 
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'onCreate uri=%{public}s', want.uri ?? '');
-    AppStorage.setOrCreate<boolean>('darkMode', isDarkMode(this.context.config?.colorMode));
+    const dark: boolean = isDarkMode(this.context.config?.colorMode);
+    AppStorage.setOrCreate<boolean>('darkMode', dark);
     AppStorage.setOrCreate<number>('fontSizeScale', this.context.config?.fontSizeScale ?? 1.0);
-    hostBridge.init(this.context);
+    hostBridge.init(this.context, dark);
     hostBridge.handleWant(want, false);
   }
 
@@ -27,11 +27,10 @@ export default class EntryAbility extends UIAbility {
 
   onConfigurationUpdate(newConfig: Configuration): void {
     const dark: boolean = isDarkMode(newConfig.colorMode);
-    AppStorage.setOrCreate<boolean>('darkMode', dark);
     if (newConfig.fontSizeScale !== undefined && newConfig.fontSizeScale > 0) {
       AppStorage.setOrCreate<number>('fontSizeScale', newConfig.fontSizeScale);
     }
-    host.setDarkMode(dark);
+    hostBridge.onSystemDarkModeChanged(dark);
     hostBridge.refreshEnvAndDisplays();
   }
 
