@@ -176,6 +176,20 @@ func (b *Backend) loadInitialEnv() {
 	if v := strings.TrimSpace(os.Getenv("MYGO_OHOS_NET_METERED")); v == "1" || v == "true" {
 		b.netStatus.Metered = true
 	}
+	if rawScale := strings.TrimSpace(os.Getenv("MYGO_OHOS_TEXT_SCALE")); rawScale != "" {
+		if f, err := strconv.ParseFloat(rawScale, 64); err == nil && f > 0 {
+			if f > 10 {
+				f /= 1000
+			}
+			b.prefs.TextScale = f
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("MYGO_OHOS_HIGH_CONTRAST")); v == "1" || v == "true" {
+		b.prefs.HighContrast = true
+	}
+	if v := strings.TrimSpace(os.Getenv("MYGO_OHOS_REDUCE_MOTION")); v == "1" || v == "true" {
+		b.prefs.ReduceMotion = true
+	}
 }
 
 func parseDisplaySpec(spec string) (platform.Display, bool) {
@@ -256,6 +270,22 @@ func (b *Backend) onEnvInfo(payload []byte) {
 		b.displays = info.displays
 		displaysChanged = true
 	}
+	prefsChanged := false
+	if info.textScaleMilli > 0 || info.prefFlags != 0 {
+		next := b.prefs
+		if info.textScaleMilli > 0 {
+			next.TextScale = float64(info.textScaleMilli) / 1000
+		}
+		if info.prefFlags&1 != 0 {
+			next.HighContrast = info.prefFlags&2 != 0
+			next.ReduceMotion = info.prefFlags&4 != 0
+			next.ReduceTransparency = info.prefFlags&8 != 0
+		}
+		if b.prefs != next {
+			b.prefs = next
+			prefsChanged = true
+		}
+	}
 	app := b.app
 	b.mu.Unlock()
 
@@ -265,6 +295,9 @@ func (b *Backend) onEnvInfo(payload []byte) {
 		}
 		if localeChanged {
 			app.LocaleChanged()
+		}
+		if prefsChanged {
+			app.ThemeChanged()
 		}
 	}
 }

@@ -17,6 +17,7 @@ import host, {
   HostSchemeHeader,
   HostSchemeRes,
   HostSurfaceRegion,
+  HostTrayUpdate,
   HostUserScript,
   HostWebAsyncReq,
   HostWebSetup,
@@ -29,8 +30,9 @@ import { util } from '@kit.ArkTS';
 import { display, window } from '@kit.ArkUI';
 import { WebNetErrorList, webview } from '@kit.ArkWeb';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
-import { BusinessError, batteryInfo, commonEventManager, pasteboard } from '@kit.BasicServicesKit';
+import { BusinessError, batteryInfo, commonEventManager, emitter, pasteboard } from '@kit.BasicServicesKit';
 import { fileIo, fileShare, fileUri, picker } from '@kit.CoreFileKit';
+import { statusBarManager } from '@kit.DeskTopExtensionKit';
 import { image } from '@kit.ImageKit';
 import { i18n } from '@kit.LocalizationKit';
 import { connection } from '@kit.NetworkKit';
@@ -180,6 +182,15 @@ const SCHEME_OP_HEAD: number = 1;
 const SCHEME_OP_BODY: number = 2;
 const SCHEME_OP_FINISH: number = 3;
 const SCHEME_OP_FAIL: number = 4;
+
+const TRAY_OP_UPSERT: number = 1;
+const TRAY_OP_DESTROY: number = 2;
+const TRAY_FLAG_HAS_IMAGE: number = 1 << 0;
+const TRAY_FLAG_HAS_MENU: number = 1 << 2;
+const TRAY_EV_CLICK: number = 1;
+const TRAY_EV_MENU_ITEM: number = 3;
+const MENU_ITEM_SEPARATOR: number = 1;
+const MENU_ITEM_SUBMENU: number = 2;
 
 const NOTIF_PARAM_KEY: string = 'mygoNotificationId';
 
@@ -411,6 +422,31 @@ class HostBridgeManager {
   private powerSubscriber: commonEventManager.CommonEventSubscriber | undefined = undefined;
   private netConn: connection.NetConnection | undefined = undefined;
   private netWatching: boolean = false;
+  private trayChain: Promise<void> = Promise.resolve();
+  private activeTrayId: number = 0;
+  private trayAdded: boolean = false;
+  private trayListenersAttached: boolean = false;
+  private trayIconPm: image.PixelMap | undefined = undefined;
+  private trayMenus: statusBarManager.StatusBarGroupMenu[] = [];
+  private trayTooltip: string = '';
+  private trayIconClickHandler: (ev: emitter.EventData) => void = (_ev: emitter.EventData): void => {
+    if (this.activeTrayId > 0) {
+      host.notifyTrayEvent(this.activeTrayId, TRAY_EV_CLICK, 0);
+    }
+  };
+  private trayMenuClickHandler: (ev: emitter.EventData) => void = (ev: emitter.EventData): void => {
+    if (this.activeTrayId <= 0) {
+      return;
+    }
+    const dataObj: Record<string, Object> | undefined = ev.data as Record<string, Object> | undefined;
+    const rawCode: Object | undefined = dataObj !== undefined ? dataObj['menuCode'] : undefined;
+    if (typeof rawCode === 'string' && rawCode.length > 0) {
+      const parsed: number = Number.parseInt(rawCode, 10);
+      if (!Number.isNaN(parsed) && parsed !== 0) {
+        host.notifyTrayEvent(this.activeTrayId, TRAY_EV_MENU_ITEM, parsed);
+      }
+    }
+  };
   private pasteboardUpdateHandler: () => void = (): void => {
     this.onSystemPasteboardUpdated();
   };
@@ -503,6 +539,9 @@ class HostBridgeManager {
         },
         onSchemeRes: (res: HostSchemeRes): void => {
           this.handleSchemeRes(res);
+        },
+        onTrayUpdate: (tray: HostTrayUpdate): void => {
+          this.handleTrayUpdate(tray);
         },
         onEngineQuit: (): void => {
           this.handleEngineQuit();
@@ -598,6 +637,7 @@ class HostBridgeManager {
     this.unregisterPowerEvents();
     this.unregisterNetWatch();
     this.teardownAVSessionAndBackground();
+    this.teardownTray();
     this.windows.forEach((mw: ManagedWindow): void => {
       if (mw.showTimerId >= 0) {
         clearTimeout(mw.showTimerId);
@@ -1499,7 +1539,8 @@ class HostBridgeManager {
         };
         list.push(item);
       }
-      host.updateEnvInfo(pkgName, pkgVer, pkgId, locale, firstWeekday, hourCycle, langs, list);
+      const fontScale: number = AppStorage.get<number>('fontSizeScale') ?? (this.context?.config?.fontSizeScale ?? 1.0);
+      host.updateEnvInfo(pkgName, pkgVer, pkgId, locale, firstWeekday, hourCycle, langs, list, fontScale);
     };
 
     const emptyAreas: Map<number, display.Rect> = new Map<number, display.Rect>();
@@ -2242,6 +2283,7 @@ class HostBridgeManager {
     this.powerKeepRunning = false;
     this.applyKeepScreenOn(false);
     this.syncBackgroundRunning();
+    this.teardownTray();
     const staleIds: number[] = [];
     this.windows.forEach((_mw: ManagedWindow, id: number): void => {
       if (id >= 2) {
@@ -3549,6 +3591,251 @@ class HostBridgeManager {
 
       default:
         throw new Error('unsupported cookie op');
+    }
+  }
+
+  private handleTrayUpdate(tray: HostTrayUpdate): void {
+    this.trayChain = this.trayChain.then((): Promise<void> => {
+      return this.applyTrayUpdateAsync(tray);
+    }).catch((err: BusinessError): void => {
+      hilog.error(DOMAIN, TAG, 'applyTrayUpdateAsync failed: %{public}s', JSON.stringify(err));
+    });
+  }
+
+  private buildTrayGroupMenus(items: HostMenuItem[]): statusBarManager.StatusBarGroupMenu[] {
+    const groups: statusBarManager.StatusBarGroupMenu[] = [];
+    let curGroup: statusBarManager.StatusBarMenuItem[] = [];
+    let totalTop: number = 0;
+
+    for (let i: number = 0; i < items.length; i++) {
+      const it: HostMenuItem = items[i];
+      if (it.kind === MENU_ITEM_SEPARATOR) {
+        if (curGroup.length > 0) {
+          groups.push(curGroup);
+          curGroup = [];
+        }
+        continue;
+      }
+      if (totalTop >= 20) {
+        break;
+      }
+      const titleText: string = it.label.length > 0 ? it.label : 'Item';
+      if (it.kind === MENU_ITEM_SUBMENU && it.items.length > 0) {
+        const subs: statusBarManager.StatusBarSubMenuItem[] = [];
+        for (let j: number = 0; j < it.items.length && subs.length < 20; j++) {
+          const sub: HostMenuItem = it.items[j];
+          if (sub.kind === MENU_ITEM_SEPARATOR) {
+            continue;
+          }
+          const subCode: string = sub.id.toString();
+          const subEntry: statusBarManager.StatusBarSubMenuItem = {
+            subTitle: sub.label.length > 0 ? sub.label : 'Item',
+            menuCode: subCode,
+            menuAction: {
+              abilityName: 'EntryAbility',
+              notifyOnly: sub.enabled
+            },
+            options: {
+              selected: sub.checked
+            }
+          };
+          subs.push(subEntry);
+        }
+        if (subs.length > 0) {
+          const parentEntry: statusBarManager.StatusBarMenuItem = {
+            title: titleText,
+            menuCode: 'sub_' + i.toString() + '_' + it.id.toString(),
+            subMenu: subs
+          };
+          curGroup.push(parentEntry);
+          totalTop++;
+        }
+        continue;
+      }
+
+      const itemCode: string = it.id.toString();
+      const entry: statusBarManager.StatusBarMenuItem = {
+        title: titleText,
+        menuCode: itemCode,
+        menuAction: {
+          abilityName: 'EntryAbility',
+          notifyOnly: it.enabled
+        },
+        options: {
+          selected: it.checked
+        }
+      };
+      curGroup.push(entry);
+      totalTop++;
+    }
+
+    if (curGroup.length > 0) {
+      groups.push(curGroup);
+    }
+    return groups;
+  }
+
+  private async ensureTrayIconPixelMap(png: ArrayBuffer, replace: boolean): Promise<image.PixelMap> {
+    if (replace && png.byteLength > 0) {
+      let src: image.ImageSource | undefined = undefined;
+      try {
+        src = image.createImageSource(png);
+        const decoded: image.PixelMap = await src.createPixelMap();
+        if (this.trayIconPm !== undefined) {
+          try { await this.trayIconPm.release(); } catch (_) {}
+        }
+        this.trayIconPm = decoded;
+        return decoded;
+      } finally {
+        if (src !== undefined) {
+          try { await src.release(); } catch (_) {}
+        }
+      }
+    }
+    if (this.trayIconPm !== undefined) {
+      return this.trayIconPm;
+    }
+    const blank: ArrayBuffer = new ArrayBuffer(24 * 24 * 4);
+    const u8: Uint8Array = new Uint8Array(blank);
+    for (let i: number = 0; i < u8.length; i += 4) {
+      u8[i] = 180;
+      u8[i + 1] = 180;
+      u8[i + 2] = 180;
+      u8[i + 3] = 255;
+    }
+    const fallback: image.PixelMap = await image.createPixelMap(blank, {
+      size: { width: 24, height: 24 },
+      pixelFormat: image.PixelMapFormat.RGBA_8888,
+      editable: true
+    });
+    this.trayIconPm = fallback;
+    return fallback;
+  }
+
+  private attachTrayListeners(): void {
+    if (this.trayListenersAttached) {
+      return;
+    }
+    this.trayListenersAttached = true;
+    try {
+      statusBarManager.on('statusBarIconClick', this.trayIconClickHandler);
+    } catch (_) {}
+    try {
+      statusBarManager.on('rightMenuClick', this.trayMenuClickHandler);
+    } catch (_) {}
+  }
+
+  private detachTrayListeners(): void {
+    if (!this.trayListenersAttached) {
+      return;
+    }
+    this.trayListenersAttached = false;
+    try {
+      statusBarManager.off('statusBarIconClick', this.trayIconClickHandler);
+    } catch (_) {}
+    try {
+      statusBarManager.off('rightMenuClick', this.trayMenuClickHandler);
+    } catch (_) {}
+  }
+
+  private async applyTrayUpdateAsync(tray: HostTrayUpdate): Promise<void> {
+    if (this.context === undefined) {
+      return;
+    }
+    const ctx: common.UIAbilityContext = this.context;
+
+    if (tray.op === TRAY_OP_DESTROY) {
+      if (this.activeTrayId === tray.trayId || tray.trayId === 0) {
+        this.teardownTray();
+      }
+      return;
+    }
+
+    if (tray.op !== TRAY_OP_UPSERT) {
+      return;
+    }
+
+    this.activeTrayId = tray.trayId;
+    const hasImg: boolean = (tray.flags & TRAY_FLAG_HAS_IMAGE) !== 0 && tray.png.byteLength > 0;
+    const hasMenu: boolean = (tray.flags & TRAY_FLAG_HAS_MENU) !== 0;
+    const pm: image.PixelMap = await this.ensureTrayIconPixelMap(tray.png, hasImg);
+    const icons: statusBarManager.StatusBarIcon = {
+      white: pm,
+      black: pm
+    };
+
+    if (hasMenu) {
+      this.trayMenus = this.buildTrayGroupMenus(tray.items);
+    }
+
+    const rawTip: string = tray.tooltip.length > 0 ? tray.tooltip : tray.title;
+    const clippedTip: string = rawTip.length > 128 ? rawTip.substring(0, 128) : rawTip;
+
+    this.attachTrayListeners();
+
+    if (!this.trayAdded) {
+      const quickTitle: string = tray.title.length > 0 ? tray.title : this.bundleLabel;
+      const sbItem: statusBarManager.StatusBarItem = {
+        icons: icons,
+        quickOperation: {
+          title: quickTitle.length > 0 ? quickTitle : 'MyGo',
+          height: 1,
+          abilityName: ''
+        }
+      };
+      if (this.trayMenus.length > 0) {
+        sbItem.statusBarGroupMenu = this.trayMenus;
+      }
+      if (clippedTip.length > 0) {
+        sbItem.hoverTips = clippedTip;
+        this.trayTooltip = clippedTip;
+      }
+      try {
+        statusBarManager.addToStatusBar(ctx, sbItem);
+        this.trayAdded = true;
+      } catch (e) {
+        hilog.error(DOMAIN, TAG, 'addToStatusBar failed: %{public}s', JSON.stringify(e));
+      }
+      return;
+    }
+
+    if (hasImg) {
+      try {
+        statusBarManager.updateStatusBarIcon(ctx, icons);
+      } catch (e) {
+        hilog.error(DOMAIN, TAG, 'updateStatusBarIcon failed: %{public}s', JSON.stringify(e));
+      }
+    }
+    if (hasMenu) {
+      try {
+        statusBarManager.updateStatusBarMenu(ctx, this.trayMenus);
+      } catch (e) {
+        hilog.error(DOMAIN, TAG, 'updateStatusBarMenu failed: %{public}s', JSON.stringify(e));
+      }
+    }
+    if (clippedTip.length > 0 && clippedTip !== this.trayTooltip) {
+      this.trayTooltip = clippedTip;
+      try {
+        await statusBarManager.updateStatusBarHoverTips(ctx, clippedTip);
+      } catch (_) {}
+    }
+  }
+
+  private teardownTray(): void {
+    this.detachTrayListeners();
+    if (this.trayAdded && this.context !== undefined) {
+      try {
+        statusBarManager.removeFromStatusBar(this.context);
+      } catch (_) {}
+    }
+    this.trayAdded = false;
+    this.activeTrayId = 0;
+    this.trayMenus = [];
+    this.trayTooltip = '';
+    if (this.trayIconPm !== undefined) {
+      const oldPm: image.PixelMap = this.trayIconPm;
+      this.trayIconPm = undefined;
+      try { oldPm.release().catch((): void => {}); } catch (_) {}
     }
   }
 }

@@ -66,6 +66,11 @@ type Surface struct {
 	placed            []platform.WebViewPlacement
 	glCtx             uintptr
 	gl                *glTarget
+	dragReq           *platform.DragRequest
+	dragCanceled      bool
+	dragEscaped       bool
+	dropFormats       []transfer.Format
+	accessEnabled     bool
 }
 
 type buffer struct {
@@ -390,11 +395,6 @@ func (s *Surface) SetTextInput(t platform.TextInputState) {
 		s.w.b.send(kindTextInput, textInputMessage(wire))
 	}
 }
-
-func (s *Surface) UpdateAccessibility(t *platform.AccessTree) {}
-func (s *Surface) StartDataDrag(r platform.DragRequest)       {}
-func (s *Surface) CancelDataDrag()                            {}
-func (s *Surface) SetDropFormats(f []transfer.Format)         {}
 
 func (s *Surface) FrameNow() { s.RequestFrame() }
 

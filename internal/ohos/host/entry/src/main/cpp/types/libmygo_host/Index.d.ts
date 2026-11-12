@@ -219,6 +219,17 @@ export interface HostSchemeRes {
   err: string;
 }
 
+export interface HostTrayUpdate {
+  trayId: number;
+  op: number;
+  flags: number;
+  id: string;
+  title: string;
+  tooltip: string;
+  png: ArrayBuffer;
+  items: HostMenuItem[];
+}
+
 export interface HostBridgeCallbacks {
   onWinCreate: (cfg: HostWinConfig) => void;
   onWinConfig: (cfg: HostWinConfig) => void;
@@ -242,6 +253,7 @@ export interface HostBridgeCallbacks {
   onPlaceWebViews: (place: HostPlaceWebViews) => void;
   onWebAsyncReq: (req: HostWebAsyncReq) => void;
   onSchemeRes: (res: HostSchemeRes) => void;
+  onTrayUpdate: (tray: HostTrayUpdate) => void;
   onEngineQuit: () => void;
   onEngineRestart: () => void;
 }
@@ -256,7 +268,8 @@ export interface HostModule {
     firstWeekday: number,
     hourCycle: number,
     langs: string[],
-    displays: HostDisplayInfo[]
+    displays: HostDisplayInfo[],
+    textScale?: number
   ): void;
   bindWindow(
     winId: number,
@@ -304,6 +317,7 @@ export interface HostModule {
     body: ArrayBuffer
   ): void;
   clearWebControllerHandler(handler: Object): void;
+  notifyTrayEvent(trayId: number, ev: number, menuItemId: number): void;
   setDarkMode(dark: boolean): void;
   crash(): void;
 }

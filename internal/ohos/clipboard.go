@@ -441,7 +441,7 @@ func buildTransferDataFromHost(reps []clipWireRep, requested []transfer.Format) 
 
 	for _, r := range reps {
 		switch r.format {
-		case string(transfer.URIList), string(transfer.FileList), "text/uri":
+		case string(transfer.URIList), string(transfer.FileList), "text/uri", "general.file-uri":
 			for _, line := range strings.Split(strings.ReplaceAll(string(r.data), "\r\n", "\n"), "\n") {
 				line = strings.TrimSpace(line)
 				if line != "" && !strings.HasPrefix(line, "#") {

@@ -592,6 +592,7 @@ func (w *Window) closeInternal(notifyHost bool) {
 	w.focused = false
 	w.visible = false
 	if w.surface != nil {
+		w.surface.cleanupDrag()
 		w.surface.Idle()
 		w.surface.ReleaseGL()
 	}

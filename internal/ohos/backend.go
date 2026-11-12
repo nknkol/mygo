@@ -101,6 +101,16 @@ type Backend struct {
 	nextWebAsyncReq uint32
 	pendingWebAsync map[uint32]pendingWebAsyncCall
 	schemeTasks     map[uint32]*schemeResponder
+
+	readLoopOnce  sync.Once
+	prefs         platform.Preferences
+	nextSecretReq uint32
+	secretWaiters map[uint32]chan secretWireRes
+	nextHotkeyReq uint32
+	hotkeyWaiters map[uint32]chan string
+	nextTrayID    uint32
+	trays         map[uint32]*trayItem
+	dragSessions  map[string]*Surface
 }
 
 // New returns the backend from the arguments and environment the host started
@@ -189,8 +199,15 @@ func (t themeBackend) SetSource(src string) {
 	t.b.mu.Unlock()
 }
 
-func (themeBackend) UIFont() string                    { return "HarmonyOS Sans" }
-func (themeBackend) Preferences() platform.Preferences { return platform.Preferences{} }
+func (themeBackend) UIFont() string { return "HarmonyOS Sans" }
+func (t themeBackend) Preferences() platform.Preferences {
+	if t.b == nil {
+		return platform.Preferences{}
+	}
+	t.b.mu.Lock()
+	defer t.b.mu.Unlock()
+	return t.b.prefs
+}
 func (themeBackend) FontRendering() platform.FontRendering {
 	return platform.FontRendering{Antialias: "gray", Hinting: "slight"}
 }
@@ -200,9 +217,23 @@ func (b *Backend) setSystemDark(dark bool) {
 	changed := b.systemDark != dark
 	b.systemDark = dark
 	app := b.app
+	var trays []*trayItem
+	if changed && len(b.trays) > 0 {
+		trays = make([]*trayItem, 0, len(b.trays))
+		for _, tr := range b.trays {
+			trays = append(trays, tr)
+		}
+	}
 	b.mu.Unlock()
-	if changed && app != nil {
-		app.ThemeChanged()
+	if changed {
+		if app != nil {
+			app.ThemeChanged()
+		}
+		for _, tr := range trays {
+			if tr != nil && !tr.destroyed && tr.h != nil {
+				tr.h.AppearanceChanged()
+			}
+		}
 	}
 }
 
@@ -223,6 +254,23 @@ func (b *Backend) Init(h platform.AppHandler, opts platform.AppOptions) error {
 
 func (b *Backend) IsMainThread() bool { return int64(syscall.Gettid()) == b.mainTID.Load() }
 
+func (b *Backend) ensureReadLoop() {
+	if b == nil {
+		return
+	}
+	b.readLoopOnce.Do(func() {
+		b.mu.Lock()
+		if b.conn == nil && b.fd >= 0 {
+			b.conn = &conn{fd: b.fd}
+		}
+		hasConn := b.conn != nil
+		b.mu.Unlock()
+		if hasConn {
+			go b.readLoop()
+		}
+	})
+}
+
 // Run runs the app's loop: one message at a time, on a thread of its own,
 // which the backend pins so that IsMainThread stays true.
 func (b *Backend) Run() error {
@@ -235,7 +283,7 @@ func (b *Backend) Run() error {
 	}
 	app := b.app
 	b.mu.Unlock()
-	go b.readLoop()
+	b.ensureReadLoop()
 	if app != nil {
 		app.Ready()
 	}
@@ -278,7 +326,8 @@ func (b *Backend) popNextLocked() (event, bool) {
 			case kindInput, kindPopupResult, kindEnvInfo,
 				kindClipChanged, kindClipData, kindDialogResult, kindShellResult, kindAppOpen,
 				kindMediaCmd, kindNotifResult, kindNotifClicked, kindPowerState, kindNetState,
-				kindCookieResult, kindWebEvent, kindWebAsyncRes, kindSchemeReq, kindInternal:
+				kindCookieResult, kindWebEvent, kindWebAsyncRes, kindSchemeReq,
+				kindHotkeyTrig, kindTrayEvent, kindDragEvent, kindAccessEvent, kindInternal:
 				idx = i
 			case kindQuit, kindSurface:
 				i = len(b.events)
@@ -378,6 +427,14 @@ func (b *Backend) Quit() {
 	sendQuit := !b.quitSent && b.conn != nil
 	b.quitSent = true
 	b.quit = true
+	for id, ch := range b.secretWaiters {
+		delete(b.secretWaiters, id)
+		close(ch)
+	}
+	for id, ch := range b.hotkeyWaiters {
+		delete(b.hotkeyWaiters, id)
+		close(ch)
+	}
 	if b.cond != nil {
 		b.cond.Broadcast()
 	}
@@ -513,6 +570,14 @@ func (b *Backend) readLoop() {
 			b.Quit()
 			return
 		}
+		if kind == kindSecretRes {
+			b.handleSecretRes(payload)
+			continue
+		}
+		if kind == kindHotkeyRes {
+			b.handleHotkeyRes(payload)
+			continue
+		}
 		b.mu.Lock()
 		b.events = append(b.events, event{kind: kind, payload: payload, fd: fd})
 		b.cond.Broadcast()
@@ -565,6 +630,14 @@ func (b *Backend) dispatch(ev event) {
 		b.onWebAsyncRes(ev.payload)
 	case kindSchemeReq:
 		b.onSchemeReq(ev.payload)
+	case kindHotkeyTrig:
+		b.onHotkeyTrig(ev.payload)
+	case kindTrayEvent:
+		b.onTrayEvent(ev.payload)
+	case kindDragEvent:
+		b.onDragEvent(ev.payload)
+	case kindAccessEvent:
+		b.onAccessEvent(ev.payload)
 	case kindInternal:
 		if ev.fn != nil {
 			ev.fn()

@@ -76,6 +76,21 @@ const (
 	kindSchemeReq     = 48 // host -> engine: custom protocol request or cancellation
 	kindSchemeRes     = 49 // engine -> host: custom protocol response headers/body/finish/fail
 
+	kindSecretReq      = 50 // engine -> host: {u32 reqID, u8 op, 3×pad, str service, str account, bytes secret}
+	kindSecretRes      = 51 // host -> engine: {u32 reqID, u8 notFound, 3×pad, str err, bytes secret}
+	kindHotkeyReq      = 52 // engine -> host: {u32 reqID, i32 hotkeyID, u8 register, 3×pad, i32 finalKey, u32 preCount, preKeys...}
+	kindHotkeyRes      = 53 // host -> engine: {u32 reqID, str err}
+	kindHotkeyTrig     = 54 // host -> engine: {i32 hotkeyID}
+	kindTrayUpdate     = 55 // engine -> host: {u32 trayID, u8 op, u8 flags, 2×pad, str id, str title, str tooltip, bytes png, menu...}
+	kindTrayEvent      = 56 // host -> engine: {u32 trayID, u8 ev, 3×pad, i32 menuItemID}
+	kindDragSetFormats = 57 // engine -> host: {u32 winID, u32 count, formats...}
+	kindDragStart      = 58 // engine -> host: {u32 winID, u32 ops, f64 x, f64 y, i32 w, i32 h, i32 hotX, i32 hotY, str session, bytes preview, reps...}
+	kindDragCancel     = 59 // engine -> host: {u32 winID}
+	kindDragEvent      = 60 // host -> engine: {u32 winID, u8 ev, u8 canceled, u8 escaped, u8 pad, u32 pendingID, u32 ops, u32 suggestedOp, f64 x, f64 y, ...}
+	kindDragReply      = 61 // engine -> host: {u32 winID, u32 pendingID, u32 op, u8 taken, 3×pad}
+	kindAccessTree     = 62 // engine -> host: accessibility tree snapshot & live announcements
+	kindAccessEvent    = 63 // host -> engine: {u32 winID, u8 ev, u8 actionKind, 2×pad, u64 nodeID, i32 from, i32 to, str text}
+
 	kindInternal = 255 // internal main-thread callback queued via Backend.post
 )
 
@@ -355,11 +370,13 @@ type winConfigWire struct {
 }
 
 type envInfoWire struct {
-	hasPkg   bool
-	pkg      platform.PackageInfo
-	langs    []string
-	region   platform.Region
-	displays []platform.Display
+	hasPkg         bool
+	pkg            platform.PackageInfo
+	langs          []string
+	region         platform.Region
+	displays       []platform.Display
+	textScaleMilli uint32
+	prefFlags      byte // bit 0: hasPrefs, bit 1: highContrast, bit 2: reduceMotion, bit 3: reduceTransparency
 }
 
 // conn is the socket to the host: one reader and one writer, both on the
@@ -676,6 +693,12 @@ func encodeEnvInfoMessage(info envInfoWire) []byte {
 		buf = append(buf, db[:]...)
 		buf = appendWireStr(buf, d.Label)
 	}
+	if info.textScaleMilli > 0 || info.prefFlags != 0 {
+		var pb [8]byte
+		binary.LittleEndian.PutUint32(pb[0:], info.textScaleMilli)
+		pb[4] = info.prefFlags | 1
+		buf = append(buf, pb[:]...)
+	}
 	return buf
 }
 
@@ -756,6 +779,10 @@ func decodeEnvInfoMessage(p []byte) (envInfoWire, bool) {
 			Primary:     dflags&1 != 0,
 			Internal:    dflags&2 != 0,
 		})
+	}
+	if off+8 <= len(p) {
+		out.textScaleMilli = binary.LittleEndian.Uint32(p[off:])
+		out.prefFlags = p[off+4]
 	}
 	return out, true
 }

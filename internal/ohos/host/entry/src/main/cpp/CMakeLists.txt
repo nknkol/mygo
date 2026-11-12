@@ -18,4 +18,7 @@ target_link_libraries(mygo_host PUBLIC
     libohinputmethod.so
     libohinput.so
     libohaudio.so
+    libasset_ndk.z.so
+    libudmf.so
+    libpixelmap.so
 )

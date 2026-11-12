@@ -12,14 +12,21 @@
 //     variables (safe before Init) and live kEnvInfo updates.
 #include <napi/native_api.h>
 #include <hilog/log.h>
+#include <arkui/drag_and_drop.h>
 #include <arkui/native_interface.h>
+#include <arkui/native_interface_accessibility.h>
 #include <arkui/native_interface_focus.h>
 #include <arkui/native_node.h>
 #include <arkui/native_node_napi.h>
 #include <arkui/ui_input_event.h>
 #include <arkui/native_key_event.h>
 #include <ace/xcomponent/native_interface_xcomponent.h>
+#include <asset/asset_api.h>
+#include <asset/asset_type.h>
+#include <database/udmf/udmf.h>
+#include <database/udmf/uds.h>
 #include <inputmethod/inputmethod_controller_capi.h>
+#include <multimedia/image_framework/image/pixelmap_native.h>
 #include <multimodalinput/oh_input_manager.h>
 #include <multimodalinput/oh_pointer_style.h>
 #include <native_window/external_window.h>
@@ -126,6 +133,21 @@ constexpr uint8_t kWebAsyncReq     = 46; // engine -> host: CallAsyncFunction / 
 constexpr uint8_t kWebAsyncRes     = 47; // host -> engine: async WebView result
 constexpr uint8_t kSchemeReq       = 48; // host -> engine: custom protocol request / cancel
 constexpr uint8_t kSchemeRes       = 49; // engine -> host: custom protocol response head/body/finish/fail
+
+constexpr uint8_t kSecretReq       = 50; // engine -> host: Asset Store secret op
+constexpr uint8_t kSecretRes       = 51; // host -> engine: Asset Store secret result
+constexpr uint8_t kHotkeyReq       = 52; // engine -> host: register/unregister global hotkey
+constexpr uint8_t kHotkeyRes       = 53; // host -> engine: hotkey registration result
+constexpr uint8_t kHotkeyTrig      = 54; // host -> engine: global hotkey triggered
+constexpr uint8_t kTrayUpdate      = 55; // engine -> host: system tray upsert/destroy
+constexpr uint8_t kTrayEvent       = 56; // host -> engine: system tray click / menu item
+constexpr uint8_t kDragSetFormats  = 57; // engine -> host: set accepted drop formats
+constexpr uint8_t kDragStart       = 58; // engine -> host: start outgoing data drag
+constexpr uint8_t kDragCancel      = 59; // engine -> host: cancel outgoing data drag
+constexpr uint8_t kDragEvent       = 60; // host -> engine: drag enter/move/leave/drop/ended
+constexpr uint8_t kDragReply       = 61; // engine -> host: drag over/drop reply
+constexpr uint8_t kAccessTree      = 62; // engine -> host: surface accessibility tree snapshot
+constexpr uint8_t kAccessEvent     = 63; // host -> engine: accessibility enabled / action
 
 constexpr uint8_t kWinActEnableWebLayer = 17;
 constexpr uint8_t kWinActFocusSurface   = 18;
@@ -424,6 +446,7 @@ struct CachedEnv {
     std::string locale;
     int32_t firstWeekday = -1;
     int32_t hourCycle = 0;
+    uint32_t textScaleMilli = 1000;
     std::string langsCsv;
     std::string displaysSpec;
     std::vector<uint8_t> wirePayload;
@@ -458,6 +481,10 @@ struct WinSession {
     ArkUI_NodeHandle xcNode = nullptr;
     OH_ArkUI_SurfaceHolder *surfaceHolder = nullptr;
     OH_ArkUI_SurfaceCallback *surfaceCallback = nullptr;
+    ArkUI_AccessibilityProvider *accessProvider = nullptr;
+    std::string accessInstId;
+    ArkUI_DragAction *activeDragAction = nullptr;
+    bool activeDragCanceled = false;
     int32_t arkWindowId = 0;
     bool nodeFocused = false;
     bool metaLeftDown = false;
@@ -548,6 +575,7 @@ enum class BridgeEventKind {
     PlaceWebViews,
     WebAsyncReq,
     SchemeRes,
+    TrayUpdate,
     FirstFrame,
     EngineQuit,
     EngineRestart,
@@ -721,6 +749,19 @@ struct SchemeResData {
     std::string err;
 };
 
+struct TrayUpdateData {
+    uint32_t trayId = 0;
+    uint8_t op = 0;
+    bool hasImage = false;
+    bool templateImg = false;
+    bool hasMenu = false;
+    std::string id;
+    std::string title;
+    std::string tooltip;
+    std::vector<uint8_t> png;
+    std::vector<PopupItemData> menuItems;
+};
+
 struct BridgeEvent {
     BridgeEventKind kind = BridgeEventKind::WinAction;
     WinConfigData winCfg;
@@ -751,6 +792,7 @@ struct BridgeEvent {
     PlaceWebViewsData placeWebViews;
     WebAsyncReqData webAsyncReq;
     SchemeResData schemeRes;
+    TrayUpdateData trayUpdate;
 };
 
 std::mutex gBridgeMu;
@@ -1285,6 +1327,39 @@ void BridgeCallJs(napi_env env, napi_value, void *, void *data) {
         }
         napi_set_named_property(env, obj, "chunk", vChunk);
         callBridgeMethod(env, cbObj, "onSchemeRes", 1, &obj);
+        break;
+    }
+    case BridgeEventKind::TrayUpdate: {
+        const auto &tu = ev->trayUpdate;
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_value vTid = nullptr, vOp = nullptr, vHi = nullptr, vTi = nullptr, vHm = nullptr;
+        napi_value vId = nullptr, vTitle = nullptr, vTip = nullptr, vPng = nullptr;
+        napi_create_uint32(env, tu.trayId, &vTid);
+        napi_create_uint32(env, tu.op, &vOp);
+        napi_get_boolean(env, tu.hasImage, &vHi);
+        napi_get_boolean(env, tu.templateImg, &vTi);
+        napi_get_boolean(env, tu.hasMenu, &vHm);
+        napi_create_string_utf8(env, tu.id.c_str(), tu.id.size(), &vId);
+        napi_create_string_utf8(env, tu.title.c_str(), tu.title.size(), &vTitle);
+        napi_create_string_utf8(env, tu.tooltip.c_str(), tu.tooltip.size(), &vTip);
+        void *abPtr = nullptr;
+        napi_create_arraybuffer(env, tu.png.size(), &abPtr, &vPng);
+        if (abPtr != nullptr && !tu.png.empty()) {
+            memcpy(abPtr, tu.png.data(), tu.png.size());
+        }
+        napi_value vMenu = makeJsMenuItems(env, tu.menuItems);
+        napi_set_named_property(env, obj, "trayId", vTid);
+        napi_set_named_property(env, obj, "op", vOp);
+        napi_set_named_property(env, obj, "hasImage", vHi);
+        napi_set_named_property(env, obj, "templateImg", vTi);
+        napi_set_named_property(env, obj, "hasMenu", vHm);
+        napi_set_named_property(env, obj, "id", vId);
+        napi_set_named_property(env, obj, "title", vTitle);
+        napi_set_named_property(env, obj, "tooltip", vTip);
+        napi_set_named_property(env, obj, "png", vPng);
+        napi_set_named_property(env, obj, "menuItems", vMenu);
+        callBridgeMethod(env, cbObj, "onTrayUpdate", 1, &obj);
         break;
     }
     case BridgeEventKind::FirstFrame: {
@@ -2057,6 +2132,1602 @@ uint8_t mapMouseButton(int32_t arkBtn) {
     }
 }
 
+// ---------- Batch 7: Asset Store Secrets, Global Hotkeys, Drag & Drop, Accessibility ----------
+
+std::mutex gSecretExecMu;
+
+std::string makeSecretAlias(const std::string &service, const std::string &account) {
+    std::string raw = service;
+    raw.push_back('\x1f');
+    raw += account;
+    if (raw.empty()) {
+        return "_";
+    }
+    if (raw.size() <= 240) {
+        return raw;
+    }
+    uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : raw) {
+        h ^= static_cast<uint64_t>(c);
+        h *= 1099511628211ULL;
+    }
+    char hex[20];
+    snprintf(hex, sizeof(hex), "#%016llx", static_cast<unsigned long long>(h));
+    return raw.substr(0, 200) + hex;
+}
+
+void sendSecretResWire(uint32_t reqId, bool notFound, const std::string &errStr, const std::vector<uint8_t> &secret) {
+    std::vector<uint8_t> wire(8, 0);
+    memcpy(wire.data() + 0, &reqId, 4);
+    wire[4] = notFound ? 1 : 0;
+    appendStr(wire, errStr);
+    appendBytes(wire, secret.data(), secret.size());
+    sendMessage(kSecretRes, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+}
+
+void handleSecretReq(const std::vector<uint8_t> &p) {
+    if (p.size() < 8) {
+        return;
+    }
+    uint32_t reqId = 0;
+    memcpy(&reqId, p.data() + 0, 4);
+    uint8_t op = p[4];
+    size_t off = 8;
+    std::string service, account;
+    std::vector<uint8_t> secret;
+    if (!readStr(p, off, &service) || !readStr(p, off, &account) ||
+        !readBytes(p, off, &secret) || off != p.size()) {
+        sendSecretResWire(reqId, false, "ohos: malformed secret request", {});
+        return;
+    }
+
+    std::thread([reqId, op, service = std::move(service), account = std::move(account),
+                 secret = std::move(secret)]() mutable {
+        std::lock_guard<std::mutex> lk(gSecretExecMu);
+        std::string alias = makeSecretAlias(service, account);
+
+        if (op == 1) { // set
+            Asset_Attr delAttr{};
+            delAttr.tag = ASSET_TAG_ALIAS;
+            delAttr.value.blob.size = static_cast<uint32_t>(alias.size());
+            delAttr.value.blob.data = reinterpret_cast<uint8_t *>(alias.data());
+            (void)OH_Asset_Remove(&delAttr, 1);
+
+            std::vector<uint8_t> blob(1 + secret.size(), 0x01);
+            if (!secret.empty()) {
+                memcpy(blob.data() + 1, secret.data(), secret.size());
+            }
+            Asset_Attr attrs[3]{};
+            attrs[0].tag = ASSET_TAG_ALIAS;
+            attrs[0].value.blob.size = static_cast<uint32_t>(alias.size());
+            attrs[0].value.blob.data = reinterpret_cast<uint8_t *>(alias.data());
+            attrs[1].tag = ASSET_TAG_SECRET;
+            attrs[1].value.blob.size = static_cast<uint32_t>(blob.size());
+            attrs[1].value.blob.data = blob.data();
+            attrs[2].tag = ASSET_TAG_ACCESSIBILITY;
+            attrs[2].value.u32 = ASSET_ACCESSIBILITY_DEVICE_POWERED_ON;
+
+            int32_t rc = OH_Asset_Add(attrs, 3);
+            if (rc == ASSET_SUCCESS) {
+                sendSecretResWire(reqId, false, "", {});
+            } else {
+                sendSecretResWire(reqId, false, "ohos: OH_Asset_Add failed (" + std::to_string(rc) + ")", {});
+            }
+            return;
+        }
+
+        if (op == 2) { // get
+            Asset_Attr query[2]{};
+            query[0].tag = ASSET_TAG_ALIAS;
+            query[0].value.blob.size = static_cast<uint32_t>(alias.size());
+            query[0].value.blob.data = reinterpret_cast<uint8_t *>(alias.data());
+            query[1].tag = ASSET_TAG_RETURN_TYPE;
+            query[1].value.u32 = ASSET_RETURN_ALL;
+
+            Asset_ResultSet rset{0, nullptr};
+            int32_t rc = OH_Asset_Query(query, 2, &rset);
+            if (rc == ASSET_NOT_FOUND || (rc == ASSET_SUCCESS && rset.count == 0)) {
+                if (rset.results != nullptr) {
+                    OH_Asset_FreeResultSet(&rset);
+                }
+                sendSecretResWire(reqId, true, "", {});
+                return;
+            }
+            if (rc != ASSET_SUCCESS) {
+                if (rset.results != nullptr) {
+                    OH_Asset_FreeResultSet(&rset);
+                }
+                sendSecretResWire(reqId, false, "ohos: OH_Asset_Query failed (" + std::to_string(rc) + ")", {});
+                return;
+            }
+            std::vector<uint8_t> out;
+            Asset_Attr *sec = OH_Asset_ParseAttr(rset.results, ASSET_TAG_SECRET);
+            if (sec != nullptr && sec->value.blob.data != nullptr && sec->value.blob.size >= 1) {
+                const uint8_t *raw = sec->value.blob.data;
+                uint32_t sz = sec->value.blob.size;
+                if (raw[0] == 0x01) {
+                    out.assign(raw + 1, raw + sz);
+                } else {
+                    out.assign(raw, raw + sz);
+                }
+            }
+            OH_Asset_FreeResultSet(&rset);
+            sendSecretResWire(reqId, false, "", out);
+            return;
+        }
+
+        if (op == 3) { // delete
+            Asset_Attr query{};
+            query.tag = ASSET_TAG_ALIAS;
+            query.value.blob.size = static_cast<uint32_t>(alias.size());
+            query.value.blob.data = reinterpret_cast<uint8_t *>(alias.data());
+            int32_t rc = OH_Asset_Remove(&query, 1);
+            if (rc == ASSET_SUCCESS || rc == ASSET_NOT_FOUND) {
+                sendSecretResWire(reqId, false, "", {});
+            } else {
+                sendSecretResWire(reqId, false, "ohos: OH_Asset_Remove failed (" + std::to_string(rc) + ")", {});
+            }
+            return;
+        }
+
+        sendSecretResWire(reqId, false, "ohos: unknown secret op", {});
+    }).detach();
+}
+
+struct HotkeyEntry {
+    int32_t id = 0;
+    int32_t finalKey = 0;
+    std::vector<int32_t> preKeys;
+    Input_Hotkey *handle = nullptr;
+};
+
+std::mutex gHotkeyMu;
+std::vector<HotkeyEntry> gHotkeys;
+
+void OnHotkeyTriggered(Input_Hotkey *hotkey) {
+    int32_t matchedId = 0;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lk(gHotkeyMu);
+        for (const auto &e : gHotkeys) {
+            if (e.handle == hotkey) {
+                matchedId = e.id;
+                found = true;
+                break;
+            }
+        }
+        if (!found && hotkey != nullptr) {
+            int32_t fk = 0;
+            if (OH_Input_GetFinalKey(hotkey, &fk) == INPUT_SUCCESS) {
+                for (const auto &e : gHotkeys) {
+                    if (e.finalKey == fk) {
+                        matchedId = e.id;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (found) {
+        uint8_t wire[4];
+        memcpy(wire, &matchedId, 4);
+        sendMessage(kHotkeyTrig, wire, 4, -1);
+    }
+}
+
+void clearAllHotkeys() {
+    std::vector<HotkeyEntry> old;
+    {
+        std::lock_guard<std::mutex> lk(gHotkeyMu);
+        old.swap(gHotkeys);
+    }
+    for (auto &e : old) {
+        if (e.handle != nullptr) {
+            (void)OH_Input_RemoveHotkeyMonitor(e.handle, OnHotkeyTriggered);
+            OH_Input_DestroyHotkey(&e.handle);
+        }
+    }
+}
+
+void sendHotkeyResWire(uint32_t reqId, const std::string &errStr) {
+    if (reqId == 0) {
+        return;
+    }
+    std::vector<uint8_t> wire;
+    appendU32(wire, reqId);
+    appendStr(wire, errStr);
+    sendMessage(kHotkeyRes, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+}
+
+void handleHotkeyReq(const std::vector<uint8_t> &p) {
+    if (p.size() < 20) {
+        return;
+    }
+    uint32_t reqId = 0, preCount = 0;
+    int32_t hotkeyId = 0, finalKey = 0;
+    memcpy(&reqId, p.data() + 0, 4);
+    memcpy(&hotkeyId, p.data() + 4, 4);
+    bool reg = p[8] != 0;
+    memcpy(&finalKey, p.data() + 12, 4);
+    memcpy(&preCount, p.data() + 16, 4);
+    if (preCount > 8 || 20u + preCount * 4u != p.size()) {
+        sendHotkeyResWire(reqId, "ohos: malformed hotkey request");
+        return;
+    }
+    std::vector<int32_t> preKeys(preCount);
+    for (uint32_t i = 0; i < preCount; ++i) {
+        memcpy(&preKeys[i], p.data() + 20 + i * 4, 4);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(gHotkeyMu);
+        for (auto it = gHotkeys.begin(); it != gHotkeys.end(); ) {
+            if (it->id == hotkeyId) {
+                if (it->handle != nullptr) {
+                    (void)OH_Input_RemoveHotkeyMonitor(it->handle, OnHotkeyTriggered);
+                    OH_Input_DestroyHotkey(&it->handle);
+                }
+                it = gHotkeys.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (!reg) {
+            return;
+        }
+        Input_Hotkey *hk = OH_Input_CreateHotkey();
+        if (hk == nullptr) {
+            sendHotkeyResWire(reqId, "ohos: OH_Input_CreateHotkey failed");
+            return;
+        }
+        if (!preKeys.empty()) {
+            OH_Input_SetPreKeys(hk, preKeys.data(), static_cast<int32_t>(preKeys.size()));
+        }
+        OH_Input_SetFinalKey(hk, finalKey);
+        OH_Input_SetRepeat(hk, false);
+        Input_Result rc = OH_Input_AddHotkeyMonitor(hk, OnHotkeyTriggered);
+        if (rc != INPUT_SUCCESS) {
+            OH_Input_DestroyHotkey(&hk);
+            sendHotkeyResWire(reqId, "ohos: hotkey unavailable or conflict (" + std::to_string(static_cast<int>(rc)) + ")");
+            return;
+        }
+        HotkeyEntry entry;
+        entry.id = hotkeyId;
+        entry.finalKey = finalKey;
+        entry.preKeys = std::move(preKeys);
+        entry.handle = hk;
+        gHotkeys.push_back(std::move(entry));
+    }
+    sendHotkeyResWire(reqId, "");
+}
+
+struct HostDragRep {
+    std::string format;
+    std::vector<uint8_t> data;
+};
+
+struct ActiveHostDrag {
+    bool active = false;
+    uint32_t srcWinId = 0;
+    uint32_t ops = 1;
+    std::string session;
+    std::vector<HostDragRep> reps;
+};
+
+struct PendingDragReply {
+    bool ready = false;
+    uint32_t op = 0;
+    bool taken = false;
+};
+
+std::mutex gDragMu;
+ActiveHostDrag gActiveHostDrag;
+
+std::mutex gDragReplyMu;
+std::condition_variable gDragReplyCv;
+uint32_t gNextDragPendingId = 0;
+std::unordered_map<uint32_t, PendingDragReply> gDragReplies;
+
+void sendDragEventWire(uint32_t winId, uint8_t ev, bool canceled, bool escaped, uint32_t pendingId,
+                       uint32_t ops, uint32_t suggestedOp, double x, double y,
+                       const std::string &session, const std::string &errStr,
+                       const std::vector<std::string> &formats, const std::vector<HostDragRep> &reps) {
+    std::vector<uint8_t> wire(36, 0);
+    memcpy(wire.data() + 0, &winId, 4);
+    wire[4] = ev;
+    wire[5] = canceled ? 1 : 0;
+    wire[6] = escaped ? 1 : 0;
+    memcpy(wire.data() + 8, &pendingId, 4);
+    memcpy(wire.data() + 12, &ops, 4);
+    memcpy(wire.data() + 16, &suggestedOp, 4);
+    memcpy(wire.data() + 20, &x, 8);
+    memcpy(wire.data() + 28, &y, 8);
+    appendStr(wire, session);
+    appendStr(wire, errStr);
+    appendU32(wire, static_cast<uint32_t>(formats.size()));
+    for (const auto &f : formats) {
+        appendStr(wire, f);
+    }
+    appendU32(wire, static_cast<uint32_t>(reps.size()));
+    for (const auto &r : reps) {
+        appendStr(wire, r.format);
+        appendBytes(wire, r.data.data(), r.data.size());
+    }
+    sendMessage(kDragEvent, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+}
+
+void handleDragReply(const std::vector<uint8_t> &p) {
+    if (p.size() != 16) {
+        return;
+    }
+    uint32_t pendingId = 0, op = 0;
+    memcpy(&pendingId, p.data() + 4, 4);
+    memcpy(&op, p.data() + 8, 4);
+    bool taken = p[12] != 0;
+    if (pendingId == 0) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(gDragReplyMu);
+        auto it = gDragReplies.find(pendingId);
+        if (it != gDragReplies.end()) {
+            it->second.ready = true;
+            it->second.op = op;
+            it->second.taken = taken;
+        }
+    }
+    gDragReplyCv.notify_all();
+}
+
+void disposeActiveDragAction(WinSession *ws) {
+    if (ws != nullptr && ws->activeDragAction != nullptr) {
+        ArkUI_DragAction *act = ws->activeDragAction;
+        ws->activeDragAction = nullptr;
+        ws->activeDragCanceled = false;
+        OH_ArkUI_DragAction_UnregisterStatusListener(act);
+        OH_ArkUI_DragAction_Dispose(act);
+    }
+}
+
+void OnDragActionStatus(ArkUI_DragAndDropInfo *info, void *userData) {
+    if (info == nullptr) {
+        return;
+    }
+    ArkUI_DragStatus st = OH_ArkUI_DragAndDropInfo_GetDragStatus(info);
+    if (st != ARKUI_DRAG_STATUS_ENDED) {
+        return;
+    }
+    uint32_t winId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(userData));
+    ArkUI_DragEvent *dev = OH_ArkUI_DragAndDropInfo_GetDragEvent(info);
+    ArkUI_DragResult dres = ARKUI_DRAG_RESULT_CANCELED;
+    ArkUI_DropOperation dop = ARKUI_DROP_OPERATION_COPY;
+    if (dev != nullptr) {
+        OH_ArkUI_DragEvent_GetDragResult(dev, &dres);
+        OH_ArkUI_DragEvent_GetDropOperation(dev, &dop);
+    }
+    {
+        std::lock_guard<std::mutex> lk(gDragMu);
+        if (gActiveHostDrag.srcWinId == winId) {
+            gActiveHostDrag = ActiveHostDrag{};
+        }
+    }
+    bool wasCanceled = false;
+    if (auto ws = findSession(winId)) {
+        wasCanceled = ws->activeDragCanceled;
+        disposeActiveDragAction(ws.get());
+    }
+    uint32_t ops = 0;
+    bool canceled = false;
+    bool escaped = false;
+    if (!wasCanceled && dres == ARKUI_DRAG_RESULT_SUCCESSFUL) {
+        ops = (dop == ARKUI_DROP_OPERATION_MOVE) ? 2u : 1u;
+    } else {
+        canceled = true;
+        escaped = wasCanceled || (dres == ARKUI_DRAG_RESULT_CANCELED);
+    }
+    sendDragEventWire(winId, 5, canceled, escaped, 0, ops, 0, 0.0, 0.0, "", "", {}, {});
+}
+
+struct DragStartTask {
+    uint32_t winId = 0;
+    uint32_t ops = 1;
+    int32_t width = 0;
+    int32_t height = 0;
+    int32_t hotX = 0;
+    int32_t hotY = 0;
+    std::string session;
+    std::vector<uint8_t> preview;
+    std::vector<HostDragRep> reps;
+};
+
+OH_PixelmapNative *createDragPreviewPixelmap(std::vector<uint8_t> &preview, int32_t w, int32_t h) {
+    OH_Pixelmap_InitializationOptions *opts = nullptr;
+    if (OH_PixelmapInitializationOptions_Create(&opts) != IMAGE_SUCCESS || opts == nullptr) {
+        return nullptr;
+    }
+    uint8_t fallback[4] = {0, 0, 0, 0};
+    uint8_t *srcPtr = fallback;
+    size_t srcLen = sizeof(fallback);
+    uint32_t pw = 1, ph = 1;
+    if (w > 0 && h > 0 && preview.size() >= static_cast<size_t>(w) * static_cast<size_t>(h) * 4u) {
+        pw = static_cast<uint32_t>(w);
+        ph = static_cast<uint32_t>(h);
+        srcPtr = preview.data();
+        srcLen = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
+    }
+    OH_PixelmapInitializationOptions_SetWidth(opts, pw);
+    OH_PixelmapInitializationOptions_SetHeight(opts, ph);
+    OH_PixelmapInitializationOptions_SetSrcPixelFormat(opts, PIXEL_FORMAT_BGRA_8888);
+    OH_PixelmapInitializationOptions_SetPixelFormat(opts, PIXEL_FORMAT_BGRA_8888);
+    OH_PixelmapInitializationOptions_SetAlphaType(opts, PIXELMAP_ALPHA_TYPE_PREMULTIPLIED);
+    OH_PixelmapNative *pm = nullptr;
+    (void)OH_PixelmapNative_CreatePixelmap(srcPtr, srcLen, opts, &pm);
+    OH_PixelmapInitializationOptions_Release(opts);
+    return pm;
+}
+
+void RunStartDragUITask(void *data) {
+    std::unique_ptr<DragStartTask> task(static_cast<DragStartTask *>(data));
+    if (!task) {
+        return;
+    }
+    auto ws = findSession(task->winId);
+    if (!ws || ws->xcNode == nullptr) {
+        {
+            std::lock_guard<std::mutex> lk(gDragMu);
+            if (gActiveHostDrag.srcWinId == task->winId) {
+                gActiveHostDrag = ActiveHostDrag{};
+            }
+        }
+        sendDragEventWire(task->winId, 5, false, false, 0, 0, 0, 0.0, 0.0, "",
+                          "ohos: window closed before drag started", {}, {});
+        return;
+    }
+    disposeActiveDragAction(ws.get());
+
+    ArkUI_DragAction *act = OH_ArkUI_CreateDragActionWithNode(ws->xcNode);
+    if (act == nullptr) {
+        {
+            std::lock_guard<std::mutex> lk(gDragMu);
+            if (gActiveHostDrag.srcWinId == task->winId) {
+                gActiveHostDrag = ActiveHostDrag{};
+            }
+        }
+        sendDragEventWire(task->winId, 5, false, false, 0, 0, 0, 0.0, 0.0, "",
+                          "ohos: OH_ArkUI_CreateDragActionWithNode failed", {}, {});
+        return;
+    }
+
+    OH_ArkUI_DragAction_SetPointerId(act, 0);
+    OH_PixelmapNative *pm = createDragPreviewPixelmap(task->preview, task->width, task->height);
+    if (pm != nullptr) {
+        OH_PixelmapNative *pms[1] = {pm};
+        OH_ArkUI_DragAction_SetPixelMaps(act, pms, 1);
+    }
+    OH_ArkUI_DragAction_SetTouchPointX(act, static_cast<float>(std::max(0, task->hotX)));
+    OH_ArkUI_DragAction_SetTouchPointY(act, static_cast<float>(std::max(0, task->hotY)));
+
+    OH_UdmfData *ud = OH_UdmfData_Create();
+    if (ud != nullptr) {
+        OH_UdmfRecord *rec = OH_UdmfRecord_Create();
+        bool recHasEntry = false;
+        uint32_t addedRecords = 0;
+        for (auto &rep : task->reps) {
+            if (rep.format == "text/plain") {
+                if (rec != nullptr) {
+                    OH_UdsPlainText *pt = OH_UdsPlainText_Create();
+                    if (pt != nullptr) {
+                        std::string s(reinterpret_cast<const char *>(rep.data.data()), rep.data.size());
+                        OH_UdsPlainText_SetContent(pt, s.c_str());
+                        OH_UdmfRecord_AddPlainText(rec, pt);
+                        OH_UdsPlainText_Destroy(pt);
+                        recHasEntry = true;
+                    }
+                }
+            } else if (rep.format == "text/html") {
+                if (rec != nullptr) {
+                    OH_UdsHtml *ht = OH_UdsHtml_Create();
+                    if (ht != nullptr) {
+                        std::string s(reinterpret_cast<const char *>(rep.data.data()), rep.data.size());
+                        OH_UdsHtml_SetContent(ht, s.c_str());
+                        OH_UdmfRecord_AddHtml(rec, ht);
+                        OH_UdsHtml_Destroy(ht);
+                        recHasEntry = true;
+                    }
+                }
+            } else if (rep.format == "text/uri-list") {
+                std::string all(reinterpret_cast<const char *>(rep.data.data()), rep.data.size());
+                size_t pos = 0;
+                while (pos < all.size()) {
+                    size_t nl = all.find('\n', pos);
+                    std::string line = (nl == std::string::npos) ? all.substr(pos) : all.substr(pos, nl - pos);
+                    pos = (nl == std::string::npos) ? all.size() : nl + 1;
+                    if (!line.empty() && line.back() == '\r') {
+                        line.pop_back();
+                    }
+                    if (line.empty() || line[0] == '#') {
+                        continue;
+                    }
+                    if (line[0] == '/') {
+                        line = "file://" + line;
+                    }
+                    OH_UdmfRecord *frec = OH_UdmfRecord_Create();
+                    OH_UdsFileUri *fu = OH_UdsFileUri_Create();
+                    if (frec != nullptr && fu != nullptr) {
+                        OH_UdsFileUri_SetFileUri(fu, line.c_str());
+                        OH_UdsFileUri_SetFileType(fu, "general.file");
+                        OH_UdmfRecord_AddFileUri(frec, fu);
+                        OH_UdmfData_AddRecord(ud, frec);
+                        ++addedRecords;
+                    }
+                    if (fu != nullptr) {
+                        OH_UdsFileUri_Destroy(fu);
+                    }
+                    if (frec != nullptr) {
+                        OH_UdmfRecord_Destroy(frec);
+                    }
+                }
+            } else if (rec != nullptr && !rep.format.empty()) {
+                unsigned char dummy = 0;
+                unsigned char *ptr = rep.data.empty() ? &dummy : rep.data.data();
+                OH_UdmfRecord_AddGeneralEntry(rec, rep.format.c_str(), ptr, static_cast<unsigned int>(rep.data.size()));
+                recHasEntry = true;
+            }
+        }
+        if (rec != nullptr) {
+            if (!recHasEntry && addedRecords == 0) {
+                OH_UdsPlainText *pt = OH_UdsPlainText_Create();
+                if (pt != nullptr) {
+                    OH_UdsPlainText_SetContent(pt, "");
+                    OH_UdmfRecord_AddPlainText(rec, pt);
+                    OH_UdsPlainText_Destroy(pt);
+                    recHasEntry = true;
+                }
+            }
+            if (recHasEntry) {
+                OH_UdmfData_AddRecord(ud, rec);
+            }
+            OH_UdmfRecord_Destroy(rec);
+        }
+        OH_ArkUI_DragAction_SetData(act, ud);
+        OH_UdmfData_Destroy(ud);
+    }
+
+    ArkUI_DragPreviewOption *opt = OH_ArkUI_CreateDragPreviewOption();
+    if (opt != nullptr) {
+        OH_ArkUI_DragPreviewOption_SetScaleMode(opt, ARKUI_DRAG_PREVIEW_SCALE_DISABLED);
+        OH_ArkUI_DragPreviewOption_SetDefaultShadowEnabled(opt, true);
+        OH_ArkUI_DragAction_SetDragPreviewOption(act, opt);
+        OH_ArkUI_DragPreviewOption_Dispose(opt);
+    }
+
+    ws->activeDragAction = act;
+    ws->activeDragCanceled = false;
+    OH_ArkUI_DragAction_RegisterStatusListener(act, reinterpret_cast<void *>(static_cast<uintptr_t>(ws->winId)),
+                                               OnDragActionStatus);
+    int32_t rc = OH_ArkUI_StartDrag(act);
+    if (pm != nullptr) {
+        OH_PixelmapNative_Release(pm);
+    }
+    if (rc != ARKUI_ERROR_CODE_NO_ERROR) {
+        disposeActiveDragAction(ws.get());
+        {
+            std::lock_guard<std::mutex> lk(gDragMu);
+            if (gActiveHostDrag.srcWinId == task->winId) {
+                gActiveHostDrag = ActiveHostDrag{};
+            }
+        }
+        sendDragEventWire(task->winId, 5, false, false, 0, 0, 0, 0.0, 0.0, "",
+                          "ohos: OH_ArkUI_StartDrag failed (" + std::to_string(rc) + ")", {}, {});
+    }
+}
+
+void handleDragStart(const std::vector<uint8_t> &p) {
+    if (p.size() < 40) {
+        return;
+    }
+    auto task = std::make_unique<DragStartTask>();
+    memcpy(&task->winId, p.data() + 0, 4);
+    memcpy(&task->ops, p.data() + 4, 4);
+    memcpy(&task->width, p.data() + 24, 4);
+    memcpy(&task->height, p.data() + 28, 4);
+    memcpy(&task->hotX, p.data() + 32, 4);
+    memcpy(&task->hotY, p.data() + 36, 4);
+    size_t off = 40;
+    uint32_t repCount = 0;
+    if (!readStr(p, off, &task->session) || !readBytes(p, off, &task->preview) ||
+        !readU32(p, off, &repCount) || repCount > 128) {
+        return;
+    }
+    task->reps.reserve(repCount);
+    for (uint32_t i = 0; i < repCount; ++i) {
+        HostDragRep r;
+        if (!readStr(p, off, &r.format) || !readBytes(p, off, &r.data)) {
+            return;
+        }
+        task->reps.push_back(std::move(r));
+    }
+    if (off != p.size()) {
+        return;
+    }
+
+    auto ws = findSession(task->winId);
+    if (!ws || ws->uiContext == nullptr || ws->xcNode == nullptr) {
+        sendDragEventWire(task->winId, 5, false, false, 0, 0, 0, 0.0, 0.0, "",
+                          "ohos: surface unavailable for drag", {}, {});
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(gDragMu);
+        gActiveHostDrag.active = true;
+        gActiveHostDrag.srcWinId = task->winId;
+        gActiveHostDrag.ops = task->ops != 0 ? task->ops : 1u;
+        gActiveHostDrag.session = task->session;
+        gActiveHostDrag.reps = task->reps;
+    }
+    DragStartTask *raw = task.release();
+    if (OH_ArkUI_PostUITask(ws->uiContext, raw, RunStartDragUITask) != ARKUI_ERROR_CODE_NO_ERROR) {
+        uint32_t wid = raw->winId;
+        delete raw;
+        {
+            std::lock_guard<std::mutex> lk(gDragMu);
+            if (gActiveHostDrag.srcWinId == wid) {
+                gActiveHostDrag = ActiveHostDrag{};
+            }
+        }
+        sendDragEventWire(wid, 5, false, false, 0, 0, 0, 0.0, 0.0, "",
+                          "ohos: PostUITask failed for drag", {}, {});
+    }
+}
+
+void RunCancelDragUITask(void *data) {
+    uint32_t winId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(data));
+    bool hadActive = false;
+    if (auto ws = findSession(winId)) {
+        if (ws->activeDragAction != nullptr) {
+            hadActive = true;
+            ws->activeDragCanceled = true;
+            disposeActiveDragAction(ws.get());
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(gDragMu);
+        if (gActiveHostDrag.srcWinId == winId) {
+            hadActive = true;
+            gActiveHostDrag = ActiveHostDrag{};
+        }
+    }
+    if (hadActive) {
+        sendDragEventWire(winId, 5, true, true, 0, 0, 0, 0.0, 0.0, "", "", {}, {});
+    }
+}
+
+void handleDragCancel(const std::vector<uint8_t> &p) {
+    if (p.size() < 4) {
+        return;
+    }
+    uint32_t winId = 0;
+    memcpy(&winId, p.data(), 4);
+    auto ws = findSession(winId);
+    if (ws && ws->uiContext != nullptr) {
+        OH_ArkUI_PostUITask(ws->uiContext, reinterpret_cast<void *>(static_cast<uintptr_t>(winId)), RunCancelDragUITask);
+    } else {
+        RunCancelDragUITask(reinterpret_cast<void *>(static_cast<uintptr_t>(winId)));
+    }
+}
+
+void handleNodeDragEvent(WinSession *ws, ArkUI_NodeEventType eventType, ArkUI_NodeEvent *event) {
+    if (ws == nullptr || event == nullptr) {
+        return;
+    }
+    if (eventType == NODE_ON_DRAG_LEAVE) {
+        sendDragEventWire(ws->winId, 3, false, false, 0, 0, 0, 0.0, 0.0, "", "", {}, {});
+        return;
+    }
+    if (eventType != NODE_ON_DRAG_ENTER && eventType != NODE_ON_DRAG_MOVE && eventType != NODE_ON_DROP) {
+        return;
+    }
+    ArkUI_DragEvent *dev = OH_ArkUI_NodeEvent_GetDragEvent(event);
+    if (dev == nullptr) {
+        return;
+    }
+
+    const double sc = ws->scale > 0 ? ws->scale : 1.0;
+    const double x = static_cast<double>(OH_ArkUI_DragEvent_GetTouchPointXToWindow(dev)) / sc;
+    const double y = static_cast<double>(OH_ArkUI_DragEvent_GetTouchPointYToWindow(dev)) / sc;
+    ws->lastPointerX = static_cast<float>(x);
+    ws->lastPointerY = static_cast<float>(y);
+
+    std::vector<std::string> formats;
+    auto addFmt = [&](const std::string &f) {
+        if (!f.empty() && std::find(formats.begin(), formats.end(), f) == formats.end()) {
+            formats.push_back(f);
+        }
+    };
+
+    int32_t typeCnt = 0;
+    if (OH_ArkUI_DragEvent_GetDataTypeCount(dev, &typeCnt) == ARKUI_ERROR_CODE_NO_ERROR &&
+        typeCnt > 0 && typeCnt <= 128) {
+        std::vector<char> storage(static_cast<size_t>(typeCnt) * 256u, 0);
+        std::vector<char *> ptrs(static_cast<size_t>(typeCnt), nullptr);
+        for (int32_t i = 0; i < typeCnt; ++i) {
+            ptrs[static_cast<size_t>(i)] = storage.data() + static_cast<size_t>(i) * 256u;
+        }
+        if (OH_ArkUI_DragEvent_GetDataTypes(dev, ptrs.data(), typeCnt, 256) == ARKUI_ERROR_CODE_NO_ERROR) {
+            for (int32_t i = 0; i < typeCnt; ++i) {
+                addFmt(ptrs[static_cast<size_t>(i)]);
+            }
+        }
+    }
+
+    uint32_t ops = 3u;
+    uint32_t suggestedOp = 1u;
+    uint64_t modKeys = 0;
+    if (OH_ArkUI_DragEvent_GetModifierKeyStates(dev, &modKeys) == ARKUI_ERROR_CODE_NO_ERROR &&
+        (modKeys & ARKUI_MODIFIER_KEY_SHIFT) != 0) {
+        suggestedOp = 2u;
+    }
+
+    std::string session;
+    std::vector<HostDragRep> reps;
+    bool fromLocalDrag = false;
+    {
+        std::lock_guard<std::mutex> lk(gDragMu);
+        if (gActiveHostDrag.active) {
+            fromLocalDrag = true;
+            ops = gActiveHostDrag.ops != 0 ? gActiveHostDrag.ops : 1u;
+            if ((ops & suggestedOp) == 0) {
+                suggestedOp = (ops & 1u) ? 1u : 2u;
+            }
+            session = gActiveHostDrag.session;
+            for (const auto &r : gActiveHostDrag.reps) {
+                addFmt(r.format);
+            }
+            if (eventType == NODE_ON_DROP) {
+                reps = gActiveHostDrag.reps;
+            }
+        }
+    }
+
+    if (eventType == NODE_ON_DROP && !fromLocalDrag) {
+        OH_UdmfData *ud = OH_UdmfData_Create();
+        if (ud != nullptr) {
+            if (OH_ArkUI_DragEvent_GetUdmfData(dev, ud) == ARKUI_ERROR_CODE_NO_ERROR) {
+                unsigned int rcnt = 0;
+                OH_UdmfRecord **recs = OH_UdmfData_GetRecords(ud, &rcnt);
+                std::string uriLines;
+                for (unsigned int i = 0; recs != nullptr && i < rcnt; ++i) {
+                    OH_UdmfRecord *rec = recs[i];
+                    if (rec == nullptr) {
+                        continue;
+                    }
+                    unsigned int tcnt = 0;
+                    char **types = OH_UdmfRecord_GetTypes(rec, &tcnt);
+                    for (unsigned int t = 0; types != nullptr && t < tcnt; ++t) {
+                        const char *ts = types[t];
+                        if (ts == nullptr) {
+                            continue;
+                        }
+                        std::string tstr(ts);
+                        addFmt(tstr);
+                        if (tstr == "general.plain-text" || tstr == "text/plain") {
+                            OH_UdsPlainText *pt = OH_UdsPlainText_Create();
+                            if (pt != nullptr && OH_UdmfRecord_GetPlainText(rec, pt) == 0) {
+                                const char *c = OH_UdsPlainText_GetContent(pt);
+                                if (c != nullptr) {
+                                    HostDragRep rep;
+                                    rep.format = "text/plain";
+                                    rep.data.assign(reinterpret_cast<const uint8_t *>(c),
+                                                    reinterpret_cast<const uint8_t *>(c) + strlen(c));
+                                    reps.push_back(std::move(rep));
+                                }
+                            }
+                            if (pt != nullptr) {
+                                OH_UdsPlainText_Destroy(pt);
+                            }
+                        } else if (tstr == "general.html" || tstr == "text/html") {
+                            OH_UdsHtml *ht = OH_UdsHtml_Create();
+                            if (ht != nullptr && OH_UdmfRecord_GetHtml(rec, ht) == 0) {
+                                const char *c = OH_UdsHtml_GetContent(ht);
+                                if (c != nullptr) {
+                                    HostDragRep rep;
+                                    rep.format = "text/html";
+                                    rep.data.assign(reinterpret_cast<const uint8_t *>(c),
+                                                    reinterpret_cast<const uint8_t *>(c) + strlen(c));
+                                    reps.push_back(std::move(rep));
+                                }
+                            }
+                            if (ht != nullptr) {
+                                OH_UdsHtml_Destroy(ht);
+                            }
+                        } else if (tstr == "general.file-uri" || tstr == "general.file" ||
+                                   tstr == "general.folder" || tstr == "general.image" ||
+                                   tstr == "general.video" || tstr == "general.audio") {
+                            OH_UdsFileUri *fu = OH_UdsFileUri_Create();
+                            if (fu != nullptr && OH_UdmfRecord_GetFileUri(rec, fu) == 0) {
+                                const char *u = OH_UdsFileUri_GetFileUri(fu);
+                                if (u != nullptr && u[0] != '\0') {
+                                    if (!uriLines.empty()) {
+                                        uriLines += "\r\n";
+                                    }
+                                    uriLines += u;
+                                }
+                            }
+                            if (fu != nullptr) {
+                                OH_UdsFileUri_Destroy(fu);
+                            }
+                        } else {
+                            unsigned char *entry = nullptr;
+                            unsigned int elen = 0;
+                            if (OH_UdmfRecord_GetGeneralEntry(rec, ts, &entry, &elen) == 0 && entry != nullptr) {
+                                HostDragRep rep;
+                                rep.format = tstr;
+                                rep.data.assign(entry, entry + elen);
+                                reps.push_back(std::move(rep));
+                            }
+                        }
+                    }
+                }
+                if (!uriLines.empty()) {
+                    addFmt("text/uri-list");
+                    HostDragRep rep;
+                    rep.format = "text/uri-list";
+                    rep.data.assign(reinterpret_cast<const uint8_t *>(uriLines.data()),
+                                    reinterpret_cast<const uint8_t *>(uriLines.data()) + uriLines.size());
+                    reps.push_back(std::move(rep));
+                }
+            }
+            OH_UdmfData_Destroy(ud);
+        }
+    }
+
+    uint8_t wireEv = 2;
+    if (eventType == NODE_ON_DRAG_ENTER) {
+        wireEv = 1;
+    } else if (eventType == NODE_ON_DROP) {
+        wireEv = 4;
+    }
+
+    uint32_t pendingId = 0;
+    {
+        std::lock_guard<std::mutex> lk(gDragReplyMu);
+        pendingId = ++gNextDragPendingId;
+        if (pendingId == 0) {
+            pendingId = ++gNextDragPendingId;
+        }
+        gDragReplies[pendingId] = PendingDragReply{};
+    }
+
+    sendDragEventWire(ws->winId, wireEv, false, false, pendingId, ops, suggestedOp, x, y,
+                      session, "", formats, reps);
+
+    PendingDragReply reply{};
+    const int waitMs = (eventType == NODE_ON_DROP) ? 400 : 80;
+    {
+        std::unique_lock<std::mutex> lk(gDragReplyMu);
+        gDragReplyCv.wait_for(lk, std::chrono::milliseconds(waitMs), [&] {
+            auto it = gDragReplies.find(pendingId);
+            return it == gDragReplies.end() || it->second.ready;
+        });
+        auto it = gDragReplies.find(pendingId);
+        if (it != gDragReplies.end()) {
+            reply = it->second;
+            gDragReplies.erase(it);
+        }
+    }
+
+    if (reply.taken) {
+        ArkUI_DropOperation dropOp = (reply.op & 2u) ? ARKUI_DROP_OPERATION_MOVE : ARKUI_DROP_OPERATION_COPY;
+        OH_ArkUI_DragEvent_SetSuggestedDropOperation(dev, dropOp);
+        OH_ArkUI_DragEvent_SetDragResult(dev, ARKUI_DRAG_RESULT_SUCCESSFUL);
+    } else {
+        OH_ArkUI_DragEvent_SetDragResult(dev, ARKUI_DRAG_RESULT_FAILED);
+    }
+}
+
+struct HostAccessNode {
+    uint64_t id = 0;
+    int32_t parent = -1;
+    uint8_t role = 0;
+    uint8_t actions = 0;
+    uint8_t current = 0;
+    uint8_t hasPopup = 0;
+    uint32_t states = 0;
+    float x = 0, y = 0, w = 0, h = 0;
+    double minVal = 0, maxVal = 0, nowVal = 0, stepVal = 0;
+    int32_t selStart = 0, selEnd = 0, level = 0;
+    uint16_t posInSet = 0, setSize = 0;
+    std::string label;
+    std::string value;
+    std::string placeholder;
+    std::string description;
+    std::string roleDesc;
+    std::vector<int64_t> childElemIds;
+};
+
+struct AccessWinSnapshot {
+    bool enabledNotified = false;
+    uint64_t focusId = 0;
+    int32_t a11yFocusElemId = 0;
+    std::string selectedWord;
+    std::vector<HostAccessNode> nodes;
+    std::vector<int64_t> rootChildElemIds;
+};
+
+std::mutex gAccessMu;
+std::unordered_map<uint32_t, AccessWinSnapshot> gAccessTrees;
+std::unordered_map<std::string, uint32_t> gAccessInstToWinId;
+
+void sendAccessEventWire(uint32_t winId, uint8_t ev, uint8_t actionKind, uint64_t nodeId,
+                         int32_t from, int32_t to, const std::string &text) {
+    std::vector<uint8_t> wire(24, 0);
+    memcpy(wire.data() + 0, &winId, 4);
+    wire[4] = ev;
+    wire[5] = actionKind;
+    memcpy(wire.data() + 8, &nodeId, 8);
+    memcpy(wire.data() + 16, &from, 4);
+    memcpy(wire.data() + 20, &to, 4);
+    appendStr(wire, text);
+    sendMessage(kAccessEvent, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+}
+
+const char *mapAccessRoleType(uint8_t role) {
+    switch (role) {
+    case 1:  return "text";
+    case 2:  return "button";
+    case 3:  return "link";
+    case 4:  return "checkbox";
+    case 5:  return "radio";
+    case 6:  return "Toggle";
+    case 7:  return "slider";
+    case 8:  return "progress";
+    case 9:  return "textInput";
+    case 10: return "image";
+    case 11: return "list";
+    case 12: return "scroll";
+    case 13: return "dialog";
+    case 17: return "tabBar";
+    case 18: return "tabContent";
+    case 27: return "listItem";
+    case 31: return "button";
+    case 32: return "select";
+    case 39: return "menu";
+    case 41: return "menuitem";
+    case 42: return "checkbox";
+    case 43: return "radio";
+    default: return "column";
+    }
+}
+
+uint32_t resolveAccessWinIdLocked(const char *instanceId) {
+    if (instanceId != nullptr) {
+        auto it = gAccessInstToWinId.find(instanceId);
+        if (it != gAccessInstToWinId.end()) {
+            return it->second;
+        }
+    }
+    return 1;
+}
+
+void ensureAccessEnabledForWinLocked(uint32_t winId, AccessWinSnapshot &snap, bool *sendEnableOut) {
+    if (!snap.enabledNotified) {
+        snap.enabledNotified = true;
+        *sendEnableOut = true;
+    }
+}
+
+void fillAccessElementLocked(uint32_t winId, const AccessWinSnapshot &snap, int32_t elemId,
+                             double scale, int32_t surfW, int32_t surfH,
+                             ArkUI_AccessibilityElementInfo *info) {
+    if (info == nullptr) {
+        return;
+    }
+    if (elemId <= 0 || static_cast<size_t>(elemId) > snap.nodes.size()) {
+        OH_ArkUI_AccessibilityElementInfoSetElementId(info, 0);
+        OH_ArkUI_AccessibilityElementInfoSetParentId(info, -2100000);
+        OH_ArkUI_AccessibilityElementInfoSetComponentType(info, "root");
+        OH_ArkUI_AccessibilityElementInfoSetEnabled(info, true);
+        OH_ArkUI_AccessibilityElementInfoSetVisible(info, true);
+        OH_ArkUI_AccessibilityElementInfoSetAccessibilityLevel(info, "yes");
+        ArkUI_AccessibleRect rr{0, 0, std::max(1, surfW), std::max(1, surfH)};
+        OH_ArkUI_AccessibilityElementInfoSetScreenRect(info, &rr);
+        if (!snap.rootChildElemIds.empty()) {
+            std::vector<int64_t> kids = snap.rootChildElemIds;
+            OH_ArkUI_AccessibilityElementInfoSetChildNodeIds(info, static_cast<int32_t>(kids.size()), kids.data());
+        }
+        return;
+    }
+
+    const HostAccessNode &n = snap.nodes[static_cast<size_t>(elemId - 1)];
+    const int32_t parentElem = (n.parent >= 0 && static_cast<size_t>(n.parent) < snap.nodes.size())
+                                   ? (n.parent + 1)
+                                   : 0;
+    OH_ArkUI_AccessibilityElementInfoSetElementId(info, elemId);
+    OH_ArkUI_AccessibilityElementInfoSetParentId(info, parentElem);
+    OH_ArkUI_AccessibilityElementInfoSetComponentType(info,
+                                                      n.roleDesc.empty() ? mapAccessRoleType(n.role) : n.roleDesc.c_str());
+
+    const std::string &primaryText = !n.value.empty() ? n.value : n.label;
+    OH_ArkUI_AccessibilityElementInfoSetContents(info, primaryText.c_str());
+    OH_ArkUI_AccessibilityElementInfoSetAccessibilityText(info, n.label.c_str());
+    if (!n.placeholder.empty()) {
+        OH_ArkUI_AccessibilityElementInfoSetIsHint(info, n.value.empty());
+        OH_ArkUI_AccessibilityElementInfoSetHintText(info, n.placeholder.c_str());
+    }
+    if (!n.description.empty()) {
+        OH_ArkUI_AccessibilityElementInfoSetAccessibilityDescription(info, n.description.c_str());
+    }
+
+    const bool disabled = (n.states & (1u << 1)) != 0;
+    const bool focusable = (n.states & (1u << 0)) != 0 || (n.actions & (1u << 1)) != 0;
+    const bool checked = (n.states & (1u << 2)) != 0;
+    const bool checkable = checked || (n.states & (1u << 3)) != 0 ||
+                           n.role == 4 || n.role == 5 || n.role == 6 || n.role == 31 || n.role == 42 || n.role == 43;
+    const bool selected = (n.states & (1u << 4)) != 0;
+    const bool password = (n.states & (1u << 7)) != 0;
+    const bool readOnly = (n.states & (1u << 8)) != 0;
+    const bool offscreen = (n.states & (1u << 10)) != 0;
+    const bool isFocused = (snap.focusId != 0 && n.id == snap.focusId);
+    const bool isA11yFocused = (snap.a11yFocusElemId == elemId);
+    const bool editable = (n.role == 9 || n.role == 32) && !readOnly && !disabled;
+    const bool clickable = (n.actions & (1u << 0)) != 0 && !disabled;
+    const bool scrollable = n.role == 11 || n.role == 12 || ((n.actions & ((1u << 2) | (1u << 3))) != 0);
+
+    OH_ArkUI_AccessibilityElementInfoSetEnabled(info, !disabled);
+    OH_ArkUI_AccessibilityElementInfoSetVisible(info, !offscreen);
+    OH_ArkUI_AccessibilityElementInfoSetFocusable(info, focusable);
+    OH_ArkUI_AccessibilityElementInfoSetFocused(info, isFocused);
+    OH_ArkUI_AccessibilityElementInfoSetAccessibilityFocused(info, isA11yFocused);
+    OH_ArkUI_AccessibilityElementInfoSetCheckable(info, checkable);
+    OH_ArkUI_AccessibilityElementInfoSetChecked(info, checked);
+    OH_ArkUI_AccessibilityElementInfoSetSelected(info, selected);
+    OH_ArkUI_AccessibilityElementInfoSetClickable(info, clickable);
+    OH_ArkUI_AccessibilityElementInfoSetIsPassword(info, password);
+    OH_ArkUI_AccessibilityElementInfoSetEditable(info, editable);
+    OH_ArkUI_AccessibilityElementInfoSetScrollable(info, scrollable);
+    OH_ArkUI_AccessibilityElementInfoSetAccessibilityLevel(info, "yes");
+
+    const double sc = scale > 0 ? scale : 1.0;
+    ArkUI_AccessibleRect rect{
+        static_cast<int32_t>(std::lround(n.x * sc)),
+        static_cast<int32_t>(std::lround(n.y * sc)),
+        static_cast<int32_t>(std::lround((n.x + n.w) * sc)),
+        static_cast<int32_t>(std::lround((n.y + n.h) * sc)),
+    };
+    OH_ArkUI_AccessibilityElementInfoSetScreenRect(info, &rect);
+
+    if (n.role == 7 || n.role == 8 || n.role == 34 || n.role == 35) {
+        ArkUI_AccessibleRangeInfo ri{n.minVal, n.maxVal, n.nowVal};
+        OH_ArkUI_AccessibilityElementInfoSetRangeInfo(info, &ri);
+    }
+    if (n.role == 9 || n.role == 32) {
+        OH_ArkUI_AccessibilityElementInfoSetSelectedTextStart(info, n.selStart);
+        OH_ArkUI_AccessibilityElementInfoSetSelectedTextEnd(info, n.selEnd);
+    }
+    if (n.setSize > 0) {
+        OH_ArkUI_AccessibilityElementInfoSetItemCount(info, n.setSize);
+        if (n.posInSet > 0) {
+            OH_ArkUI_AccessibilityElementInfoSetCurrentItemIndex(info, n.posInSet - 1);
+        }
+    }
+
+    if (!n.childElemIds.empty()) {
+        std::vector<int64_t> kids = n.childElemIds;
+        OH_ArkUI_AccessibilityElementInfoSetChildNodeIds(info, static_cast<int32_t>(kids.size()), kids.data());
+    }
+
+    std::vector<ArkUI_AccessibleAction> ops;
+    ops.push_back({isA11yFocused ? ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_CLEAR_ACCESSIBILITY_FOCUS
+                                 : ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_GAIN_ACCESSIBILITY_FOCUS,
+                   "focus"});
+    if (clickable) {
+        ops.push_back({ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_CLICK, "click"});
+    }
+    if ((n.actions & (1u << 6)) != 0) {
+        ops.push_back({ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_LONG_CLICK, "expand"});
+    }
+    if ((n.actions & (1u << 2)) != 0) {
+        ops.push_back({ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_SCROLL_FORWARD, "increment"});
+    }
+    if ((n.actions & (1u << 3)) != 0) {
+        ops.push_back({ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_SCROLL_BACKWARD, "decrement"});
+    }
+    if (editable || (n.actions & (1u << 4)) != 0) {
+        ops.push_back({ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_SET_TEXT, "setText"});
+        ops.push_back({ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_SELECT_TEXT, "selectText"});
+        ops.push_back({ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_SET_CURSOR_POSITION, "setCursor"});
+    }
+    OH_ArkUI_AccessibilityElementInfoSetOperationActions(info, static_cast<int32_t>(ops.size()), ops.data());
+    (void)winId;
+}
+
+void getWindowMetricsForAccess(uint32_t winId, double *scaleOut, int32_t *wOut, int32_t *hOut) {
+    *scaleOut = 1.0;
+    *wOut = 1280;
+    *hOut = 800;
+    if (auto ws = findSession(winId)) {
+        std::lock_guard<std::mutex> lk(ws->mu);
+        *scaleOut = ws->scale > 0 ? ws->scale : 1.0;
+        if (ws->curW > 0) {
+            *wOut = ws->curW;
+        }
+        if (ws->curH > 0) {
+            *hOut = ws->curH;
+        }
+    }
+}
+
+void appendSubtreeToAccessListLocked(uint32_t winId, const AccessWinSnapshot &snap, int32_t elemId,
+                                     double sc, int32_t sw, int32_t sh,
+                                     ArkUI_AccessibilityElementInfoList *list, bool recursive) {
+    ArkUI_AccessibilityElementInfo *ei = OH_ArkUI_AddAndGetAccessibilityElementInfo(list);
+    fillAccessElementLocked(winId, snap, elemId, sc, sw, sh, ei);
+    const std::vector<int64_t> *kids = nullptr;
+    if (elemId <= 0) {
+        kids = &snap.rootChildElemIds;
+    } else if (static_cast<size_t>(elemId) <= snap.nodes.size()) {
+        kids = &snap.nodes[static_cast<size_t>(elemId - 1)].childElemIds;
+    }
+    if (kids == nullptr) {
+        return;
+    }
+    for (int64_t cid : *kids) {
+        if (recursive) {
+            appendSubtreeToAccessListLocked(winId, snap, static_cast<int32_t>(cid), sc, sw, sh, list, true);
+        } else {
+            ArkUI_AccessibilityElementInfo *ci = OH_ArkUI_AddAndGetAccessibilityElementInfo(list);
+            fillAccessElementLocked(winId, snap, static_cast<int32_t>(cid), sc, sw, sh, ci);
+        }
+    }
+}
+
+int32_t AccessFindById(const char *instanceId, int64_t elementId, ArkUI_AccessibilitySearchMode mode,
+                       int32_t, ArkUI_AccessibilityElementInfoList *elementList) {
+    if (elementList == nullptr) {
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_BAD_PARAMETER;
+    }
+    uint32_t winId = 1;
+    bool notifyEnable = false;
+    {
+        std::lock_guard<std::mutex> lk(gAccessMu);
+        winId = resolveAccessWinIdLocked(instanceId);
+        ensureAccessEnabledForWinLocked(winId, gAccessTrees[winId], &notifyEnable);
+    }
+    double sc = 1.0;
+    int32_t sw = 1280, sh = 800;
+    getWindowMetricsForAccess(winId, &sc, &sw, &sh);
+    {
+        std::lock_guard<std::mutex> lk(gAccessMu);
+        const auto &snap = gAccessTrees[winId];
+        int32_t eid = elementId <= 0 ? 0 : static_cast<int32_t>(elementId);
+        if (eid > 0 && static_cast<size_t>(eid) > snap.nodes.size()) {
+            return ARKUI_ACCESSIBILITY_NATIVE_RESULT_FAILED;
+        }
+        if ((mode & ARKUI_ACCESSIBILITY_NATIVE_SEARCH_MODE_PREFETCH_RECURSIVE_CHILDREN) != 0) {
+            appendSubtreeToAccessListLocked(winId, snap, eid, sc, sw, sh, elementList, true);
+        } else if ((mode & ARKUI_ACCESSIBILITY_NATIVE_SEARCH_MODE_PREFETCH_CHILDREN) != 0) {
+            appendSubtreeToAccessListLocked(winId, snap, eid, sc, sw, sh, elementList, false);
+        } else {
+            ArkUI_AccessibilityElementInfo *ei = OH_ArkUI_AddAndGetAccessibilityElementInfo(elementList);
+            fillAccessElementLocked(winId, snap, eid, sc, sw, sh, ei);
+        }
+    }
+    if (notifyEnable) {
+        sendAccessEventWire(winId, 1, 0, 0, 0, 0, "");
+    }
+    return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+}
+
+int32_t AccessFindByText(const char *instanceId, int64_t elementId, const char *text,
+                         int32_t, ArkUI_AccessibilityElementInfoList *elementList) {
+    if (elementList == nullptr || text == nullptr) {
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_BAD_PARAMETER;
+    }
+    std::string needle(text);
+    uint32_t winId = 1;
+    bool notifyEnable = false;
+    {
+        std::lock_guard<std::mutex> lk(gAccessMu);
+        winId = resolveAccessWinIdLocked(instanceId);
+        ensureAccessEnabledForWinLocked(winId, gAccessTrees[winId], &notifyEnable);
+    }
+    double sc = 1.0;
+    int32_t sw = 1280, sh = 800;
+    getWindowMetricsForAccess(winId, &sc, &sw, &sh);
+    {
+        std::lock_guard<std::mutex> lk(gAccessMu);
+        const auto &snap = gAccessTrees[winId];
+        for (size_t i = 0; i < snap.nodes.size(); ++i) {
+            const auto &n = snap.nodes[i];
+            if (!needle.empty() &&
+                n.label.find(needle) == std::string::npos &&
+                n.value.find(needle) == std::string::npos) {
+                continue;
+            }
+            ArkUI_AccessibilityElementInfo *ei = OH_ArkUI_AddAndGetAccessibilityElementInfo(elementList);
+            fillAccessElementLocked(winId, snap, static_cast<int32_t>(i + 1), sc, sw, sh, ei);
+        }
+    }
+    if (notifyEnable) {
+        sendAccessEventWire(winId, 1, 0, 0, 0, 0, "");
+    }
+    (void)elementId;
+    return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+}
+
+int32_t AccessFindFocused(const char *instanceId, int64_t, ArkUI_AccessibilityFocusType focusType,
+                          int32_t, ArkUI_AccessibilityElementInfo *elementInfo) {
+    if (elementInfo == nullptr) {
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_BAD_PARAMETER;
+    }
+    uint32_t winId = 1;
+    {
+        std::lock_guard<std::mutex> lk(gAccessMu);
+        winId = resolveAccessWinIdLocked(instanceId);
+    }
+    double sc = 1.0;
+    int32_t sw = 1280, sh = 800;
+    getWindowMetricsForAccess(winId, &sc, &sw, &sh);
+
+    std::lock_guard<std::mutex> lk(gAccessMu);
+    const auto &snap = gAccessTrees[winId];
+    int32_t foundElem = 0;
+    if (focusType == ARKUI_ACCESSIBILITY_NATIVE_FOCUS_TYPE_ACCESSIBILITY) {
+        if (snap.a11yFocusElemId > 0 && static_cast<size_t>(snap.a11yFocusElemId) <= snap.nodes.size()) {
+            foundElem = snap.a11yFocusElemId;
+        }
+    } else if (focusType == ARKUI_ACCESSIBILITY_NATIVE_FOCUS_TYPE_INPUT && snap.focusId != 0) {
+        for (size_t i = 0; i < snap.nodes.size(); ++i) {
+            if (snap.nodes[i].id == snap.focusId) {
+                foundElem = static_cast<int32_t>(i + 1);
+                break;
+            }
+        }
+    }
+    if (foundElem <= 0) {
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_FAILED;
+    }
+    fillAccessElementLocked(winId, snap, foundElem, sc, sw, sh, elementInfo);
+    return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+}
+
+int32_t AccessFindNextFocus(const char *instanceId, int64_t elementId,
+                            ArkUI_AccessibilityFocusMoveDirection direction,
+                            int32_t, ArkUI_AccessibilityElementInfo *elementInfo) {
+    if (elementInfo == nullptr) {
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_BAD_PARAMETER;
+    }
+    uint32_t winId = 1;
+    {
+        std::lock_guard<std::mutex> lk(gAccessMu);
+        winId = resolveAccessWinIdLocked(instanceId);
+    }
+    double sc = 1.0;
+    int32_t sw = 1280, sh = 800;
+    getWindowMetricsForAccess(winId, &sc, &sw, &sh);
+
+    std::lock_guard<std::mutex> lk(gAccessMu);
+    const auto &snap = gAccessTrees[winId];
+    if (snap.nodes.empty()) {
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_FAILED;
+    }
+    const int32_t n = static_cast<int32_t>(snap.nodes.size());
+    const bool backward = (direction == ARKUI_ACCESSIBILITY_NATIVE_DIRECTION_BACKWARD ||
+                           direction == ARKUI_ACCESSIBILITY_NATIVE_DIRECTION_UP ||
+                           direction == ARKUI_ACCESSIBILITY_NATIVE_DIRECTION_LEFT);
+    int32_t cur = elementId <= 0 ? (backward ? n + 1 : 0) : static_cast<int32_t>(elementId);
+    int32_t step = backward ? -1 : 1;
+    for (int32_t e = cur + step; e >= 1 && e <= n; e += step) {
+        const auto &nd = snap.nodes[static_cast<size_t>(e - 1)];
+        if ((nd.states & (1u << 10)) != 0) {
+            continue;
+        }
+        fillAccessElementLocked(winId, snap, e, sc, sw, sh, elementInfo);
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+    }
+    return ARKUI_ACCESSIBILITY_NATIVE_RESULT_FAILED;
+}
+
+int32_t AccessExecuteAction(const char *instanceId, int64_t elementId,
+                            ArkUI_Accessibility_ActionType action,
+                            ArkUI_AccessibilityActionArguments *args, int32_t) {
+    uint32_t winId = 1;
+    uint64_t nodeId = 0;
+    uint8_t nodeStates = 0;
+    ArkUI_AccessibilityProvider *provider = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(gAccessMu);
+        winId = resolveAccessWinIdLocked(instanceId);
+        auto &snap = gAccessTrees[winId];
+        if (action == ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_CLEAR_ACCESSIBILITY_FOCUS) {
+            snap.a11yFocusElemId = 0;
+            return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+        }
+        if (elementId <= 0 || static_cast<size_t>(elementId) > snap.nodes.size()) {
+            return ARKUI_ACCESSIBILITY_NATIVE_RESULT_FAILED;
+        }
+        const auto &nd = snap.nodes[static_cast<size_t>(elementId - 1)];
+        nodeId = nd.id;
+        nodeStates = static_cast<uint8_t>(nd.states & 0xFFu);
+        if (action == ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_GAIN_ACCESSIBILITY_FOCUS) {
+            snap.a11yFocusElemId = static_cast<int32_t>(elementId);
+        }
+    }
+    if (auto ws = findSession(winId)) {
+        provider = ws->accessProvider;
+    }
+
+    auto getArgStr = [&](const char *key) -> std::string {
+        if (args == nullptr) {
+            return "";
+        }
+        char *val = nullptr;
+        if (OH_ArkUI_FindAccessibilityActionArgumentByKey(args, key, &val) ==
+                ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL &&
+            val != nullptr) {
+            return std::string(val);
+        }
+        return "";
+    };
+
+    switch (action) {
+    case ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_GAIN_ACCESSIBILITY_FOCUS:
+        sendAccessEventWire(winId, 2, 5, nodeId, 0, 0, ""); // AccessScrollIntoView
+        if (provider != nullptr) {
+            ArkUI_AccessibilityEventInfo *ev = OH_ArkUI_CreateAccessibilityEventInfo();
+            if (ev != nullptr) {
+                OH_ArkUI_AccessibilityEventSetEventType(ev, ARKUI_ACCESSIBILITY_NATIVE_EVENT_TYPE_ACCESSIBILITY_FOCUSED);
+                OH_ArkUI_SendAccessibilityAsyncEvent(provider, ev, [](int32_t) {});
+                OH_ArkUI_DestoryAccessibilityEventInfo(ev);
+            }
+        }
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+    case ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_CLICK:
+        sendAccessEventWire(winId, 2, 0, nodeId, 0, 0, ""); // AccessPress
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+    case ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_LONG_CLICK: {
+        const bool expanded = (nodeStates & (1u << 5)) != 0;
+        sendAccessEventWire(winId, 2, expanded ? 7 : 6, nodeId, 0, 0, ""); // Collapse / Expand
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+    }
+    case ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_SCROLL_FORWARD:
+        sendAccessEventWire(winId, 2, 2, nodeId, 0, 0, ""); // AccessIncrement
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+    case ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_SCROLL_BACKWARD:
+        sendAccessEventWire(winId, 2, 3, nodeId, 0, 0, ""); // AccessDecrement
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+    case ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_SET_TEXT: {
+        std::string txt = getArgStr("setText");
+        sendAccessEventWire(winId, 2, 4, nodeId, 0, 0, txt); // AccessSetValue
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+    }
+    case ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_SELECT_TEXT: {
+        int32_t b = atoi(getArgStr("selectTextBegin").c_str());
+        int32_t e = atoi(getArgStr("selectTextEnd").c_str());
+        sendAccessEventWire(winId, 2, 8, nodeId, b, e, ""); // AccessSelectText
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+    }
+    case ARKUI_ACCESSIBILITY_NATIVE_ACTION_TYPE_SET_CURSOR_POSITION: {
+        int32_t pos = atoi(getArgStr("offset").c_str());
+        sendAccessEventWire(winId, 2, 8, nodeId, pos, pos, ""); // AccessSelectText(pos, pos)
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+    }
+    default:
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_FAILED;
+    }
+}
+
+int32_t AccessClearFocus(const char *instanceId) {
+    std::lock_guard<std::mutex> lk(gAccessMu);
+    uint32_t winId = resolveAccessWinIdLocked(instanceId);
+    gAccessTrees[winId].a11yFocusElemId = 0;
+    return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+}
+
+int32_t AccessGetCursorPos(const char *instanceId, int64_t elementId, int32_t, int32_t *index) {
+    if (index == nullptr) {
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_BAD_PARAMETER;
+    }
+    std::lock_guard<std::mutex> lk(gAccessMu);
+    uint32_t winId = resolveAccessWinIdLocked(instanceId);
+    const auto &snap = gAccessTrees[winId];
+    if (elementId <= 0 || static_cast<size_t>(elementId) > snap.nodes.size()) {
+        *index = 0;
+        return ARKUI_ACCESSIBILITY_NATIVE_RESULT_FAILED;
+    }
+    *index = snap.nodes[static_cast<size_t>(elementId - 1)].selEnd;
+    return ARKUI_ACCESSIBILITY_NATIVE_RESULT_SUCCESSFUL;
+}
+
+ArkUI_AccessibilityProviderCallbacksWithInstance gAccessCallbacks = {
+    AccessFindById,
+    AccessFindByText,
+    AccessFindFocused,
+    AccessFindNextFocus,
+    AccessExecuteAction,
+    AccessClearFocus,
+    AccessGetCursorPos,
+};
+
+void attachWindowAccessibility(WinSession *ws) {
+    if (ws == nullptr || ws->xcNode == nullptr) {
+        return;
+    }
+    ws->accessInstId = "mygo_win_" + std::to_string(ws->winId);
+    {
+        std::lock_guard<std::mutex> lk(gAccessMu);
+        gAccessInstToWinId[ws->accessInstId] = ws->winId;
+    }
+    ws->accessProvider = OH_ArkUI_AccessibilityProvider_Create(ws->xcNode);
+    if (ws->accessProvider != nullptr) {
+        OH_ArkUI_AccessibilityProviderRegisterCallbackWithInstance(
+            ws->accessInstId.c_str(), ws->accessProvider, &gAccessCallbacks);
+    }
+}
+
+void detachWindowAccessibility(WinSession *ws, bool eraseTree) {
+    if (ws == nullptr) {
+        return;
+    }
+    if (ws->accessProvider != nullptr) {
+        OH_ArkUI_AccessibilityProvider_Dispose(ws->accessProvider);
+        ws->accessProvider = nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lk(gAccessMu);
+        if (!ws->accessInstId.empty()) {
+            gAccessInstToWinId.erase(ws->accessInstId);
+        }
+        if (eraseTree) {
+            gAccessTrees.erase(ws->winId);
+        }
+    }
+    ws->accessInstId.clear();
+}
+
+void handleAccessTree(const std::vector<uint8_t> &p) {
+    if (p.size() < 12) {
+        return;
+    }
+    uint32_t winId = 0;
+    uint64_t focusId = 0;
+    memcpy(&winId, p.data() + 0, 4);
+    memcpy(&focusId, p.data() + 4, 8);
+    size_t off = 12;
+    std::string selectedWord;
+    uint32_t annCount = 0, alertCount = 0, nodeCount = 0;
+    if (!readStr(p, off, &selectedWord) || !readU32(p, off, &annCount) || annCount > 256) {
+        return;
+    }
+    std::vector<std::string> anns(annCount);
+    for (uint32_t i = 0; i < annCount; ++i) {
+        if (!readStr(p, off, &anns[i])) {
+            return;
+        }
+    }
+    if (!readU32(p, off, &alertCount) || alertCount > 256) {
+        return;
+    }
+    std::vector<std::string> alerts(alertCount);
+    for (uint32_t i = 0; i < alertCount; ++i) {
+        if (!readStr(p, off, &alerts[i])) {
+            return;
+        }
+    }
+    if (!readU32(p, off, &nodeCount) || nodeCount > 16384) {
+        return;
+    }
+    std::vector<HostAccessNode> nodes(nodeCount);
+    std::vector<int64_t> rootKids;
+    for (uint32_t i = 0; i < nodeCount; ++i) {
+        if (off + 84 > p.size()) {
+            return;
+        }
+        HostAccessNode &n = nodes[i];
+        const uint8_t *nb = p.data() + off;
+        off += 84;
+        memcpy(&n.id, nb + 0, 8);
+        memcpy(&n.parent, nb + 8, 4);
+        n.role = nb[12];
+        n.actions = nb[13];
+        n.current = nb[14];
+        n.hasPopup = nb[15];
+        memcpy(&n.states, nb + 16, 4);
+        memcpy(&n.x, nb + 20, 4);
+        memcpy(&n.y, nb + 24, 4);
+        memcpy(&n.w, nb + 28, 4);
+        memcpy(&n.h, nb + 32, 4);
+        memcpy(&n.minVal, nb + 36, 8);
+        memcpy(&n.maxVal, nb + 44, 8);
+        memcpy(&n.nowVal, nb + 52, 8);
+        memcpy(&n.stepVal, nb + 60, 8);
+        memcpy(&n.selStart, nb + 68, 4);
+        memcpy(&n.selEnd, nb + 72, 4);
+        memcpy(&n.level, nb + 76, 4);
+        memcpy(&n.posInSet, nb + 80, 2);
+        memcpy(&n.setSize, nb + 82, 2);
+        if (!readStr(p, off, &n.label) ||
+            !readStr(p, off, &n.value) ||
+            !readStr(p, off, &n.placeholder) ||
+            !readStr(p, off, &n.description) ||
+            !readStr(p, off, &n.roleDesc)) {
+            return;
+        }
+    }
+    if (off != p.size()) {
+        return;
+    }
+    for (uint32_t i = 0; i < nodeCount; ++i) {
+        int32_t par = nodes[i].parent;
+        if (par >= 0 && static_cast<uint32_t>(par) < nodeCount) {
+            nodes[static_cast<size_t>(par)].childElemIds.push_back(static_cast<int64_t>(i + 1));
+        } else {
+            rootKids.push_back(static_cast<int64_t>(i + 1));
+        }
+    }
+
+    bool focusChanged = false;
+    int32_t focusElemId = 0;
+    {
+        std::lock_guard<std::mutex> lk(gAccessMu);
+        auto &snap = gAccessTrees[winId];
+        focusChanged = (snap.focusId != focusId && focusId != 0);
+        snap.focusId = focusId;
+        snap.selectedWord = std::move(selectedWord);
+        snap.nodes = std::move(nodes);
+        snap.rootChildElemIds = std::move(rootKids);
+        if (focusChanged) {
+            for (size_t i = 0; i < snap.nodes.size(); ++i) {
+                if (snap.nodes[i].id == focusId) {
+                    focusElemId = static_cast<int32_t>(i + 1);
+                    break;
+                }
+            }
+        }
+    }
+
+    auto ws = findSession(winId);
+    if (!ws || ws->accessProvider == nullptr) {
+        return;
+    }
+    ArkUI_AccessibilityProvider *prov = ws->accessProvider;
+
+    ArkUI_AccessibilityEventInfo *pageEv = OH_ArkUI_CreateAccessibilityEventInfo();
+    if (pageEv != nullptr) {
+        OH_ArkUI_AccessibilityEventSetEventType(pageEv, ARKUI_ACCESSIBILITY_NATIVE_EVENT_TYPE_PAGE_CONTENT_UPDATE);
+        OH_ArkUI_SendAccessibilityAsyncEvent(prov, pageEv, [](int32_t) {});
+        OH_ArkUI_DestoryAccessibilityEventInfo(pageEv);
+    }
+    if (focusChanged && focusElemId > 0) {
+        ArkUI_AccessibilityEventInfo *fev = OH_ArkUI_CreateAccessibilityEventInfo();
+        if (fev != nullptr) {
+            OH_ArkUI_AccessibilityEventSetEventType(fev, ARKUI_ACCESSIBILITY_NATIVE_EVENT_TYPE_FOCUS_NODE_UPDATE);
+            OH_ArkUI_AccessibilityEventSetRequestFocusId(fev, focusElemId);
+            OH_ArkUI_SendAccessibilityAsyncEvent(prov, fev, [](int32_t) {});
+            OH_ArkUI_DestoryAccessibilityEventInfo(fev);
+        }
+    }
+    auto sendAnnounce = [&](const std::string &msg) {
+        if (msg.empty()) {
+            return;
+        }
+        ArkUI_AccessibilityEventInfo *aev = OH_ArkUI_CreateAccessibilityEventInfo();
+        if (aev != nullptr) {
+            OH_ArkUI_AccessibilityEventSetEventType(aev, ARKUI_ACCESSIBILITY_NATIVE_EVENT_TYPE_ANNOUNCE_FOR_ACCESSIBILITY);
+            OH_ArkUI_AccessibilityEventSetTextAnnouncedForAccessibility(aev, msg.c_str());
+            OH_ArkUI_SendAccessibilityAsyncEvent(prov, aev, [](int32_t) {});
+            OH_ArkUI_DestoryAccessibilityEventInfo(aev);
+        }
+    };
+    for (const auto &s : alerts) {
+        sendAnnounce(s);
+    }
+    for (const auto &s : anns) {
+        sendAnnounce(s);
+    }
+}
+
 void OnNodeEvent(ArkUI_NodeEvent *event) {
     if (event == nullptr) {
         return;
@@ -2300,6 +3971,12 @@ void OnNodeEvent(ArkUI_NodeEvent *event) {
                      extractMods(ws.get(), ev), code, unicode);
         return;
     }
+    case NODE_ON_DRAG_ENTER:
+    case NODE_ON_DRAG_MOVE:
+    case NODE_ON_DRAG_LEAVE:
+    case NODE_ON_DROP:
+        handleNodeDragEvent(ws.get(), type, event);
+        return;
     default:
         return;
     }
@@ -2736,7 +4413,7 @@ std::vector<std::string> buildEngineEnv(const std::string &pkgRoot) {
             "XDG_CONFIG_HOME=", "XDG_DATA_HOME=", "TMPDIR=",
             "MYGO_OHOS_PKG_ID=", "MYGO_OHOS_PKG_NAME=", "MYGO_OHOS_PKG_VER=",
             "MYGO_OHOS_LANGS=", "MYGO_OHOS_LOCALE=", "MYGO_OHOS_HOUR_CYCLE=",
-            "MYGO_OHOS_FIRST_WEEKDAY=", "MYGO_OHOS_DISPLAYS=",
+            "MYGO_OHOS_FIRST_WEEKDAY=", "MYGO_OHOS_DISPLAYS=", "MYGO_OHOS_TEXT_SCALE=",
         };
         for (const char *k : keys) {
             if (strncmp(entry, k, strlen(k)) == 0) {
@@ -2808,6 +4485,11 @@ std::vector<std::string> buildEngineEnv(const std::string &pkgRoot) {
     }
     if (!ce.displaysSpec.empty()) {
         env.push_back("MYGO_OHOS_DISPLAYS=" + ce.displaysSpec);
+    }
+    if (ce.textScaleMilli > 0) {
+        char tsBuf[32];
+        snprintf(tsBuf, sizeof(tsBuf), "%.3f", static_cast<double>(ce.textScaleMilli) / 1000.0);
+        env.push_back(std::string("MYGO_OHOS_TEXT_SCALE=") + tsBuf);
     }
     env.push_back(std::string("MYGO_OHOS_ON_BATTERY=") + (onBat ? "1" : "0"));
     env.push_back(std::string("MYGO_OHOS_NET_ONLINE=") + (netOn ? "1" : "0"));
@@ -3192,6 +4874,16 @@ void openAudioStream(uint32_t streamId, uint32_t sampleRate, uint32_t channels,
 
 void killEngine() {
     closeAllAudioStreams();
+    clearAllHotkeys();
+    {
+        std::lock_guard<std::mutex> lk(gDragMu);
+        gActiveHostDrag = ActiveHostDrag{};
+    }
+    {
+        std::lock_guard<std::mutex> lk(gDragReplyMu);
+        gDragReplies.clear();
+    }
+    gDragReplyCv.notify_all();
     gNowPlayingActive.store(false, std::memory_order_relaxed);
     gNowPlayingCmds.store(0, std::memory_order_relaxed);
     int fd = -1;
@@ -4123,6 +5815,49 @@ bool pumpEngineMessages() {
             }
             break;
         }
+        case kSecretReq:
+            handleSecretReq(payload);
+            break;
+        case kHotkeyReq:
+            handleHotkeyReq(payload);
+            break;
+        case kTrayUpdate: {
+            if (payload.size() >= 8) {
+                auto ev = std::make_unique<BridgeEvent>();
+                ev->kind = BridgeEventKind::TrayUpdate;
+                auto &tu = ev->trayUpdate;
+                memcpy(&tu.trayId, payload.data() + 0, 4);
+                tu.op = payload[4];
+                uint8_t fl = payload[5];
+                tu.hasImage = (fl & 1) != 0;
+                tu.templateImg = (fl & 2) != 0;
+                tu.hasMenu = (fl & 4) != 0;
+                size_t off = 8;
+                if (readStr(payload, off, &tu.id) &&
+                    readStr(payload, off, &tu.title) &&
+                    readStr(payload, off, &tu.tooltip) &&
+                    readBytes(payload, off, &tu.png) &&
+                    decodePopupSlice(payload, off, &tu.menuItems) &&
+                    off == payload.size()) {
+                    postBridgeEvent(std::move(ev));
+                }
+            }
+            break;
+        }
+        case kDragSetFormats:
+            break; // All drop data types are enabled per-window; filtering happens in Go Offer matching.
+        case kDragStart:
+            handleDragStart(payload);
+            break;
+        case kDragCancel:
+            handleDragCancel(payload);
+            break;
+        case kDragReply:
+            handleDragReply(payload);
+            break;
+        case kAccessTree:
+            handleAccessTree(payload);
+            break;
         default:
             break;
         }
@@ -4344,6 +6079,8 @@ void teardownWindowNode(uint32_t winId, bool eraseSession) {
         detachIME();
     }
     stopWinRenderThread(ws);
+    disposeActiveDragAction(ws.get());
+    detachWindowAccessibility(ws.get(), eraseSession);
 
     if (ws->xcNode != nullptr) {
         gNodeToWinId.erase(ws->xcNode);
@@ -4355,6 +6092,7 @@ void teardownWindowNode(uint32_t winId, bool eraseSession) {
                 NODE_TOUCH_EVENT, NODE_ON_MOUSE, NODE_ON_HOVER_EVENT,
                 NODE_ON_AXIS, NODE_ON_COASTING_AXIS_EVENT, NODE_ON_KEY_EVENT,
                 NODE_ON_FOCUS, NODE_ON_BLUR,
+                NODE_ON_DRAG_ENTER, NODE_ON_DRAG_MOVE, NODE_ON_DRAG_LEAVE, NODE_ON_DROP,
             };
             for (ArkUI_NodeEventType ev : kEvents) {
                 nodeAPI->unregisterNodeEvent(ws->xcNode, ev);
@@ -4491,8 +6229,8 @@ napi_value SetBridgeCallbacks(napi_env env, napi_callback_info info) {
 }
 
 napi_value UpdateEnvInfo(napi_env env, napi_callback_info info) {
-    size_t argc = 8;
-    napi_value argv[8] = {};
+    size_t argc = 9;
+    napi_value argv[9] = {};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 8) {
         return nullptr;
@@ -4505,6 +6243,12 @@ napi_value UpdateEnvInfo(napi_env env, napi_callback_info info) {
     ce.locale = getNapiString(env, argv[3]);
     napi_get_value_int32(env, argv[4], &ce.firstWeekday);
     napi_get_value_int32(env, argv[5], &ce.hourCycle);
+    if (argc >= 9 && argv[8] != nullptr) {
+        double ts = 1.0;
+        if (napi_get_value_double(env, argv[8], &ts) == napi_ok && std::isfinite(ts) && ts > 0.0) {
+            ce.textScaleMilli = static_cast<uint32_t>(std::clamp(std::lround(ts * 1000.0), 250L, 4000L));
+        }
+    }
 
     std::vector<std::string> langs;
     uint32_t langLen = 0;
@@ -4615,6 +6359,10 @@ napi_value UpdateEnvInfo(napi_env env, napi_callback_info info) {
         wire.insert(wire.end(), db, db + 48);
         appendStr(wire, d.label);
     }
+    uint8_t tail[8] = {0};
+    memcpy(tail + 0, &ce.textScaleMilli, 4);
+    tail[4] = 1; // hasPrefs
+    wire.insert(wire.end(), tail, tail + 8);
     ce.wirePayload = wire;
 
     {
@@ -4730,14 +6478,18 @@ napi_value BindWindow(napi_env env, napi_callback_info info) {
     OH_ArkUI_SurfaceHolder_AddSurfaceCallback(ws->surfaceHolder, ws->surfaceCallback);
 
     nodeAPI->addNodeEventReceiver(ws->xcNode, OnNodeEvent);
+    OH_ArkUI_AllowNodeAllDropDataTypes(ws->xcNode);
+    OH_ArkUI_SetDragEventStrictReportWithNode(ws->xcNode, true);
     static const ArkUI_NodeEventType kEvents[] = {
         NODE_TOUCH_EVENT, NODE_ON_MOUSE, NODE_ON_HOVER_EVENT,
         NODE_ON_AXIS, NODE_ON_COASTING_AXIS_EVENT, NODE_ON_KEY_EVENT,
         NODE_ON_FOCUS, NODE_ON_BLUR,
+        NODE_ON_DRAG_ENTER, NODE_ON_DRAG_MOVE, NODE_ON_DRAG_LEAVE, NODE_ON_DROP,
     };
     for (ArkUI_NodeEventType ev : kEvents) {
         nodeAPI->registerNodeEvent(ws->xcNode, ev, static_cast<int32_t>(ev), nullptr);
     }
+    attachWindowAccessibility(ws.get());
 
     OH_ArkUI_NodeContent_AddNode(ws->nodeContent, ws->xcNode);
     if (ws->uiContext != nullptr) {
@@ -5322,6 +7074,26 @@ napi_value ClearWebControllerHandler(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+napi_value NotifyTrayEvent(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) {
+        return nullptr;
+    }
+    uint32_t trayId = 0;
+    int32_t ev = 0, menuItemId = 0;
+    napi_get_value_uint32(env, argv[0], &trayId);
+    napi_get_value_int32(env, argv[1], &ev);
+    napi_get_value_int32(env, argv[2], &menuItemId);
+    uint8_t wire[12] = {0};
+    memcpy(wire + 0, &trayId, 4);
+    wire[4] = static_cast<uint8_t>(ev & 0xFF);
+    memcpy(wire + 8, &menuItemId, 4);
+    sendMessage(kTrayEvent, wire, sizeof(wire), -1);
+    return nullptr;
+}
+
 napi_value SetDarkMode(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1] = {nullptr};
@@ -5372,6 +7144,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"resolveWebAsync", nullptr, ResolveWebAsync, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"notifySchemeReq", nullptr, NotifySchemeReq, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"clearWebControllerHandler", nullptr, ClearWebControllerHandler, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"notifyTrayEvent", nullptr, NotifyTrayEvent, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setDarkMode", nullptr, SetDarkMode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"crash", nullptr, Crash, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
