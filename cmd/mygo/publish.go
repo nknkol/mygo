@@ -63,7 +63,8 @@ func uploads(artifacts []string) (files, manifests []string, err error) {
 				files = append(files, a)
 			}
 		case strings.HasSuffix(name, ".dmg"), strings.HasSuffix(name, ".exe") && strings.Contains(name, installerMark),
-			strings.HasSuffix(name, ".deb"), strings.HasSuffix(name, ".rpm"), strings.HasSuffix(name, ".tar.gz"), strings.HasSuffix(name, ".delta"):
+			strings.HasSuffix(name, ".deb"), strings.HasSuffix(name, ".rpm"), strings.HasSuffix(name, ".tar.gz"), strings.HasSuffix(name, ".delta"),
+			strings.HasSuffix(name, ".hap"):
 			files = append(files, a)
 		}
 	}

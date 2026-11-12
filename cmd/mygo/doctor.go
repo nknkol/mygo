@@ -40,6 +40,13 @@ func runDoctor(args []string) error {
 		major, _ := strconv.Atoi(strings.Split(v, ".")[0])
 		check("macOS", err == nil && major >= 12, v+" (WKWebView; macOS 12 or later is required)")
 	case "linux":
+		if isOhosHost() {
+			libDir := findOhosLibDir()
+			check("pango", libDir != "", or(libDir, "musl Pango libraries not found: set MYGO_OHOS_LIB_DIR or install into ~/.harmonybrew/lib"))
+			hvigor, sdk, _ := findOhosToolchain()
+			check("ohos-sdk", hvigor != "" && sdk != "", or(sdk, "HarmonyOS Command Line Tools not found: set DEVECO_SDK_HOME and add hvigorw to PATH"))
+			break
+		}
 		libs := func(pattern string) string {
 			out, _ := exec.Command("sh", "-c", "ldconfig -p 2>/dev/null | grep -o '"+pattern+"' | sort -u").Output()
 			return strings.TrimSpace(string(out))
@@ -105,6 +112,13 @@ func runDoctor(args []string) error {
 		out, _ := exec.Command("security", "find-identity", "-v", "-p", "codesigning").Output()
 		ids := strings.Count(string(out), "Developer ID Application")
 		optional("codesign", "a Developer ID to sign apps for other Macs", ids > 0, fmt.Sprintf("%d Developer ID identities", ids))
+	}
+	if !isOhosHost() {
+		if hvigor, sdk, _ := findOhosToolchain(); hvigor != "" || sdk != "" {
+			optional("ohos-sdk", "mygo build -platform ohos/arm64", hvigor != "" && sdk != "", hvigor)
+		} else {
+			optional("ohos-sdk", "mygo build -platform ohos/arm64 (DEVECO_SDK_HOME / hvigorw)", false, "")
+		}
 	}
 
 	if !ok {

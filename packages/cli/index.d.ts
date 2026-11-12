@@ -140,6 +140,8 @@ export interface Config {
   windows?: WindowsConfig;
   /** Linux packaging. */
   linux?: LinuxConfig;
+  /** HarmonyOS PC (.hap) packaging. */
+  ohos?: OHOSConfig;
 }
 
 /**
@@ -328,4 +330,20 @@ export interface LinuxDepends {
   rpm?: string[];
   /** Arch Linux packages the app needs besides GTK and WebKitGTK. */
   arch?: string[];
+}
+
+/** HarmonyOS PC (.hap) packaging. */
+export interface OHOSConfig {
+  /** Application publisher in AppScope/app.json5 (default: `publisher`, else the second segment of `identifier`, else `mygo`). */
+  vendor?: string;
+  /** Positive integer versionCode in AppScope/app.json5 (default: derived from `version`). */
+  versionCode?: number;
+  /** Target device form factors in module.json5 (default: `["2in1", "tablet"]`). */
+  deviceTypes?: string[];
+  /** Extra HarmonyOS permission names added to `requestPermissions` in module.json5. */
+  permissions?: string[];
+  /** EntryAbility `backgroundModes` in module.json5 (default: `["audioPlayback"]`). */
+  backgroundModes?: string[];
+  /** Sign the assembled `.hap` with `hda install --keep-signed` (default: `false`). */
+  signWithHda?: boolean;
 }

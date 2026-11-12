@@ -114,6 +114,7 @@ type Config struct {
 	MacOS   MacOS    `json:"macos"`
 	Windows Windows  `json:"windows"`
 	Linux   Linux    `json:"linux"`
+	OHOS    OHOS     `json:"ohos"`
 
 	root string
 	file string // the configuration file, "" without one
@@ -337,6 +338,9 @@ func (c *Config) validate() error {
 		if !slices.Contains(linuxFormats, f) {
 			return fmt.Errorf("linux.formats %q is not a Linux package format, which are %s", f, strings.Join(linuxFormats, ", "))
 		}
+	}
+	if err := c.OHOS.validate(); err != nil {
+		return err
 	}
 	if c.Updates != nil {
 		if err := c.Updates.validate(); err != nil {

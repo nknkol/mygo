@@ -61,8 +61,10 @@ update-<platform>.json: publish them where updates point to.
 
 The platform web (or js/wasm) builds an app of native UI for browsers into
 <out>/web: index.html, which loads the app, Go's wasm_exec.js and the app's
-WebAssembly, named by its content: a static site, to serve from anywhere.`)
-	platforms := flags.String("platform", runtime.GOOS+"/"+runtime.GOARCH, "comma separated GOOS/GOARCH targets, e.g. darwin/universal,linux/amd64,windows/amd64, or web for browsers")
+WebAssembly, named by its content: a static site, to serve from anywhere.
+The platform ohos/arm64 (or ohos) builds a HarmonyOS PC .hap package into
+<out>/ohos-arm64/<slug>-<version>-arm64.hap.`)
+	platforms := flags.String("platform", runtime.GOOS+"/"+runtime.GOARCH, "comma separated GOOS/GOARCH targets, e.g. darwin/universal,linux/amd64,windows/amd64,ohos/arm64, or web for browsers")
 	debug := flags.Bool("debug", false, "keep development features such as the web inspector")
 	skipBuildCommand := flags.Bool("skip-build-command", false, "do not run buildCommand")
 	skipDMG := flags.Bool("skip-dmg", false, "do not create a disk image for macOS")
@@ -157,6 +159,14 @@ WebAssembly, named by its content: a static site, to serve from anywhere.`)
 			}
 			continue
 		}
+		if isOhosPlatform(p) {
+			paths, err := buildOhos(c, ohosArch(p), opts)
+			built = append(built, paths...)
+			if err != nil {
+				return err
+			}
+			continue
+		}
 		goos, goarch, _ := strings.Cut(p, "/")
 		paths, err := buildPlatform(c, goos, goarch, opts)
 		built = append(built, paths...)
@@ -188,7 +198,7 @@ func buildPlatforms(raw string) ([]string, error) {
 		return nil, fmt.Errorf("-platform requires at least one target")
 	}
 	for _, p := range targets {
-		if isWebPlatform(p) {
+		if isWebPlatform(p) || p == "ohos" {
 			continue
 		}
 		goos, goarch, ok := strings.Cut(p, "/")
@@ -197,8 +207,12 @@ func buildPlatforms(raw string) ([]string, error) {
 		}
 		switch goos {
 		case "darwin", "linux", "windows":
+		case "ohos":
+			if goarch != "arm64" {
+				return nil, fmt.Errorf("unsupported build platform %q: HarmonyOS supports ohos/arm64", p)
+			}
 		default:
-			return nil, fmt.Errorf("unsupported build platform %q: use darwin, linux, windows or web", p)
+			return nil, fmt.Errorf("unsupported build platform %q: use darwin, linux, windows, ohos/arm64 or web", p)
 		}
 	}
 	return targets, nil

@@ -37,7 +37,7 @@ const bundleCatalog = "Assets.car"
 // Platform directories are named after a system MyGo builds apps for,
 // alone or with an architecture: darwin, linux-arm64, windows-amd64.
 var (
-	platformOS   = []string{"darwin", "linux", "windows"}
+	platformOS   = []string{"darwin", "linux", "windows", "ohos"}
 	platformArch = []string{"386", "amd64", "arm", "arm64", "loong64", "mips", "mips64", "mips64le", "mipsle", "ppc64", "ppc64le", "riscv64", "s390x"}
 )
 
@@ -60,7 +60,7 @@ func platformDir(name string) (goos, goarch string, ok bool) {
 // What other tools call systems and architectures, to catch platform
 // directories named like theirs, which would ship to every platform.
 var (
-	osAliases   = map[string]string{"darwin": "darwin", "macos": "darwin", "mac": "darwin", "osx": "darwin", "linux": "linux", "windows": "windows", "win": "windows", "win32": "windows", "win64": "windows"}
+	osAliases   = map[string]string{"darwin": "darwin", "macos": "darwin", "mac": "darwin", "osx": "darwin", "linux": "linux", "windows": "windows", "win": "windows", "win32": "windows", "win64": "windows", "ohos": "ohos", "harmonyos": "ohos", "openharmony": "ohos"}
 	archAliases = map[string]string{"x64": "amd64", "x86_64": "amd64", "aarch64": "arm64", "x86": "386", "ia32": "386", "i386": "386", "i686": "386"}
 )
 
@@ -72,7 +72,7 @@ func platformDirTypo(name string) string {
 		return lower // Linux, Darwin-ARM64
 	}
 	switch lower {
-	case "macos", "osx", "win32", "win64":
+	case "macos", "osx", "win32", "win64", "harmonyos", "openharmony":
 		return osAliases[lower]
 	}
 	sys, arch, _ := strings.Cut(lower, "-")
@@ -645,6 +645,8 @@ func reservedNames(c *Config, goos string) []string {
 		return []string{bundleIcon}
 	case "windows":
 		return []string{c.executableName() + ".exe", installPS1Name}
+	case "ohos":
+		return []string{"mygo-engine"}
 	}
 	name := c.slug()
 	return []string{name, name + ".desktop", name + ".png", name + ".xml", installScriptName}
