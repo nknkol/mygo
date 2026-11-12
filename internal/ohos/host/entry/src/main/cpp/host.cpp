@@ -116,10 +116,19 @@ constexpr uint8_t kNotifRemove = 37; // engine -> host: remove notification(s)
 constexpr uint8_t kPowerReq    = 38; // engine -> host: aggregate wake/background lock request
 constexpr uint8_t kNetWatch    = 39; // engine -> host: start reporting network changes
 
-constexpr uint8_t kCookieReq    = 40; // engine -> host: cookie/data-store request
-constexpr uint8_t kCookieResult = 41; // host -> engine: cookie/data-store result
-constexpr uint8_t kWebReq       = 42; // engine -> host: standalone ArkWeb command
-constexpr uint8_t kWebEvent     = 43; // host -> engine: standalone ArkWeb navigation/title/error event
+constexpr uint8_t kCookieReq       = 40; // engine -> host: cookie/data-store request
+constexpr uint8_t kCookieResult    = 41; // host -> engine: cookie/data-store result
+constexpr uint8_t kWebReq          = 42; // engine -> host: standalone/embedded ArkWeb command
+constexpr uint8_t kWebEvent        = 43; // host -> engine: ArkWeb event
+constexpr uint8_t kWebSetup        = 44; // engine -> host: configure standalone or embedded ArkWeb
+constexpr uint8_t kPlaceWebViews   = 45; // engine -> host: position embedded WebViews & surface hit regions
+constexpr uint8_t kWebAsyncReq     = 46; // engine -> host: CallAsyncFunction / CapturePage / PrintToPDF
+constexpr uint8_t kWebAsyncRes     = 47; // host -> engine: async WebView result
+constexpr uint8_t kSchemeReq       = 48; // host -> engine: custom protocol request / cancel
+constexpr uint8_t kSchemeRes       = 49; // engine -> host: custom protocol response head/body/finish/fail
+
+constexpr uint8_t kWinActEnableWebLayer = 17;
+constexpr uint8_t kWinActFocusSurface   = 18;
 
 constexpr uint32_t kMediaPause = 1u << 1;
 
@@ -459,6 +468,7 @@ struct WinSession {
 
     // Cursor & input latency atomics.
     std::atomic<uint8_t> desiredCursor{0};
+    std::atomic<bool> webLayerEnabled{false};
     std::atomic<int64_t> lastInputNs{0};
     std::atomic<bool> inputSincePresent{false};
 
@@ -534,6 +544,10 @@ enum class BridgeEventKind {
     NetWatch,
     CookieReq,
     WebReq,
+    WebSetup,
+    PlaceWebViews,
+    WebAsyncReq,
+    SchemeRes,
     FirstFrame,
     EngineQuit,
     EngineRestart,
@@ -643,6 +657,70 @@ struct CookieReqData {
     std::string path;
 };
 
+struct UserScriptData {
+    std::string source;
+    bool atDocEnd = false;
+    bool allFrames = false;
+};
+
+struct WebSetupData {
+    uint32_t webId = 0;
+    uint32_t hostWinId = 0;
+    uint32_t flags = 0;
+    uint32_t bgRGBA = 0;
+    double zoom = 1.0;
+    std::string ua;
+    std::vector<std::string> schemes;
+    std::vector<UserScriptData> scripts;
+};
+
+struct PlacedWebViewData {
+    uint32_t webId = 0;
+    float frameX = 0, frameY = 0, frameW = 0, frameH = 0;
+    float clipX = 0, clipY = 0, clipW = 0, clipH = 0;
+    float pageW = 0, pageH = 0;
+    float r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+};
+
+struct SurfaceRegionData {
+    float x = 0, y = 0, w = 0, h = 0;
+};
+
+struct PlaceWebViewsData {
+    uint32_t winId = 0;
+    std::vector<PlacedWebViewData> views;
+    std::vector<SurfaceRegionData> surfaceRegions;
+};
+
+struct WebAsyncReqData {
+    uint32_t reqId = 0;
+    uint32_t webId = 0;
+    uint8_t op = 0;
+    bool landscape = false;
+    bool background = false;
+    double pageWidth = 0;
+    double pageHeight = 0;
+    double marginTop = 0;
+    double marginRight = 0;
+    double marginBottom = 0;
+    double marginLeft = 0;
+    std::string body;
+};
+
+struct SchemeHeaderData {
+    std::string name;
+    std::string headerValue;
+};
+
+struct SchemeResData {
+    uint32_t reqId = 0;
+    uint8_t op = 0;
+    int32_t status = 0;
+    std::vector<SchemeHeaderData> headers;
+    std::vector<uint8_t> chunk;
+    std::string err;
+};
+
 struct BridgeEvent {
     BridgeEventKind kind = BridgeEventKind::WinAction;
     WinConfigData winCfg;
@@ -669,6 +747,10 @@ struct BridgeEvent {
     uint8_t webOp = 0;
     std::string webArg1;
     std::string webArg2;
+    WebSetupData webSetup;
+    PlaceWebViewsData placeWebViews;
+    WebAsyncReqData webAsyncReq;
+    SchemeResData schemeRes;
 };
 
 std::mutex gBridgeMu;
@@ -1039,6 +1121,172 @@ void BridgeCallJs(napi_env env, napi_value, void *, void *data) {
         callBridgeMethod(env, cbObj, "onWebReq", 4, args);
         break;
     }
+    case BridgeEventKind::WebSetup: {
+        const auto &ws = ev->webSetup;
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_value vWeb = nullptr, vHost = nullptr, vFlags = nullptr, vBg = nullptr, vZoom = nullptr, vUa = nullptr;
+        napi_create_uint32(env, ws.webId, &vWeb);
+        napi_create_uint32(env, ws.hostWinId, &vHost);
+        napi_create_uint32(env, ws.flags, &vFlags);
+        napi_create_uint32(env, ws.bgRGBA, &vBg);
+        napi_create_double(env, ws.zoom, &vZoom);
+        napi_create_string_utf8(env, ws.ua.c_str(), ws.ua.size(), &vUa);
+        napi_set_named_property(env, obj, "webId", vWeb);
+        napi_set_named_property(env, obj, "hostWinId", vHost);
+        napi_set_named_property(env, obj, "flags", vFlags);
+        napi_set_named_property(env, obj, "bgRGBA", vBg);
+        napi_set_named_property(env, obj, "zoom", vZoom);
+        napi_set_named_property(env, obj, "ua", vUa);
+
+        napi_value scArr = nullptr;
+        napi_create_array_with_length(env, ws.schemes.size(), &scArr);
+        for (size_t i = 0; i < ws.schemes.size(); ++i) {
+            napi_value sv = nullptr;
+            napi_create_string_utf8(env, ws.schemes[i].c_str(), ws.schemes[i].size(), &sv);
+            napi_set_element(env, scArr, static_cast<uint32_t>(i), sv);
+        }
+        napi_set_named_property(env, obj, "schemes", scArr);
+
+        napi_value usArr = nullptr;
+        napi_create_array_with_length(env, ws.scripts.size(), &usArr);
+        for (size_t i = 0; i < ws.scripts.size(); ++i) {
+            napi_value uo = nullptr, vSrc = nullptr, vEnd = nullptr, vAll = nullptr;
+            napi_create_object(env, &uo);
+            napi_create_string_utf8(env, ws.scripts[i].source.c_str(), ws.scripts[i].source.size(), &vSrc);
+            napi_get_boolean(env, ws.scripts[i].atDocEnd, &vEnd);
+            napi_get_boolean(env, ws.scripts[i].allFrames, &vAll);
+            napi_set_named_property(env, uo, "source", vSrc);
+            napi_set_named_property(env, uo, "atDocEnd", vEnd);
+            napi_set_named_property(env, uo, "allFrames", vAll);
+            napi_set_element(env, usArr, static_cast<uint32_t>(i), uo);
+        }
+        napi_set_named_property(env, obj, "scripts", usArr);
+        callBridgeMethod(env, cbObj, "onWebSetup", 1, &obj);
+        break;
+    }
+    case BridgeEventKind::PlaceWebViews: {
+        const auto &pw = ev->placeWebViews;
+        napi_value obj = nullptr, vWin = nullptr, vArr = nullptr, rArr = nullptr;
+        napi_create_object(env, &obj);
+        napi_create_uint32(env, pw.winId, &vWin);
+        napi_set_named_property(env, obj, "winId", vWin);
+
+        napi_create_array_with_length(env, pw.views.size(), &vArr);
+        for (size_t i = 0; i < pw.views.size(); ++i) {
+            const auto &it = pw.views[i];
+            napi_value vo = nullptr;
+            napi_create_object(env, &vo);
+            auto setNum = [&](const char *k, double d) {
+                napi_value nv = nullptr;
+                napi_create_double(env, d, &nv);
+                napi_set_named_property(env, vo, k, nv);
+            };
+            napi_value vWid = nullptr;
+            napi_create_uint32(env, it.webId, &vWid);
+            napi_set_named_property(env, vo, "webId", vWid);
+            setNum("frameX", it.frameX);
+            setNum("frameY", it.frameY);
+            setNum("frameW", it.frameW);
+            setNum("frameH", it.frameH);
+            setNum("clipX", it.clipX);
+            setNum("clipY", it.clipY);
+            setNum("clipW", it.clipW);
+            setNum("clipH", it.clipH);
+            setNum("pageW", it.pageW);
+            setNum("pageH", it.pageH);
+            setNum("r0", it.r0);
+            setNum("r1", it.r1);
+            setNum("r2", it.r2);
+            setNum("r3", it.r3);
+            napi_set_element(env, vArr, static_cast<uint32_t>(i), vo);
+        }
+        napi_set_named_property(env, obj, "views", vArr);
+
+        napi_create_array_with_length(env, pw.surfaceRegions.size(), &rArr);
+        for (size_t i = 0; i < pw.surfaceRegions.size(); ++i) {
+            const auto &rg = pw.surfaceRegions[i];
+            napi_value ro = nullptr, vx = nullptr, vy = nullptr, vw = nullptr, vh = nullptr;
+            napi_create_object(env, &ro);
+            napi_create_double(env, rg.x, &vx);
+            napi_create_double(env, rg.y, &vy);
+            napi_create_double(env, rg.w, &vw);
+            napi_create_double(env, rg.h, &vh);
+            napi_set_named_property(env, ro, "x", vx);
+            napi_set_named_property(env, ro, "y", vy);
+            napi_set_named_property(env, ro, "w", vw);
+            napi_set_named_property(env, ro, "h", vh);
+            napi_set_element(env, rArr, static_cast<uint32_t>(i), ro);
+        }
+        napi_set_named_property(env, obj, "surfaceRegions", rArr);
+        callBridgeMethod(env, cbObj, "onPlaceWebViews", 1, &obj);
+        break;
+    }
+    case BridgeEventKind::WebAsyncReq: {
+        const auto &ar = ev->webAsyncReq;
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        auto setNum = [&](const char *k, double d) {
+            napi_value nv = nullptr;
+            napi_create_double(env, d, &nv);
+            napi_set_named_property(env, obj, k, nv);
+        };
+        napi_value vReq = nullptr, vWeb = nullptr, vOp = nullptr, vLand = nullptr, vBg = nullptr, vBody = nullptr;
+        napi_create_uint32(env, ar.reqId, &vReq);
+        napi_create_uint32(env, ar.webId, &vWeb);
+        napi_create_uint32(env, ar.op, &vOp);
+        napi_get_boolean(env, ar.landscape, &vLand);
+        napi_get_boolean(env, ar.background, &vBg);
+        napi_create_string_utf8(env, ar.body.c_str(), ar.body.size(), &vBody);
+        napi_set_named_property(env, obj, "reqId", vReq);
+        napi_set_named_property(env, obj, "webId", vWeb);
+        napi_set_named_property(env, obj, "op", vOp);
+        napi_set_named_property(env, obj, "landscape", vLand);
+        napi_set_named_property(env, obj, "background", vBg);
+        setNum("pageWidth", ar.pageWidth);
+        setNum("pageHeight", ar.pageHeight);
+        setNum("marginTop", ar.marginTop);
+        setNum("marginRight", ar.marginRight);
+        setNum("marginBottom", ar.marginBottom);
+        setNum("marginLeft", ar.marginLeft);
+        napi_set_named_property(env, obj, "body", vBody);
+        callBridgeMethod(env, cbObj, "onWebAsyncReq", 1, &obj);
+        break;
+    }
+    case BridgeEventKind::SchemeRes: {
+        const auto &sr = ev->schemeRes;
+        napi_value obj = nullptr, vReq = nullptr, vOp = nullptr, vSt = nullptr, hArr = nullptr, vChunk = nullptr, vErr = nullptr;
+        napi_create_object(env, &obj);
+        napi_create_uint32(env, sr.reqId, &vReq);
+        napi_create_uint32(env, sr.op, &vOp);
+        napi_create_int32(env, sr.status, &vSt);
+        napi_create_string_utf8(env, sr.err.c_str(), sr.err.size(), &vErr);
+        napi_set_named_property(env, obj, "reqId", vReq);
+        napi_set_named_property(env, obj, "op", vOp);
+        napi_set_named_property(env, obj, "status", vSt);
+        napi_set_named_property(env, obj, "err", vErr);
+
+        napi_create_array_with_length(env, sr.headers.size(), &hArr);
+        for (size_t i = 0; i < sr.headers.size(); ++i) {
+            napi_value ho = nullptr, vk = nullptr, vv = nullptr;
+            napi_create_object(env, &ho);
+            napi_create_string_utf8(env, sr.headers[i].name.c_str(), sr.headers[i].name.size(), &vk);
+            napi_create_string_utf8(env, sr.headers[i].headerValue.c_str(), sr.headers[i].headerValue.size(), &vv);
+            napi_set_named_property(env, ho, "name", vk);
+            napi_set_named_property(env, ho, "headerValue", vv);
+            napi_set_element(env, hArr, static_cast<uint32_t>(i), ho);
+        }
+        napi_set_named_property(env, obj, "headers", hArr);
+
+        void *abPtr = nullptr;
+        napi_create_arraybuffer(env, sr.chunk.size(), &abPtr, &vChunk);
+        if (abPtr != nullptr && !sr.chunk.empty()) {
+            memcpy(abPtr, sr.chunk.data(), sr.chunk.size());
+        }
+        napi_set_named_property(env, obj, "chunk", vChunk);
+        callBridgeMethod(env, cbObj, "onSchemeRes", 1, &obj);
+        break;
+    }
     case BridgeEventKind::FirstFrame: {
         napi_value arg = nullptr;
         napi_create_uint32(env, ev->winId, &arg);
@@ -1370,6 +1618,33 @@ void applyCursorOnUI(void *userData) {
         if (res == INPUT_SUCCESS) {
             ws->appliedPointerStyle = style;
         }
+    }
+}
+
+void enableWebLayerOnUI(void *userData) {
+    uint32_t winId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(userData));
+    auto ws = findSession(winId);
+    if (!ws || ws->xcNode == nullptr || nodeAPI == nullptr) {
+        return;
+    }
+    ArkUI_NumberValue bgVal[] = {{.u32 = 0x00000000u}};
+    ArkUI_AttributeItem bgItem = {bgVal, 1, nullptr, nullptr};
+    nodeAPI->setAttribute(ws->xcNode, NODE_BACKGROUND_COLOR, &bgItem);
+    if (ws->surfaceHolder != nullptr) {
+        ArkUI_XComponentSurfaceConfig *cfg = OH_ArkUI_XComponentSurfaceConfig_Create();
+        if (cfg != nullptr) {
+            OH_ArkUI_XComponentSurfaceConfig_SetIsOpaque(cfg, false);
+            OH_ArkUI_SurfaceHolder_SetSurfaceConfig(ws->surfaceHolder, cfg);
+            OH_ArkUI_XComponentSurfaceConfig_Dispose(cfg);
+        }
+    }
+}
+
+void focusSurfaceOnUI(void *userData) {
+    uint32_t winId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(userData));
+    auto ws = findSession(winId);
+    if (ws && ws->xcNode != nullptr) {
+        OH_ArkUI_FocusRequest(ws->xcNode);
     }
 }
 
@@ -3493,10 +3768,32 @@ bool pumpEngineMessages() {
         }
         case kWinAction: {
             if (payload.size() >= 5) {
+                uint32_t wid = 0;
+                memcpy(&wid, payload.data() + 0, 4);
+                uint8_t act = payload[4];
+                if (act == kWinActEnableWebLayer) {
+                    auto ws = getOrCreateSession(wid > 0 ? wid : 1);
+                    ws->webLayerEnabled.store(true, std::memory_order_relaxed);
+                    if (ws->uiContext != nullptr) {
+                        OH_ArkUI_PostUITask(ws->uiContext,
+                                            reinterpret_cast<void *>(static_cast<uintptr_t>(ws->winId)),
+                                            enableWebLayerOnUI);
+                    }
+                    break;
+                }
+                if (act == kWinActFocusSurface) {
+                    auto ws = findSession(wid > 0 ? wid : 1);
+                    if (ws && ws->uiContext != nullptr) {
+                        OH_ArkUI_PostUITask(ws->uiContext,
+                                            reinterpret_cast<void *>(static_cast<uintptr_t>(ws->winId)),
+                                            focusSurfaceOnUI);
+                    }
+                    break;
+                }
                 auto ev = std::make_unique<BridgeEvent>();
                 ev->kind = BridgeEventKind::WinAction;
-                memcpy(&ev->winId, payload.data() + 0, 4);
-                ev->action = payload[4];
+                ev->winId = wid;
+                ev->action = act;
                 postBridgeEvent(std::move(ev));
             }
             break;
@@ -3680,6 +3977,147 @@ bool pumpEngineMessages() {
                 if (readStr(payload, off, &ev->webArg1) &&
                     readStr(payload, off, &ev->webArg2) &&
                     off == payload.size()) {
+                    postBridgeEvent(std::move(ev));
+                }
+            }
+            break;
+        }
+        case kWebSetup: {
+            if (payload.size() >= 24) {
+                auto ev = std::make_unique<BridgeEvent>();
+                ev->kind = BridgeEventKind::WebSetup;
+                auto &ws = ev->webSetup;
+                memcpy(&ws.webId, payload.data() + 0, 4);
+                memcpy(&ws.hostWinId, payload.data() + 4, 4);
+                memcpy(&ws.flags, payload.data() + 8, 4);
+                memcpy(&ws.bgRGBA, payload.data() + 12, 4);
+                memcpy(&ws.zoom, payload.data() + 16, 8);
+                size_t off = 24;
+                uint32_t scCount = 0, usCount = 0;
+                bool ok = readStr(payload, off, &ws.ua) && readU32(payload, off, &scCount) && scCount <= 64;
+                for (uint32_t i = 0; ok && i < scCount; ++i) {
+                    std::string sc;
+                    if (!readStr(payload, off, &sc)) {
+                        ok = false;
+                        break;
+                    }
+                    ws.schemes.push_back(std::move(sc));
+                }
+                if (ok) {
+                    ok = readU32(payload, off, &usCount) && usCount <= 256;
+                }
+                for (uint32_t i = 0; ok && i < usCount; ++i) {
+                    if (off + 4 > payload.size()) {
+                        ok = false;
+                        break;
+                    }
+                    uint8_t sf = payload[off];
+                    off += 4;
+                    UserScriptData ud;
+                    ud.atDocEnd = (sf & 1) != 0;
+                    ud.allFrames = (sf & 2) != 0;
+                    if (!readStr(payload, off, &ud.source)) {
+                        ok = false;
+                        break;
+                    }
+                    ws.scripts.push_back(std::move(ud));
+                }
+                if (ok && off == payload.size()) {
+                    postBridgeEvent(std::move(ev));
+                }
+            }
+            break;
+        }
+        case kPlaceWebViews: {
+            if (payload.size() >= 12) {
+                uint32_t wid = 0, vc = 0, rc = 0;
+                memcpy(&wid, payload.data() + 0, 4);
+                memcpy(&vc, payload.data() + 4, 4);
+                memcpy(&rc, payload.data() + 8, 4);
+                if (vc <= 1024 && rc <= 8192 && 12u + vc * 60u + rc * 16u == payload.size()) {
+                    auto ev = std::make_unique<BridgeEvent>();
+                    ev->kind = BridgeEventKind::PlaceWebViews;
+                    auto &pw = ev->placeWebViews;
+                    pw.winId = wid;
+                    pw.views.resize(vc);
+                    pw.surfaceRegions.resize(rc);
+                    size_t off = 12;
+                    for (uint32_t i = 0; i < vc; ++i) {
+                        auto &v = pw.views[i];
+                        memcpy(&v.webId, payload.data() + off + 0, 4);
+                        memcpy(&v.frameX, payload.data() + off + 4, 4);
+                        memcpy(&v.frameY, payload.data() + off + 8, 4);
+                        memcpy(&v.frameW, payload.data() + off + 12, 4);
+                        memcpy(&v.frameH, payload.data() + off + 16, 4);
+                        memcpy(&v.clipX, payload.data() + off + 20, 4);
+                        memcpy(&v.clipY, payload.data() + off + 24, 4);
+                        memcpy(&v.clipW, payload.data() + off + 28, 4);
+                        memcpy(&v.clipH, payload.data() + off + 32, 4);
+                        memcpy(&v.pageW, payload.data() + off + 36, 4);
+                        memcpy(&v.pageH, payload.data() + off + 40, 4);
+                        memcpy(&v.r0, payload.data() + off + 44, 4);
+                        memcpy(&v.r1, payload.data() + off + 48, 4);
+                        memcpy(&v.r2, payload.data() + off + 52, 4);
+                        memcpy(&v.r3, payload.data() + off + 56, 4);
+                        off += 60;
+                    }
+                    for (uint32_t i = 0; i < rc; ++i) {
+                        auto &r = pw.surfaceRegions[i];
+                        memcpy(&r.x, payload.data() + off + 0, 4);
+                        memcpy(&r.y, payload.data() + off + 4, 4);
+                        memcpy(&r.w, payload.data() + off + 8, 4);
+                        memcpy(&r.h, payload.data() + off + 12, 4);
+                        off += 16;
+                    }
+                    postBridgeEvent(std::move(ev));
+                }
+            }
+            break;
+        }
+        case kWebAsyncReq: {
+            if (payload.size() >= 60) {
+                auto ev = std::make_unique<BridgeEvent>();
+                ev->kind = BridgeEventKind::WebAsyncReq;
+                auto &ar = ev->webAsyncReq;
+                memcpy(&ar.reqId, payload.data() + 0, 4);
+                memcpy(&ar.webId, payload.data() + 4, 4);
+                ar.op = payload[8];
+                uint8_t pflags = payload[9];
+                ar.landscape = (pflags & 1) != 0;
+                ar.background = (pflags & 2) != 0;
+                memcpy(&ar.pageWidth, payload.data() + 12, 8);
+                memcpy(&ar.pageHeight, payload.data() + 20, 8);
+                memcpy(&ar.marginTop, payload.data() + 28, 8);
+                memcpy(&ar.marginRight, payload.data() + 36, 8);
+                memcpy(&ar.marginBottom, payload.data() + 44, 8);
+                memcpy(&ar.marginLeft, payload.data() + 52, 8);
+                size_t off = 60;
+                if (readStr(payload, off, &ar.body) && off == payload.size()) {
+                    postBridgeEvent(std::move(ev));
+                }
+            }
+            break;
+        }
+        case kSchemeRes: {
+            if (payload.size() >= 12) {
+                auto ev = std::make_unique<BridgeEvent>();
+                ev->kind = BridgeEventKind::SchemeRes;
+                auto &sr = ev->schemeRes;
+                memcpy(&sr.reqId, payload.data() + 0, 4);
+                sr.op = payload[4];
+                memcpy(&sr.status, payload.data() + 8, 4);
+                size_t off = 12;
+                uint32_t hc = 0;
+                bool ok = readU32(payload, off, &hc) && hc <= 512;
+                for (uint32_t i = 0; ok && i < hc; ++i) {
+                    SchemeHeaderData hd;
+                    if (!readStr(payload, off, &hd.name) || !readStr(payload, off, &hd.headerValue)) {
+                        ok = false;
+                        break;
+                    }
+                    sr.headers.push_back(std::move(hd));
+                }
+                if (ok && readBytes(payload, off, &sr.chunk) && readStr(payload, off, &sr.err) && off == payload.size()) {
                     postBridgeEvent(std::move(ev));
                 }
             }
@@ -4255,7 +4693,8 @@ napi_value BindWindow(napi_env env, napi_callback_info info) {
     nodeAPI->setAttribute(ws->xcNode, NODE_WIDTH_PERCENT, &pctItem);
     nodeAPI->setAttribute(ws->xcNode, NODE_HEIGHT_PERCENT, &pctItem);
 
-    ArkUI_NumberValue bgVal[] = {{.u32 = bgARGB}};
+    const bool layered = ws->webLayerEnabled.load(std::memory_order_relaxed);
+    ArkUI_NumberValue bgVal[] = {{.u32 = layered ? 0x00000000u : bgARGB}};
     ArkUI_AttributeItem bgItem = {bgVal, 1, nullptr, nullptr};
     nodeAPI->setAttribute(ws->xcNode, NODE_BACKGROUND_COLOR, &bgItem);
 
@@ -4275,7 +4714,7 @@ napi_value BindWindow(napi_env env, napi_callback_info info) {
 
     ArkUI_XComponentSurfaceConfig *cfg = OH_ArkUI_XComponentSurfaceConfig_Create();
     if (cfg != nullptr) {
-        OH_ArkUI_XComponentSurfaceConfig_SetIsOpaque(cfg, true);
+        OH_ArkUI_XComponentSurfaceConfig_SetIsOpaque(cfg, !layered);
         OH_ArkUI_SurfaceHolder_SetSurfaceConfig(ws->surfaceHolder, cfg);
         OH_ArkUI_XComponentSurfaceConfig_Dispose(cfg);
     }
@@ -4778,6 +5217,111 @@ napi_value NotifyWebEvent(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+napi_value ResolveWebAsync(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return nullptr;
+    }
+    uint32_t reqId = 0;
+    napi_get_value_uint32(env, argv[0], &reqId);
+    std::string text = getNapiString(env, argv[1]);
+    std::string errStr = getNapiString(env, argv[2]);
+    const uint8_t *ptr = nullptr;
+    size_t byteLen = 0;
+    bool isAb = false;
+    if (napi_is_arraybuffer(env, argv[3], &isAb) == napi_ok && isAb) {
+        void *raw = nullptr;
+        if (napi_get_arraybuffer_info(env, argv[3], &raw, &byteLen) == napi_ok) {
+            ptr = static_cast<const uint8_t *>(raw);
+        }
+    }
+
+    std::vector<uint8_t> wire;
+    appendU32(wire, reqId);
+    appendStr(wire, text);
+    appendStr(wire, errStr);
+    appendBytes(wire, ptr, byteLen);
+    sendMessage(kWebAsyncRes, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+    return nullptr;
+}
+
+napi_value NotifySchemeReq(napi_env env, napi_callback_info info) {
+    size_t argc = 7;
+    napi_value argv[7] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 7) {
+        return nullptr;
+    }
+    uint32_t reqId = 0, webId = 0;
+    bool cancel = false;
+    napi_get_value_uint32(env, argv[0], &reqId);
+    napi_get_value_uint32(env, argv[1], &webId);
+    napi_get_value_bool(env, argv[2], &cancel);
+    std::string method = getNapiString(env, argv[3]);
+    std::string url = getNapiString(env, argv[4]);
+
+    std::vector<SchemeHeaderData> hdrs;
+    uint32_t arrLen = 0;
+    if (napi_get_array_length(env, argv[5], &arrLen) == napi_ok) {
+        for (uint32_t i = 0; i < arrLen && i < 512; ++i) {
+            napi_value obj = nullptr;
+            if (napi_get_element(env, argv[5], i, &obj) != napi_ok || obj == nullptr) {
+                continue;
+            }
+            SchemeHeaderData hd;
+            hd.name = getPropString(env, obj, "name");
+            hd.headerValue = getPropString(env, obj, "headerValue");
+            if (!hd.name.empty()) {
+                hdrs.push_back(std::move(hd));
+            }
+        }
+    }
+
+    const uint8_t *bodyPtr = nullptr;
+    size_t bodyLen = 0;
+    bool isAb = false;
+    if (napi_is_arraybuffer(env, argv[6], &isAb) == napi_ok && isAb) {
+        void *raw = nullptr;
+        if (napi_get_arraybuffer_info(env, argv[6], &raw, &bodyLen) == napi_ok) {
+            bodyPtr = static_cast<const uint8_t *>(raw);
+        }
+    }
+
+    std::vector<uint8_t> wire(12, 0);
+    memcpy(wire.data() + 0, &reqId, 4);
+    memcpy(wire.data() + 4, &webId, 4);
+    wire[8] = cancel ? 1 : 0;
+    appendStr(wire, method);
+    appendStr(wire, url);
+    appendU32(wire, static_cast<uint32_t>(hdrs.size()));
+    for (const auto &h : hdrs) {
+        appendStr(wire, h.name);
+        appendStr(wire, h.headerValue);
+    }
+    appendBytes(wire, bodyPtr, bodyLen);
+    sendMessage(kSchemeReq, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+    return nullptr;
+}
+
+napi_value ClearWebControllerHandler(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1 || argv[0] == nullptr) {
+        return nullptr;
+    }
+    napi_value fn = nullptr;
+    if (napi_get_named_property(env, argv[0], "setWebController", &fn) != napi_ok || fn == nullptr) {
+        return nullptr;
+    }
+    napi_value nullVal = nullptr;
+    napi_get_null(env, &nullVal);
+    napi_call_function(env, argv[0], fn, 1, &nullVal, nullptr);
+    return nullptr;
+}
+
 napi_value SetDarkMode(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1] = {nullptr};
@@ -4825,6 +5369,9 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"notifyNetState", nullptr, NotifyNetState, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"resolveCookie", nullptr, ResolveCookie, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"notifyWebEvent", nullptr, NotifyWebEvent, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"resolveWebAsync", nullptr, ResolveWebAsync, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"notifySchemeReq", nullptr, NotifySchemeReq, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"clearWebControllerHandler", nullptr, ClearWebControllerHandler, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setDarkMode", nullptr, SetDarkMode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"crash", nullptr, Crash, nullptr, nullptr, nullptr, napi_default, nullptr},
     };

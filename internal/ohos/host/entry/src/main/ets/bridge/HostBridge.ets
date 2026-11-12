@@ -11,7 +11,15 @@ import host, {
   HostMessageBox,
   HostNotifShow,
   HostNowPlaying,
+  HostPlaceWebViews,
+  HostPlacedWebView,
   HostPowerReq,
+  HostSchemeHeader,
+  HostSchemeRes,
+  HostSurfaceRegion,
+  HostUserScript,
+  HostWebAsyncReq,
+  HostWebSetup,
   HostWinConfig
 } from 'libmygo_host.so';
 import { Permissions, Want, WantAgent, abilityAccessCtrl, bundleManager, common, wantAgent } from '@kit.AbilityKit';
@@ -19,7 +27,7 @@ import { avSession } from '@kit.AVSessionKit';
 import { preferences } from '@kit.ArkData';
 import { util } from '@kit.ArkTS';
 import { display, window } from '@kit.ArkUI';
-import { webview } from '@kit.ArkWeb';
+import { WebNetErrorList, webview } from '@kit.ArkWeb';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { BusinessError, batteryInfo, commonEventManager, pasteboard } from '@kit.BasicServicesKit';
 import { fileIo, fileShare, fileUri, picker } from '@kit.CoreFileKit';
@@ -128,7 +136,50 @@ export const WEB_OP_BACK: number = 5;
 export const WEB_OP_FORWARD: number = 6;
 export const WEB_OP_EVAL: number = 7;
 export const WEB_OP_SET_UA: number = 8;
+export const WEB_OP_SET_ZOOM: number = 9;
+export const WEB_OP_SET_MUTED: number = 10;
+export const WEB_OP_DEVTOOLS: number = 11;
+export const WEB_OP_FOCUS: number = 12;
+export const WEB_OP_TAB_INTO: number = 13;
+export const WEB_OP_SET_BG: number = 14;
+export const WEB_OP_DESTROY: number = 15;
+export const WEB_OP_PERM_REPLY: number = 16;
 export const WEB_OP_CLEAR_CACHE: number = 99;
+
+export const WEB_EV_PAGE_BEGIN: number = 1;
+export const WEB_EV_PAGE_END: number = 2;
+export const WEB_EV_TITLE: number = 3;
+export const WEB_EV_ERROR: number = 4;
+export const WEB_EV_MESSAGE: number = 5;
+export const WEB_EV_AUDIO_STATE: number = 6;
+export const WEB_EV_WINDOW_NEW: number = 7;
+export const WEB_EV_WINDOW_CLOSE: number = 8;
+export const WEB_EV_RENDER_EXITED: number = 9;
+export const WEB_EV_PERM_REQ: number = 10;
+export const WEB_EV_DOWNLOAD_START: number = 11;
+export const WEB_EV_SCHEME_DOWNLOAD: number = 12;
+export const WEB_EV_TAB_OUT: number = 13;
+export const WEB_EV_UNHANDLED_KEY: number = 14;
+export const WEB_EV_EMBEDDED_PRESS: number = 15;
+export const WEB_EV_EMBEDDED_SCROLL: number = 16;
+
+export const WEB_SETUP_INCOGNITO: number = 1 << 0;
+export const WEB_SETUP_DEVTOOLS: number = 1 << 1;
+export const WEB_SETUP_AUTOPLAY: number = 1 << 2;
+export const WEB_SETUP_PINCH_ZOOM: number = 1 << 3;
+export const WEB_SETUP_SCROLL_TO_CONTAINER: number = 1 << 4;
+export const WEB_SETUP_TRANSPARENT: number = 1 << 5;
+export const WEB_SETUP_HAS_BG: number = 1 << 6;
+export const WEB_SETUP_SCRIPTS_ONLY: number = 1 << 7;
+
+export const WEB_ASYNC_EVAL: number = 1;
+export const WEB_ASYNC_CAPTURE: number = 2;
+export const WEB_ASYNC_PRINT_PDF: number = 3;
+
+const SCHEME_OP_HEAD: number = 1;
+const SCHEME_OP_BODY: number = 2;
+const SCHEME_OP_FINISH: number = 3;
+const SCHEME_OP_FAIL: number = 4;
 
 const NOTIF_PARAM_KEY: string = 'mygoNotificationId';
 
@@ -148,6 +199,49 @@ const PREF_KEY_URIS: string = 'persisted_uris';
 export type PopupMenuOpener = (reqId: number, x: number, y: number, rtl: boolean, items: HostMenuItem[]) => void;
 export type MessageBoxOpener = (box: HostMessageBox) => void;
 export type WebCommandRunner = (op: number, arg1: string, arg2: string) => void;
+export type WebAsyncRunner = (req: HostWebAsyncReq) => void;
+export type WebSetupUpdater = () => void;
+export type EmbeddedWebSyncer = () => void;
+
+export class BridgeWebCmd {
+  op: number = 0;
+  arg1: string = '';
+  arg2: string = '';
+}
+
+export class ManagedWebState {
+  webId: number = 0;
+  hostWinId: number = 0;
+  flags: number = WEB_SETUP_PINCH_ZOOM;
+  bgHex: string = '#FFFFFFFF';
+  zoomFactor: number = 1.0;
+  muted: boolean = false;
+  devTools: boolean = false;
+  webUrl: string = '';
+  webUserAgent: string = '';
+  pendingWebHtml: string = '';
+  pendingWebBaseUrl: string = '';
+  schemes: string[] = ['mygo'];
+  scripts: HostUserScript[] = [];
+  queuedCmds: BridgeWebCmd[] = [];
+  queuedAsync: HostWebAsyncReq[] = [];
+}
+
+class ActiveSchemeTask {
+  reqId: number = 0;
+  webId: number = 0;
+  method: string = 'GET';
+  url: string = '';
+  resourceHandler: webview.WebResourceHandler | undefined = undefined;
+  stopped: boolean = false;
+}
+
+class EmbeddedWinState {
+  winId: number = 0;
+  webIds: number[] = [];
+  placed: HostPlacedWebView[] = [];
+  surfaceRegions: HostSurfaceRegion[] = [];
+}
 
 class ManagedWindow {
   winId: number = 1;
@@ -285,6 +379,16 @@ class HostBridgeManager {
   private popupOpeners: Map<number, PopupMenuOpener> = new Map<number, PopupMenuOpener>();
   private msgBoxOpeners: Map<number, MessageBoxOpener> = new Map<number, MessageBoxOpener>();
   private webRunners: Map<number, WebCommandRunner> = new Map<number, WebCommandRunner>();
+  private webAsyncRunners: Map<number, WebAsyncRunner> = new Map<number, WebAsyncRunner>();
+  private webSetupUpdaters: Map<number, WebSetupUpdater> = new Map<number, WebSetupUpdater>();
+  private embeddedSyncers: Map<number, EmbeddedWebSyncer> = new Map<number, EmbeddedWebSyncer>();
+  private webStates: Map<number, ManagedWebState> = new Map<number, ManagedWebState>();
+  private embeddedByWin: Map<number, EmbeddedWinState> = new Map<number, EmbeddedWinState>();
+  private customSchemes: string[] = ['mygo'];
+  private anyDevToolsEnabled: boolean = false;
+  private nextSchemeReqId: number = 0;
+  private schemeTasks: Map<number, ActiveSchemeTask> = new Map<number, ActiveSchemeTask>();
+  private schemeReqIds: Map<webview.WebSchemeHandlerRequest, number> = new Map<webview.WebSchemeHandlerRequest, number>();
   private webEngineInitialized: boolean = false;
   private displayListenersRegistered: boolean = false;
   private pasteboardListenerRegistered: boolean = false;
@@ -387,6 +491,18 @@ class HostBridgeManager {
         },
         onWebReq: (winId: number, op: number, arg1: string, arg2: string): void => {
           this.handleWebReq(winId, op, arg1, arg2);
+        },
+        onWebSetup: (setup: HostWebSetup): void => {
+          this.handleWebSetup(setup);
+        },
+        onPlaceWebViews: (place: HostPlaceWebViews): void => {
+          this.handlePlaceWebViews(place);
+        },
+        onWebAsyncReq: (req: HostWebAsyncReq): void => {
+          this.handleWebAsyncReq(req);
+        },
+        onSchemeRes: (res: HostSchemeRes): void => {
+          this.handleSchemeRes(res);
         },
         onEngineQuit: (): void => {
           this.handleEngineQuit();
@@ -493,6 +609,13 @@ class HostBridgeManager {
     this.popupOpeners.clear();
     this.msgBoxOpeners.clear();
     this.webRunners.clear();
+    this.webAsyncRunners.clear();
+    this.webSetupUpdaters.clear();
+    this.embeddedSyncers.clear();
+    this.webStates.clear();
+    this.embeddedByWin.clear();
+    this.schemeTasks.clear();
+    this.schemeReqIds.clear();
     this.windowStage = undefined;
   }
 
@@ -520,24 +643,121 @@ class HostBridgeManager {
     this.msgBoxOpeners.delete(winId);
   }
 
-  registerWebRunner(winId: number, runner: WebCommandRunner): void {
-    this.webRunners.set(winId, runner);
+  isManagedWebWindow(winId: number): boolean {
+    return this.windows.get(winId)?.isWeb ?? false;
   }
 
-  unregisterWebRunner(winId: number): void {
-    this.webRunners.delete(winId);
+  isManagedWebIncognito(winId: number): boolean {
+    const st: ManagedWebState | undefined = this.webStates.get(winId);
+    if (st !== undefined && (st.flags & WEB_SETUP_INCOGNITO) !== 0) {
+      return true;
+    }
+    return this.windows.get(winId)?.webIncognito ?? false;
   }
 
-  getWebUrl(winId: number): string {
-    return this.windows.get(winId)?.webUrl ?? '';
+  getOrCreateWebState(webId: number): ManagedWebState {
+    let st: ManagedWebState | undefined = this.webStates.get(webId);
+    if (st === undefined) {
+      st = new ManagedWebState();
+      st.webId = webId;
+      const mw: ManagedWindow | undefined = this.windows.get(webId);
+      if (mw !== undefined) {
+        if (mw.webIncognito) {
+          st.flags |= WEB_SETUP_INCOGNITO;
+        }
+        st.webUrl = mw.webUrl;
+        st.webUserAgent = mw.webUserAgent;
+        st.pendingWebHtml = mw.pendingWebHtml;
+        st.pendingWebBaseUrl = mw.pendingWebBaseUrl;
+        const darkMode: boolean = AppStorage.get<boolean>('darkMode') ?? false;
+        st.bgHex = resolveWindowBg(mw.cfg, true, darkMode)[0];
+      }
+      this.webStates.set(webId, st);
+    }
+    return st;
   }
 
-  getWebUserAgent(winId: number): string {
-    return this.windows.get(winId)?.webUserAgent ?? '';
+  registerWebInstance(
+    webId: number,
+    runner: WebCommandRunner,
+    asyncRunner: WebAsyncRunner,
+    setupUpdater: WebSetupUpdater
+  ): void {
+    this.ensureWebEngineInitialized();
+    this.webRunners.set(webId, runner);
+    this.webAsyncRunners.set(webId, asyncRunner);
+    this.webSetupUpdaters.set(webId, setupUpdater);
   }
 
-  consumePendingWebHtml(winId: number): [string, string] {
-    const mw: ManagedWindow | undefined = this.windows.get(winId);
+  unregisterWebInstance(webId: number): void {
+    this.webRunners.delete(webId);
+    this.webAsyncRunners.delete(webId);
+    this.webSetupUpdaters.delete(webId);
+  }
+
+  registerEmbeddedSyncer(winId: number, syncer: EmbeddedWebSyncer): void {
+    this.embeddedSyncers.set(winId, syncer);
+  }
+
+  unregisterEmbeddedSyncer(winId: number): void {
+    this.embeddedSyncers.delete(winId);
+  }
+
+  getEmbeddedWebIds(winId: number): number[] {
+    return this.embeddedByWin.get(winId)?.webIds ?? [];
+  }
+
+  getEmbeddedPlacements(winId: number): HostPlacedWebView[] {
+    return this.embeddedByWin.get(winId)?.placed ?? [];
+  }
+
+  getEmbeddedSurfaceRegions(winId: number): HostSurfaceRegion[] {
+    return this.embeddedByWin.get(winId)?.surfaceRegions ?? [];
+  }
+
+  consumeQueuedWebCmds(webId: number): BridgeWebCmd[] {
+    const st: ManagedWebState | undefined = this.webStates.get(webId);
+    if (st === undefined || st.queuedCmds.length === 0) {
+      return [];
+    }
+    const out: BridgeWebCmd[] = st.queuedCmds.slice();
+    st.queuedCmds = [];
+    return out;
+  }
+
+  consumeQueuedWebAsync(webId: number): HostWebAsyncReq[] {
+    const st: ManagedWebState | undefined = this.webStates.get(webId);
+    if (st === undefined || st.queuedAsync.length === 0) {
+      return [];
+    }
+    const out: HostWebAsyncReq[] = st.queuedAsync.slice();
+    st.queuedAsync = [];
+    return out;
+  }
+
+  getWebUrl(webId: number): string {
+    return this.webStates.get(webId)?.webUrl ?? this.windows.get(webId)?.webUrl ?? '';
+  }
+
+  getWebUserAgent(webId: number): string {
+    return this.webStates.get(webId)?.webUserAgent ?? this.windows.get(webId)?.webUserAgent ?? '';
+  }
+
+  consumePendingWebHtml(webId: number): [string, string] {
+    const st: ManagedWebState | undefined = this.webStates.get(webId);
+    if (st !== undefined && st.pendingWebHtml.length > 0) {
+      const html: string = st.pendingWebHtml;
+      const base: string = st.pendingWebBaseUrl;
+      st.pendingWebHtml = '';
+      st.pendingWebBaseUrl = '';
+      const mw: ManagedWindow | undefined = this.windows.get(webId);
+      if (mw !== undefined) {
+        mw.pendingWebHtml = '';
+        mw.pendingWebBaseUrl = '';
+      }
+      return [html, base];
+    }
+    const mw: ManagedWindow | undefined = this.windows.get(webId);
     if (mw === undefined || mw.pendingWebHtml.length === 0) {
       return ['', ''];
     }
@@ -1396,6 +1616,16 @@ class HostBridgeManager {
       mw.isWeb = (cfg.flags & WIN_FLAG_WEBVIEW) !== 0;
       mw.webIncognito = (cfg.flags & WIN_FLAG_WEB_INCOGNITO) !== 0;
       mw.cfg = cfg;
+      if (mw.isWeb) {
+        this.getOrCreateWebState(1);
+        setTimeout((): void => {
+          this.ensureWebEngineInitialized();
+          const syncer: EmbeddedWebSyncer | undefined = this.embeddedSyncers.get(1);
+          if (syncer !== undefined) {
+            syncer();
+          }
+        }, 0);
+      }
       if (mw.ready && mw.win !== undefined) {
         this.applyWindowConfig(mw, cfg, CFG_MASK_ALL, true);
       }
@@ -1411,9 +1641,8 @@ class HostBridgeManager {
     mw.webIncognito = (cfg.flags & WIN_FLAG_WEB_INCOGNITO) !== 0;
     mw.cfg = cfg;
     this.windows.set(cfg.winId, mw);
-
     if (mw.isWeb) {
-      this.ensureWebEngineInitialized();
+      this.getOrCreateWebState(cfg.winId);
     }
 
     const sc: number = this.currentScale();
@@ -1433,6 +1662,9 @@ class HostBridgeManager {
       if (!this.windows.has(cfg.winId)) {
         subWin.destroyWindow().catch((): void => {});
         return;
+      }
+      if (mw.isWeb) {
+        this.ensureWebEngineInitialized();
       }
       mw.win = subWin;
       try {
@@ -1765,14 +1997,7 @@ class HostBridgeManager {
         if (mw.winId === 1) {
           this.handleEngineQuit();
         } else {
-          this.detachWindowListeners(mw);
-          this.windows.delete(mw.winId);
-          this.popupOpeners.delete(mw.winId);
-          this.msgBoxOpeners.delete(mw.winId);
-          this.webRunners.delete(mw.winId);
-          try {
-            w.destroyWindow().catch((): void => {});
-          } catch (_) {}
+          this.cleanupClosedSubWindow(mw.winId);
         }
         break;
       case WIN_ACT_FOCUS:
@@ -1945,7 +2170,17 @@ class HostBridgeManager {
     this.windows.delete(winId);
     this.popupOpeners.delete(winId);
     this.msgBoxOpeners.delete(winId);
-    this.webRunners.delete(winId);
+    this.unregisterWebInstance(winId);
+    this.embeddedSyncers.delete(winId);
+    this.cleanupWebState(winId);
+    const emb: EmbeddedWinState | undefined = this.embeddedByWin.get(winId);
+    if (emb !== undefined) {
+      for (let i: number = 0; i < emb.webIds.length; i++) {
+        this.unregisterWebInstance(emb.webIds[i]);
+        this.cleanupWebState(emb.webIds[i]);
+      }
+      this.embeddedByWin.delete(winId);
+    }
     if (mw.win !== undefined) {
       try {
         mw.win.destroyWindow().catch((): void => {});
@@ -2015,6 +2250,18 @@ class HostBridgeManager {
     });
     for (let i: number = 0; i < staleIds.length; i++) {
       this.cleanupClosedSubWindow(staleIds[i]);
+    }
+    const mainEmb: EmbeddedWinState | undefined = this.embeddedByWin.get(1);
+    if (mainEmb !== undefined) {
+      for (let i: number = 0; i < mainEmb.webIds.length; i++) {
+        this.unregisterWebInstance(mainEmb.webIds[i]);
+        this.cleanupWebState(mainEmb.webIds[i]);
+      }
+      this.embeddedByWin.delete(1);
+      const syncer: EmbeddedWebSyncer | undefined = this.embeddedSyncers.get(1);
+      if (syncer !== undefined) {
+        syncer();
+      }
     }
   }
 
@@ -2559,7 +2806,73 @@ class HostBridgeManager {
     }
   }
 
-  // ---------- ArkWeb Window Commands & Cookie / DataStore Bridge ----------
+  // ---------- ArkWeb Window / Hybrid / Embedded Bridge & Cookie Store ----------
+
+  private sanitizeSchemeName(raw: string): string {
+    const s: string = raw.trim().toLowerCase();
+    if (s.length === 0 || s.length > 32) {
+      return '';
+    }
+    if (
+      s === 'http' || s === 'https' || s === 'file' || s === 'data' ||
+      s === 'about' || s === 'javascript' || s === 'blob' || s === 'ws' || s === 'wss'
+    ) {
+      return '';
+    }
+    const first: number = s.charCodeAt(0);
+    if (first < 97 || first > 122) {
+      return '';
+    }
+    for (let i: number = 1; i < s.length; i++) {
+      const ch: number = s.charCodeAt(i);
+      const isAlpha: boolean = ch >= 97 && ch <= 122;
+      const isDigit: boolean = ch >= 48 && ch <= 57;
+      const isSym: boolean = ch === 43 || ch === 45 || ch === 46; // + - .
+      if (!isAlpha && !isDigit && !isSym) {
+        return '';
+      }
+    }
+    return s;
+  }
+
+  private buildCustomSchemeDescriptors(): Array<webview.WebCustomScheme> {
+    const out: Array<webview.WebCustomScheme> = [];
+    for (let i: number = 0; i < this.customSchemes.length && out.length < 10; i++) {
+      out.push({
+        schemeName: this.customSchemes[i],
+        isSupportCORS: true,
+        isSupportFetch: true,
+        isStandard: true,
+        isSecure: true,
+        isCodeCacheSupported: true
+      });
+    }
+    return out;
+  }
+
+  private registerCustomSchemes(schemes: string[]): string[] {
+    const normalized: string[] = ['mygo'];
+    let addedNew: boolean = false;
+    for (let i: number = 0; i < schemes.length; i++) {
+      const clean: string = this.sanitizeSchemeName(schemes[i]);
+      if (clean.length === 0) {
+        continue;
+      }
+      if (normalized.indexOf(clean) < 0) {
+        normalized.push(clean);
+      }
+      if (this.customSchemes.indexOf(clean) < 0 && this.customSchemes.length < 10) {
+        this.customSchemes.push(clean);
+        addedNew = true;
+      }
+    }
+    if (addedNew && !this.webEngineInitialized) {
+      try {
+        webview.WebviewController.customizeSchemes(this.buildCustomSchemeDescriptors(), true);
+      } catch (_) {}
+    }
+    return normalized;
+  }
 
   private ensureWebEngineInitialized(): void {
     if (this.webEngineInitialized) {
@@ -2567,32 +2880,506 @@ class HostBridgeManager {
     }
     this.webEngineInitialized = true;
     try {
+      webview.WebviewController.enableWholeWebPageDrawing();
+    } catch (_) {}
+    try {
+      webview.WebviewController.customizeSchemes(this.buildCustomSchemeDescriptors());
+    } catch (_) {}
+    try {
       webview.WebviewController.initializeWebEngine();
     } catch (_) {}
     try {
       webview.WebCookieManager.putAcceptCookieEnabled(true);
       webview.WebCookieManager.putAcceptThirdPartyCookieEnabled(true);
     } catch (_) {}
+    if (this.anyDevToolsEnabled) {
+      try {
+        webview.WebviewController.setWebDebuggingAccess(true);
+      } catch (_) {}
+    }
+  }
+
+  private cleanupWebState(webId: number): void {
+    this.webStates.delete(webId);
+    const deadReqs: number[] = [];
+    this.schemeTasks.forEach((task: ActiveSchemeTask, reqId: number): void => {
+      if (task.webId === webId) {
+        task.stopped = true;
+        deadReqs.push(reqId);
+      }
+    });
+    for (let i: number = 0; i < deadReqs.length; i++) {
+      this.schemeTasks.delete(deadReqs[i]);
+    }
+  }
+
+  private getOrCreateEmbeddedWinState(winId: number): EmbeddedWinState {
+    let emb: EmbeddedWinState | undefined = this.embeddedByWin.get(winId);
+    if (emb === undefined) {
+      emb = new EmbeddedWinState();
+      emb.winId = winId;
+      this.embeddedByWin.set(winId, emb);
+    }
+    return emb;
+  }
+
+  private handleWebSetup(setup: HostWebSetup): void {
+    const st: ManagedWebState = this.getOrCreateWebState(setup.webId);
+    const scriptsOnly: boolean = (setup.flags & WEB_SETUP_SCRIPTS_ONLY) !== 0;
+    st.scripts = setup.scripts.slice();
+
+    if (!scriptsOnly) {
+      st.hostWinId = setup.hostWinId;
+      st.flags = setup.flags;
+      st.schemes = this.registerCustomSchemes(setup.schemes);
+      if (setup.zoom > 0) {
+        st.zoomFactor = setup.zoom;
+      }
+      if (setup.ua.length > 0) {
+        st.webUserAgent = setup.ua;
+      }
+      if ((setup.flags & WEB_SETUP_TRANSPARENT) !== 0) {
+        st.bgHex = '#00000000';
+      } else if ((setup.flags & WEB_SETUP_HAS_BG) !== 0) {
+        st.bgHex = rgbaToHexColor(setup.bgRGBA);
+      } else {
+        const dark: boolean = AppStorage.get<boolean>('darkMode') ?? false;
+        st.bgHex = dark ? '#FF1C1C1F' : '#FFFFFFFF';
+      }
+      if ((setup.flags & WEB_SETUP_DEVTOOLS) !== 0) {
+        st.devTools = true;
+        this.anyDevToolsEnabled = true;
+        if (this.webEngineInitialized) {
+          try {
+            webview.WebviewController.setWebDebuggingAccess(true);
+          } catch (_) {}
+        }
+      }
+      if (setup.hostWinId > 0) {
+        this.ensureWebEngineInitialized();
+        const emb: EmbeddedWinState = this.getOrCreateEmbeddedWinState(setup.hostWinId);
+        if (emb.webIds.indexOf(setup.webId) < 0) {
+          emb.webIds.push(setup.webId);
+        }
+        const syncer: EmbeddedWebSyncer | undefined = this.embeddedSyncers.get(setup.hostWinId);
+        if (syncer !== undefined) {
+          syncer();
+        }
+      }
+    }
+
+    const updater: WebSetupUpdater | undefined = this.webSetupUpdaters.get(setup.webId);
+    if (updater !== undefined) {
+      updater();
+    }
+  }
+
+  private handlePlaceWebViews(place: HostPlaceWebViews): void {
+    const emb: EmbeddedWinState = this.getOrCreateEmbeddedWinState(place.winId);
+    emb.placed = place.views.slice();
+    emb.surfaceRegions = place.surfaceRegions.slice();
+    for (let i: number = 0; i < place.views.length; i++) {
+      const wid: number = place.views[i].webId;
+      if (emb.webIds.indexOf(wid) < 0) {
+        emb.webIds.push(wid);
+      }
+    }
+    const syncer: EmbeddedWebSyncer | undefined = this.embeddedSyncers.get(place.winId);
+    if (syncer !== undefined) {
+      syncer();
+    }
   }
 
   private handleWebReq(winId: number, op: number, arg1: string, arg2: string): void {
     hilog.info(DOMAIN, TAG, 'onWebReq win=%{public}d op=%{public}d arg1=%{public}s', winId, op, arg1);
+    if (op === WEB_OP_DESTROY) {
+      const st: ManagedWebState | undefined = this.webStates.get(winId);
+      const hostWinId: number = st?.hostWinId ?? 0;
+      this.unregisterWebInstance(winId);
+      this.cleanupWebState(winId);
+      if (hostWinId > 0) {
+        const emb: EmbeddedWinState | undefined = this.embeddedByWin.get(hostWinId);
+        if (emb !== undefined) {
+          const idx: number = emb.webIds.indexOf(winId);
+          if (idx >= 0) {
+            emb.webIds.splice(idx, 1);
+          }
+          const nextPlaced: HostPlacedWebView[] = [];
+          for (let i: number = 0; i < emb.placed.length; i++) {
+            if (emb.placed[i].webId !== winId) {
+              nextPlaced.push(emb.placed[i]);
+            }
+          }
+          emb.placed = nextPlaced;
+          const syncer: EmbeddedWebSyncer | undefined = this.embeddedSyncers.get(hostWinId);
+          if (syncer !== undefined) {
+            syncer();
+          }
+        }
+      }
+      return;
+    }
+
+    const st: ManagedWebState = this.getOrCreateWebState(winId);
     const mw: ManagedWindow | undefined = this.windows.get(winId);
-    if (mw !== undefined) {
-      if (op === WEB_OP_LOAD_URL) {
+    if (op === WEB_OP_LOAD_URL) {
+      st.webUrl = arg1;
+      st.pendingWebHtml = '';
+      st.pendingWebBaseUrl = '';
+      if (mw !== undefined) {
         mw.webUrl = arg1;
         mw.pendingWebHtml = '';
         mw.pendingWebBaseUrl = '';
-      } else if (op === WEB_OP_LOAD_HTML) {
+      }
+    } else if (op === WEB_OP_LOAD_HTML) {
+      st.pendingWebHtml = arg1;
+      st.pendingWebBaseUrl = arg2;
+      if (mw !== undefined) {
         mw.pendingWebHtml = arg1;
         mw.pendingWebBaseUrl = arg2;
-      } else if (op === WEB_OP_SET_UA) {
+      }
+    } else if (op === WEB_OP_SET_UA) {
+      st.webUserAgent = arg1;
+      if (mw !== undefined) {
         mw.webUserAgent = arg1;
       }
+    } else if (op === WEB_OP_SET_ZOOM) {
+      const z: number = Number.parseFloat(arg1);
+      if (!Number.isNaN(z) && z > 0) {
+        st.zoomFactor = z;
+      }
+    } else if (op === WEB_OP_SET_MUTED) {
+      st.muted = arg1 === '1';
+    } else if (op === WEB_OP_DEVTOOLS) {
+      st.devTools = arg1 === '1';
+      if (st.devTools) {
+        this.anyDevToolsEnabled = true;
+      }
+      if (this.webEngineInitialized) {
+        try {
+          webview.WebviewController.setWebDebuggingAccess(st.devTools);
+        } catch (_) {}
+      }
+    } else if (op === WEB_OP_SET_BG) {
+      const parsed: number = Number.parseInt(arg1, 10);
+      if (!Number.isNaN(parsed)) {
+        st.bgHex = rgbaToHexColor(parsed >>> 0);
+      }
+      if (st.hostWinId > 0) {
+        const syncer: EmbeddedWebSyncer | undefined = this.embeddedSyncers.get(st.hostWinId);
+        if (syncer !== undefined) {
+          syncer();
+        }
+      }
     }
+
     const runner: WebCommandRunner | undefined = this.webRunners.get(winId);
     if (runner !== undefined) {
       runner(op, arg1, arg2);
+    } else if (op !== WEB_OP_LOAD_URL && op !== WEB_OP_LOAD_HTML && op !== WEB_OP_SET_UA) {
+      const cmd: BridgeWebCmd = new BridgeWebCmd();
+      cmd.op = op;
+      cmd.arg1 = arg1;
+      cmd.arg2 = arg2;
+      st.queuedCmds.push(cmd);
+    }
+  }
+
+  private handleWebAsyncReq(req: HostWebAsyncReq): void {
+    const asyncRunner: WebAsyncRunner | undefined = this.webAsyncRunners.get(req.webId);
+    if (asyncRunner !== undefined) {
+      asyncRunner(req);
+      return;
+    }
+    const st: ManagedWebState | undefined = this.webStates.get(req.webId);
+    if (st !== undefined) {
+      st.queuedAsync.push(req);
+      return;
+    }
+    host.resolveWebAsync(req.reqId, '', 'ohos: webview not found', new ArrayBuffer(0));
+  }
+
+  attachSchemeHandlers(webId: number, ctrl: webview.WebviewController): void {
+    const st: ManagedWebState = this.getOrCreateWebState(webId);
+    for (let i: number = 0; i < st.schemes.length; i++) {
+      const scheme: string = st.schemes[i];
+      try {
+        const handler: webview.WebSchemeHandler = new webview.WebSchemeHandler();
+        handler.onRequestStart(
+          (request: webview.WebSchemeHandlerRequest, resourceHandler: webview.WebResourceHandler): boolean => {
+            return this.onSchemeRequestStart(webId, request, resourceHandler);
+          }
+        );
+        handler.onRequestStop((request: webview.WebSchemeHandlerRequest): void => {
+          this.onSchemeRequestStop(webId, request);
+        });
+        ctrl.setWebSchemeHandler(scheme, handler);
+      } catch (e) {
+        hilog.error(DOMAIN, TAG, 'setWebSchemeHandler(%{public}s) failed: %{public}s', scheme, JSON.stringify(e));
+      }
+    }
+  }
+
+  private onSchemeRequestStart(
+    webId: number,
+    request: webview.WebSchemeHandlerRequest,
+    resourceHandler: webview.WebResourceHandler
+  ): boolean {
+    let url: string = '';
+    let method: string = 'GET';
+    const headers: HostSchemeHeader[] = [];
+    try {
+      url = request.getRequestUrl();
+      method = request.getRequestMethod();
+      const rawHdrs: Array<webview.WebHeader> = request.getHeader();
+      for (let i: number = 0; i < rawHdrs.length; i++) {
+        headers.push({
+          name: rawHdrs[i].headerKey,
+          headerValue: rawHdrs[i].headerValue
+        });
+      }
+    } catch (_) {}
+    if (url.length === 0) {
+      return false;
+    }
+
+    this.nextSchemeReqId = (this.nextSchemeReqId + 1) >>> 0;
+    if (this.nextSchemeReqId === 0) {
+      this.nextSchemeReqId = 1;
+    }
+    const reqId: number = this.nextSchemeReqId;
+
+    const task: ActiveSchemeTask = new ActiveSchemeTask();
+    task.reqId = reqId;
+    task.webId = webId;
+    task.method = method;
+    task.url = url;
+    task.resourceHandler = resourceHandler;
+    this.schemeTasks.set(reqId, task);
+    this.schemeReqIds.set(request, reqId);
+
+    let bodyStream: webview.WebHttpBodyStream | null = null;
+    try {
+      bodyStream = request.getHttpBodyStream();
+    } catch (_) {
+      bodyStream = null;
+    }
+
+    if (bodyStream === null) {
+      host.notifySchemeReq(reqId, webId, false, method, url, headers, new ArrayBuffer(0));
+    } else {
+      const streamRef: webview.WebHttpBodyStream = bodyStream;
+      this.readHttpBodyStream(streamRef).then((bodyBuf: ArrayBuffer): void => {
+        if (!task.stopped) {
+          host.notifySchemeReq(reqId, webId, false, method, url, headers, bodyBuf);
+        }
+      }).catch((): void => {
+        if (!task.stopped) {
+          host.notifySchemeReq(reqId, webId, false, method, url, headers, new ArrayBuffer(0));
+        }
+      });
+    }
+    return true;
+  }
+
+  private async readHttpBodyStream(stream: webview.WebHttpBodyStream): Promise<ArrayBuffer> {
+    await stream.initialize();
+    const chunks: Uint8Array[] = [];
+    let totalBytes: number = 0;
+    const stepBytes: number = 65536;
+    while (!stream.isEof()) {
+      const buf: ArrayBuffer = await stream.read(stepBytes);
+      if (buf.byteLength === 0) {
+        break;
+      }
+      const part: Uint8Array = new Uint8Array(buf);
+      chunks.push(part);
+      totalBytes += part.byteLength;
+      if (totalBytes > (32 << 20)) {
+        break;
+      }
+    }
+    if (totalBytes === 0) {
+      return new ArrayBuffer(0);
+    }
+    const merged: ArrayBuffer = new ArrayBuffer(totalBytes);
+    const dst: Uint8Array = new Uint8Array(merged);
+    let offset: number = 0;
+    for (let i: number = 0; i < chunks.length; i++) {
+      dst.set(chunks[i], offset);
+      offset += chunks[i].byteLength;
+    }
+    return merged;
+  }
+
+  private onSchemeRequestStop(webId: number, request: webview.WebSchemeHandlerRequest): void {
+    let matchedId: number | undefined = this.schemeReqIds.get(request);
+    this.schemeReqIds.delete(request);
+    if (matchedId === undefined) {
+      let reqUrl: string = '';
+      let reqMethod: string = '';
+      try {
+        reqUrl = request.getRequestUrl();
+        reqMethod = request.getRequestMethod();
+      } catch (_) {}
+      if (reqUrl.length > 0) {
+        this.schemeTasks.forEach((cand: ActiveSchemeTask, candId: number): void => {
+          if (
+            matchedId === undefined &&
+            !cand.stopped &&
+            cand.webId === webId &&
+            cand.url === reqUrl &&
+            cand.method === reqMethod
+          ) {
+            matchedId = candId;
+          }
+        });
+      }
+    }
+    if (matchedId === undefined) {
+      return;
+    }
+    const task: ActiveSchemeTask | undefined = this.schemeTasks.get(matchedId);
+    if (task === undefined) {
+      return;
+    }
+    this.schemeTasks.delete(matchedId);
+    if (!task.stopped) {
+      task.stopped = true;
+      host.notifySchemeReq(matchedId, webId, true, '', '', [], new ArrayBuffer(0));
+    }
+  }
+
+  private httpStatusText(status: number): string {
+    switch (status) {
+      case 200: return 'OK';
+      case 201: return 'Created';
+      case 204: return 'No Content';
+      case 206: return 'Partial Content';
+      case 301: return 'Moved Permanently';
+      case 302: return 'Found';
+      case 304: return 'Not Modified';
+      case 307: return 'Temporary Redirect';
+      case 308: return 'Permanent Redirect';
+      case 400: return 'Bad Request';
+      case 401: return 'Unauthorized';
+      case 403: return 'Forbidden';
+      case 404: return 'Not Found';
+      case 405: return 'Method Not Allowed';
+      case 416: return 'Range Not Satisfiable';
+      case 500: return 'Internal Server Error';
+      case 502: return 'Bad Gateway';
+      case 503: return 'Service Unavailable';
+      default: return 'OK';
+    }
+  }
+
+  private handleSchemeRes(res: HostSchemeRes): void {
+    const task: ActiveSchemeTask | undefined = this.schemeTasks.get(res.reqId);
+    if (task === undefined || task.stopped || task.resourceHandler === undefined) {
+      return;
+    }
+    const rh: webview.WebResourceHandler = task.resourceHandler;
+    try {
+      switch (res.op) {
+        case SCHEME_OP_HEAD: {
+          const resp: webview.WebSchemeHandlerResponse = new webview.WebSchemeHandlerResponse();
+          resp.setNetErrorCode(WebNetErrorList.NET_OK);
+          const status: number = res.status > 0 ? res.status : 200;
+          resp.setStatus(status);
+          resp.setStatusText(this.httpStatusText(status));
+          let mime: string = 'application/octet-stream';
+          let encoding: string = '';
+          const seenHeaders: Map<string, boolean> = new Map<string, boolean>();
+          for (let i: number = 0; i < res.headers.length; i++) {
+            const hk: string = res.headers[i].name.trim();
+            const hv: string = res.headers[i].headerValue;
+            if (hk.length === 0) {
+              continue;
+            }
+            const lower: string = hk.toLowerCase();
+            if (lower === 'content-type') {
+              const semi: number = hv.indexOf(';');
+              const bareMime: string = (semi >= 0 ? hv.substring(0, semi) : hv).trim();
+              if (bareMime.length > 0) {
+                mime = bareMime;
+              }
+              if (semi >= 0) {
+                const params: string = hv.substring(semi + 1);
+                const eq: number = params.toLowerCase().indexOf('charset=');
+                if (eq >= 0) {
+                  let cs: string = params.substring(eq + 8).trim();
+                  const semi2: number = cs.indexOf(';');
+                  if (semi2 >= 0) {
+                    cs = cs.substring(0, semi2).trim();
+                  }
+                  if (cs.startsWith('"') && cs.endsWith('"') && cs.length >= 2) {
+                    cs = cs.substring(1, cs.length - 1);
+                  }
+                  encoding = cs;
+                }
+              }
+            }
+            const overwrite: boolean = !seenHeaders.has(lower);
+            seenHeaders.set(lower, true);
+            try {
+              resp.setHeaderByName(hk, hv, overwrite);
+            } catch (_) {}
+          }
+          resp.setMimeType(mime);
+          if (encoding.length > 0) {
+            resp.setEncoding(encoding);
+          }
+          rh.didReceiveResponse(resp);
+          break;
+        }
+        case SCHEME_OP_BODY: {
+          if (res.chunk.byteLength > 0) {
+            rh.didReceiveResponseBody(res.chunk);
+          }
+          break;
+        }
+        case SCHEME_OP_FINISH: {
+          task.stopped = true;
+          this.schemeTasks.delete(res.reqId);
+          rh.didFinish();
+          break;
+        }
+        case SCHEME_OP_FAIL: {
+          task.stopped = true;
+          this.schemeTasks.delete(res.reqId);
+          try {
+            rh.didFail(WebNetErrorList.ERR_FAILED, true);
+          } catch (_) {
+            rh.didFail(WebNetErrorList.ERR_FAILED);
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'handleSchemeRes op=%{public}d failed: %{public}s', res.op, JSON.stringify(e));
+      task.stopped = true;
+      this.schemeTasks.delete(res.reqId);
+    }
+  }
+
+  async packPixelMapToPng(pm: image.PixelMap): Promise<ArrayBuffer> {
+    const packer: image.ImagePacker = image.createImagePacker();
+    try {
+      const buf: ArrayBuffer = await packer.packToData(pm, {
+        format: 'image/png',
+        quality: 100
+      });
+      return buf;
+    } finally {
+      try {
+        await packer.release();
+      } catch (_) {}
+      try {
+        await pm.release();
+      } catch (_) {}
     }
   }
 

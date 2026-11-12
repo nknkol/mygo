@@ -142,6 +142,83 @@ export interface HostCookie {
   sameSite: string;
 }
 
+export interface HostUserScript {
+  source: string;
+  atDocEnd: boolean;
+  allFrames: boolean;
+}
+
+export interface HostWebSetup {
+  webId: number;
+  hostWinId: number;
+  flags: number;
+  bgRGBA: number;
+  zoom: number;
+  ua: string;
+  schemes: string[];
+  scripts: HostUserScript[];
+}
+
+export interface HostPlacedWebView {
+  webId: number;
+  frameX: number;
+  frameY: number;
+  frameW: number;
+  frameH: number;
+  clipX: number;
+  clipY: number;
+  clipW: number;
+  clipH: number;
+  pageW: number;
+  pageH: number;
+  r0: number;
+  r1: number;
+  r2: number;
+  r3: number;
+}
+
+export interface HostSurfaceRegion {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface HostPlaceWebViews {
+  winId: number;
+  views: HostPlacedWebView[];
+  surfaceRegions: HostSurfaceRegion[];
+}
+
+export interface HostWebAsyncReq {
+  reqId: number;
+  webId: number;
+  op: number;
+  landscape: boolean;
+  background: boolean;
+  pageWidth: number;
+  pageHeight: number;
+  marginTop: number;
+  marginRight: number;
+  marginBottom: number;
+  marginLeft: number;
+  body: string;
+}
+
+export interface HostSchemeHeader {
+  name: string;
+  headerValue: string;
+}
+
+export interface HostSchemeRes {
+  reqId: number;
+  op: number;
+  status: number;
+  headers: HostSchemeHeader[];
+  chunk: ArrayBuffer;
+  err: string;
+}
+
 export interface HostBridgeCallbacks {
   onWinCreate: (cfg: HostWinConfig) => void;
   onWinConfig: (cfg: HostWinConfig) => void;
@@ -161,6 +238,10 @@ export interface HostBridgeCallbacks {
   onNetWatch: () => void;
   onCookieReq: (req: HostCookieReq) => void;
   onWebReq: (winId: number, op: number, arg1: string, arg2: string) => void;
+  onWebSetup: (setup: HostWebSetup) => void;
+  onPlaceWebViews: (place: HostPlaceWebViews) => void;
+  onWebAsyncReq: (req: HostWebAsyncReq) => void;
+  onSchemeRes: (res: HostSchemeRes) => void;
   onEngineQuit: () => void;
   onEngineRestart: () => void;
 }
@@ -212,6 +293,17 @@ export interface HostModule {
     text: string,
     desc: string
   ): void;
+  resolveWebAsync(reqId: number, text: string, err: string, data: ArrayBuffer): void;
+  notifySchemeReq(
+    reqId: number,
+    webId: number,
+    cancel: boolean,
+    method: string,
+    url: string,
+    headers: HostSchemeHeader[],
+    body: ArrayBuffer
+  ): void;
+  clearWebControllerHandler(handler: Object): void;
   setDarkMode(dark: boolean): void;
   crash(): void;
 }

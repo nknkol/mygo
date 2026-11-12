@@ -62,6 +62,8 @@ type Surface struct {
 	touch             touchGesture
 	pinch             float64
 	lastX, lastY      float64
+	layered           bool
+	placed            []platform.WebViewPlacement
 	glCtx             uintptr
 	gl                *glTarget
 }
@@ -389,15 +391,10 @@ func (s *Surface) SetTextInput(t platform.TextInputState) {
 	}
 }
 
-func (s *Surface) UpdateAccessibility(t *platform.AccessTree)      {}
-func (s *Surface) StartDataDrag(r platform.DragRequest)            {}
-func (s *Surface) CancelDataDrag()                                 {}
-func (s *Surface) SetDropFormats(f []transfer.Format)              {}
-func (s *Surface) PlaceWebViews(views []platform.WebViewPlacement) {}
-
-func (s *Surface) NewWebView(opts *platform.WindowOptions, h platform.WindowHandler) (platform.WebView, error) {
-	return nil, platform.ErrUnsupported
-}
+func (s *Surface) UpdateAccessibility(t *platform.AccessTree) {}
+func (s *Surface) StartDataDrag(r platform.DragRequest)       {}
+func (s *Surface) CancelDataDrag()                            {}
+func (s *Surface) SetDropFormats(f []transfer.Format)         {}
 
 func (s *Surface) FrameNow() { s.RequestFrame() }
 

@@ -97,6 +97,10 @@ type Backend struct {
 
 	nextCookieReq  uint32
 	pendingCookies map[uint32]pendingCookieCall
+
+	nextWebAsyncReq uint32
+	pendingWebAsync map[uint32]pendingWebAsyncCall
+	schemeTasks     map[uint32]*schemeResponder
 }
 
 // New returns the backend from the arguments and environment the host started
@@ -274,7 +278,7 @@ func (b *Backend) popNextLocked() (event, bool) {
 			case kindInput, kindPopupResult, kindEnvInfo,
 				kindClipChanged, kindClipData, kindDialogResult, kindShellResult, kindAppOpen,
 				kindMediaCmd, kindNotifResult, kindNotifClicked, kindPowerState, kindNetState,
-				kindCookieResult, kindWebEvent:
+				kindCookieResult, kindWebEvent, kindWebAsyncRes, kindSchemeReq, kindInternal:
 				idx = i
 			case kindQuit, kindSurface:
 				i = len(b.events)
@@ -402,8 +406,16 @@ func (b *Backend) NewWindow(opts *platform.WindowOptions, h platform.WindowHandl
 	b.mu.Unlock()
 
 	b.send(kindWinCreate, winConfigMessage(w.wireConfig(w.parentID)))
-	if w.isWeb && w.ua != "" {
-		w.sendWebReq(webOpSetUA, w.ua, "")
+	if w.isWeb {
+		if w.needsWebSetup() {
+			w.sendWebSetup(false)
+		}
+		if w.ua != "" {
+			w.sendWebReq(webOpSetUA, w.ua, "")
+		}
+		if w.zoom > 0 && w.zoom != 1 {
+			w.sendWebReq(webOpSetZoom, strconv.FormatFloat(w.zoom, 'f', -1, 64), "")
+		}
 	}
 	return w, nil
 }
@@ -444,7 +456,7 @@ func (b *Backend) removeWindow(id uint32) {
 
 func (b *Backend) hasFocusedWindowLocked() bool {
 	for _, id := range b.winOrder {
-		if w := b.windows[id]; w != nil && !w.closed && w.focused {
+		if w := b.windows[id]; w != nil && w.host == nil && !w.closed && w.focused {
 			return true
 		}
 	}
@@ -453,12 +465,12 @@ func (b *Backend) hasFocusedWindowLocked() bool {
 
 func (b *Backend) focusedOrFirstWindowLocked() *Window {
 	for i := len(b.winOrder) - 1; i >= 0; i-- {
-		if w := b.windows[b.winOrder[i]]; w != nil && !w.closed && w.focused {
+		if w := b.windows[b.winOrder[i]]; w != nil && w.host == nil && !w.closed && w.focused {
 			return w
 		}
 	}
 	for i := len(b.winOrder) - 1; i >= 0; i-- {
-		if w := b.windows[b.winOrder[i]]; w != nil && !w.closed {
+		if w := b.windows[b.winOrder[i]]; w != nil && w.host == nil && !w.closed {
 			return w
 		}
 	}
@@ -476,6 +488,19 @@ type event struct {
 	kind    byte
 	payload []byte
 	fd      int
+	fn      func()
+}
+
+func (b *Backend) post(fn func()) {
+	if b == nil || fn == nil {
+		return
+	}
+	b.mu.Lock()
+	b.events = append(b.events, event{kind: kindInternal, fd: -1, fn: fn})
+	if b.cond != nil {
+		b.cond.Broadcast()
+	}
+	b.mu.Unlock()
 }
 
 func (b *Backend) readLoop() {
@@ -536,6 +561,14 @@ func (b *Backend) dispatch(ev event) {
 		b.onCookieResult(ev.payload)
 	case kindWebEvent:
 		b.onWebEvent(ev.payload)
+	case kindWebAsyncRes:
+		b.onWebAsyncRes(ev.payload)
+	case kindSchemeReq:
+		b.onSchemeReq(ev.payload)
+	case kindInternal:
+		if ev.fn != nil {
+			ev.fn()
+		}
 	}
 }
 
@@ -577,6 +610,7 @@ func (b *Backend) onSurface(payload []byte) {
 		return
 	}
 	win.updateBoundsFromPixels(w, h, scale)
+	s.refreshPlacedWebViews()
 	s.send(platform.SurfaceEvent{Kind: platform.SurfaceResize})
 	if win.h != nil {
 		win.h.Resized()

@@ -65,10 +65,18 @@ const (
 	kindPowerReq    = 38 // engine -> host: {u8 keepSys, u8 keepDisp, u8 keepRun, u8 pad, str reason}
 	kindNetWatch    = 39 // engine -> host: {}
 
-	kindCookieReq    = 40 // engine -> host: {u32 reqID, u8 op, u8 incognito, 2×pad, u32 siteDataTypes, str url, str headerOrName, str domain, str path}
-	kindCookieResult = 41 // host -> engine: {u32 reqID, str err, u32 count, cookies...}
-	kindWebReq       = 42 // engine -> host: {u32 winID, u8 op, 3×pad, str arg1, str arg2}
-	kindWebEvent     = 43 // host -> engine: {u32 winID, u8 ev, u8 canBack, u8 canForward, u8 pad, i32 errCode, str text, str desc}
+	kindCookieReq     = 40 // engine -> host: {u32 reqID, u8 op, u8 incognito, 2×pad, u32 siteDataTypes, str url, str headerOrName, str domain, str path}
+	kindCookieResult  = 41 // host -> engine: {u32 reqID, str err, u32 count, cookies...}
+	kindWebReq        = 42 // engine -> host: {u32 winID, u8 op, 3×pad, str arg1, str arg2}
+	kindWebEvent      = 43 // host -> engine: {u32 winID, u8 ev, u8 canBack, u8 canForward, u8 pad, i32 errCode, str text, str desc}
+	kindWebSetup      = 44 // engine -> host: configure standalone or embedded ArkWeb (scripts, schemes, flags)
+	kindPlaceWebViews = 45 // engine -> host: position embedded WebViews and surface hit-test regions
+	kindWebAsyncReq   = 46 // engine -> host: CallAsyncFunction / CapturePage / PrintToPDF
+	kindWebAsyncRes   = 47 // host -> engine: {u32 reqID, str text, str err, bytes data}
+	kindSchemeReq     = 48 // host -> engine: custom protocol request or cancellation
+	kindSchemeRes     = 49 // engine -> host: custom protocol response headers/body/finish/fail
+
+	kindInternal = 255 // internal main-thread callback queued via Backend.post
 )
 
 // Cookie & WebsiteDataStore operations (kindCookieReq).
@@ -80,21 +88,65 @@ const (
 	cookieOpClearData byte = 5
 )
 
-// Standalone ArkWeb operations (kindWebReq) and events (kindWebEvent).
+// ArkWeb operations (kindWebReq) and events (kindWebEvent).
 const (
-	webOpLoadURL  byte = 1
-	webOpLoadHTML byte = 2
-	webOpReload   byte = 3
-	webOpStop     byte = 4
-	webOpBack     byte = 5
-	webOpForward  byte = 6
-	webOpEval     byte = 7
-	webOpSetUA    byte = 8
+	webOpLoadURL   byte = 1
+	webOpLoadHTML  byte = 2
+	webOpReload    byte = 3
+	webOpStop      byte = 4
+	webOpBack      byte = 5
+	webOpForward   byte = 6
+	webOpEval      byte = 7
+	webOpSetUA     byte = 8
+	webOpSetZoom   byte = 9
+	webOpSetMuted  byte = 10
+	webOpDevTools  byte = 11
+	webOpFocus     byte = 12
+	webOpTabInto   byte = 13
+	webOpSetBg     byte = 14
+	webOpDestroy   byte = 15
+	webOpPermReply byte = 16
 
-	webEvPageBegin byte = 1
-	webEvPageEnd   byte = 2
-	webEvTitle     byte = 3
-	webEvError     byte = 4
+	webEvPageBegin      byte = 1
+	webEvPageEnd        byte = 2
+	webEvTitle          byte = 3
+	webEvError          byte = 4
+	webEvMessage        byte = 5
+	webEvAudioState     byte = 6
+	webEvWindowNew      byte = 7
+	webEvWindowClose    byte = 8
+	webEvRenderExited   byte = 9
+	webEvPermReq        byte = 10
+	webEvDownloadStart  byte = 11
+	webEvSchemeDownload byte = 12
+	webEvTabOut         byte = 13
+	webEvUnhandledKey   byte = 14
+	webEvEmbeddedPress  byte = 15
+	webEvEmbeddedScroll byte = 16
+)
+
+// ArkWeb setup flags (kindWebSetup), async ops (kindWebAsyncReq) & scheme ops (kindSchemeRes).
+const (
+	webSetupIncognito         uint32 = 1 << 0
+	webSetupDevTools          uint32 = 1 << 1
+	webSetupAutoplay          uint32 = 1 << 2
+	webSetupPinchZoom         uint32 = 1 << 3
+	webSetupScrollToContainer uint32 = 1 << 4
+	webSetupTransparent       uint32 = 1 << 5
+	webSetupHasBg             uint32 = 1 << 6
+	webSetupScriptsOnly       uint32 = 1 << 7
+
+	userScriptAtDocEnd  byte = 1 << 0
+	userScriptAllFrames byte = 1 << 1
+
+	webAsyncEval     byte = 1
+	webAsyncCapture  byte = 2
+	webAsyncPrintPDF byte = 3
+
+	schemeOpHead   byte = 1
+	schemeOpBody   byte = 2
+	schemeOpFinish byte = 3
+	schemeOpFail   byte = 4
 )
 
 // NowPlaying playback state bytes (kindNowPlaying).
@@ -260,6 +312,8 @@ const (
 	winActStartDrag       byte = 14
 	winActCloseAllow      byte = 15
 	winActCloseDeny       byte = 16
+	winActEnableWebLayer  byte = 17
+	winActFocusSurface    byte = 18
 )
 
 // rect is a rectangle in the content's own coordinates, origin top left, as

@@ -5,6 +5,8 @@ package ohos
 import (
 	"math"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/egoist/mygo/internal/platform"
@@ -13,40 +15,45 @@ import (
 // Window is a HarmonyOS window backed by either an OHNativeWindow surface or
 // a standalone ArkWeb view in the host process: Window 1 is the UIAbility's
 // main window, and subsequent windows are freeform or modal subwindows on
-// WindowStage.
+// WindowStage. When host != nil, Window stands for an embedded ArkWeb view
+// created via Surface.NewWebView under host.surface.
 type Window struct {
 	b            *Backend
 	id           uint32
 	parentID     uint32
+	host         *Window
+	webViews     []*Window
 	surface      *Surface
 	isWeb        bool
 	webIncognito bool
 	h            platform.WindowHandler
 	opts         platform.WindowOptions
 
-	title       string
-	visible     bool
-	minimized   bool
-	maximized   bool
-	fullscreen  bool
-	focused     bool
-	alwaysOnTop bool
-	hasShadow   bool
-	closed      bool
-	zoom        float64
-	ua          string
-	currentURL  string
-	loading     bool
-	canBack     bool
-	canForward  bool
-	muted       bool
-	bounds      platform.Rect
-	minSize     platform.Size
-	maxSize     platform.Size
-	bgColor     platform.Color
-	hasBg       bool
-	rawTitleBar platform.TitleBar
-	hasTitleBar bool
+	title        string
+	visible      bool
+	minimized    bool
+	maximized    bool
+	fullscreen   bool
+	focused      bool
+	alwaysOnTop  bool
+	hasShadow    bool
+	closed       bool
+	zoom         float64
+	ua           string
+	currentURL   string
+	loading      bool
+	canBack      bool
+	canForward   bool
+	audible      bool
+	muted        bool
+	devToolsOpen bool
+	bounds       platform.Rect
+	minSize      platform.Size
+	maxSize      platform.Size
+	bgColor      platform.Color
+	hasBg        bool
+	rawTitleBar  platform.TitleBar
+	hasTitleBar  bool
 }
 
 func newWindow(b *Backend, id uint32, scale float64, opts *platform.WindowOptions, h platform.WindowHandler) *Window {
@@ -84,6 +91,10 @@ func newWindow(b *Backend, id uint32, scale float64, opts *platform.WindowOption
 				w.ua = suf
 			}
 		}
+		if opts.Zoom > 0 {
+			w.zoom = opts.Zoom
+		}
+		w.devToolsOpen = opts.DevTools
 		w.title = opts.Title
 		w.minSize = opts.MinSize
 		w.maxSize = opts.MaxSize
@@ -397,6 +408,10 @@ func (w *Window) Focus() {
 		return
 	}
 	w.focused = true
+	if w.host != nil {
+		w.sendWebReq(webOpFocus, "", "")
+		return
+	}
 	w.sendAction(winActFocus)
 }
 
@@ -479,6 +494,10 @@ func (w *Window) SetBackgroundColor(c platform.Color) {
 	}
 	w.bgColor = c
 	w.hasBg = true
+	if w.host != nil {
+		w.sendWebReq(webOpSetBg, strconv.FormatUint(uint64(w.packedBgRGBA()), 10), "")
+		return
+	}
 	w.sendConfig(cfgMaskBg)
 }
 
@@ -541,6 +560,29 @@ func (w *Window) Close() {
 
 func (w *Window) closeInternal(notifyHost bool) {
 	if w.closed {
+		return
+	}
+	if len(w.webViews) > 0 {
+		children := slices.Clone(w.webViews)
+		w.webViews = nil
+		for _, child := range children {
+			child.Close()
+		}
+	}
+	if w.host != nil {
+		if notifyHost && w.b != nil {
+			w.b.send(kindWebReq, encodeWebReqMessage(w.id, webOpDestroy, "", ""))
+		}
+		w.closed = true
+		w.focused = false
+		w.visible = false
+		w.host.webViews = slices.DeleteFunc(w.host.webViews, func(x *Window) bool { return x == w })
+		if w.b != nil {
+			w.b.removeWindow(w.id)
+		}
+		if !w.host.closed && w.host.surface != nil {
+			w.host.surface.dropClosedWebView(w)
+		}
 		return
 	}
 	if notifyHost {
@@ -643,23 +685,17 @@ func (w *Window) Eval(js string) {
 	w.sendWebReq(webOpEval, js, "")
 }
 
-func (w *Window) SetUserScripts([]platform.UserScript)          {}
-func (w *Window) SetContentRules([]any)                         {}
-func (w *Window) CallAsyncFunction(string, func(string, error)) {}
-func (w *Window) SetZoom(f float64)                             { w.zoom = f }
-func (w *Window) Zoom() float64                                 { return w.zoom }
+func (w *Window) SetContentRules([]any) {}
 
 func (w *Window) SetUserAgent(ua string) {
 	w.ua = ua
 	w.sendWebReq(webOpSetUA, ua, "")
 }
 
-func (w *Window) UserAgent() string      { return w.ua }
-func (w *Window) ProcessID() int         { return 0 }
-func (w *Window) GPUProcessID() int      { return 0 }
-func (w *Window) IsAudible() bool        { return false }
-func (w *Window) SetAudioMuted(m bool)   { w.muted = m }
-func (w *Window) IsAudioMuted() bool     { return w.muted }
+func (w *Window) UserAgent() string    { return w.ua }
+func (w *Window) ProcessID() int       { return 0 }
+func (w *Window) GPUProcessID() int    { return 0 }
+func (w *Window) IsAudioMuted() bool   { return w.muted }
 func (w *Window) CaptureState(platform.CaptureKind) platform.CaptureState {
 	return platform.CaptureNone
 }
@@ -668,12 +704,5 @@ func (w *Window) TogglePictureInPicture()                                     {}
 func (w *Window) PictureInPictureActive(cb func(bool))                        { cb(false) }
 func (w *Window) SessionState() []byte                                        { return nil }
 func (w *Window) RestoreSessionState([]byte) bool                             { return false }
-func (w *Window) OpenDevTools()                                               {}
-func (w *Window) CloseDevTools()                                              {}
-func (w *Window) IsDevToolsOpened() bool                                      { return false }
-func (w *Window) CapturePage(cb func([]byte, error))                          { cb(nil, platform.ErrUnsupported) }
-func (w *Window) PrintToPDF(platform.PDFOptions, func([]byte, error)) {
-	// No web view to print.
-}
-func (w *Window) DroppedFiles() []string { return nil }
-func (w *Window) Print()                 {}
+func (w *Window) DroppedFiles() []string                                      { return nil }
+func (w *Window) Print()                                                      {}

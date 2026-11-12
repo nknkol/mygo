@@ -292,6 +292,8 @@ func (b *Backend) onWebEvent(payload []byte) {
 		if w.h != nil {
 			w.h.LoadFailed(text, int(errCode), desc)
 		}
+	default:
+		w.onHybridWebEvent(ev, errCode, text, desc)
 	}
 }
 

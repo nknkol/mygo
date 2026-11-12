@@ -2,3 +2,10 @@
 # by string, such as the ability's and the page's.
 -enable-property-obfuscation
 -keep-global-name
+-keep-property-name
+postMessage
+asyncReply
+tabOut
+unhandledKey
+wheelScroll
+setWebController
