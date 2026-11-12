@@ -4013,18 +4013,16 @@ void OnVsyncCallback(long long, void *data) {
     }
 }
 
-void WinSession::applyExpectedFrameRateLocked(uint32_t fps) {
+void WinSession::applyExpectedFrameRateLocked(uint32_t) {
     if (vsync == nullptr) {
         return;
     }
+    // Keep hardware VSync and Rosen/APS GPU clocks at the display's native max
+    // refresh rate (e.g. 120Hz). Lower-rate canvas animations (AnimationFrameRate)
+    // are paced on exact VSync multiples by package ui's paceSkips() without
+    // downclocking touchpad scrolling or UI transitions to 30Hz.
     int32_t maxHz = std::max<int32_t>(60, static_cast<int32_t>(std::lround(hz)));
-    OH_NativeVSync_ExpectedRateRange range;
-    if (fps == 0) {
-        range = {maxHz, maxHz, maxHz};
-    } else {
-        int32_t target = std::clamp<int32_t>(static_cast<int32_t>(fps), 1, maxHz);
-        range = {target, maxHz, target};
-    }
+    OH_NativeVSync_ExpectedRateRange range = {maxHz, maxHz, maxHz};
     OH_NativeVSync_SetExpectedFrameRateRange(vsync, &range);
 }
 
