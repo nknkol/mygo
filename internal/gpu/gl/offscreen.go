@@ -46,12 +46,13 @@ type Offscreen struct {
 // one, current on the calling thread, and binds a framebuffer of w×h
 // pixels.
 func NewOffscreen(es bool, w, h int) (_ *Offscreen, err error) {
-	lib, err := purego.Dlopen("libEGL.so.1", purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	lib, err := openAnyLib("libEGL.so.1", "libEGL.so")
 	if err != nil {
 		return nil, fmt.Errorf("gl: no EGL: %w", err)
 	}
 	var (
 		getPlatformDisplay func(platform uint32, native uintptr, attribs unsafe.Pointer) uintptr
+		getDisplay         func(native uintptr) uintptr
 		initialize         func(display uintptr, major, minor *int32) uint32
 		bindAPI            func(api uint32) uint32
 		chooseConfig       func(display uintptr, attribs *int32, configs *uintptr, size int32, n *int32) uint32
@@ -61,7 +62,7 @@ func NewOffscreen(es bool, w, h int) (_ *Offscreen, err error) {
 		terminate          func(display uintptr) uint32
 	)
 	for name, fn := range map[string]any{
-		"eglGetPlatformDisplay": &getPlatformDisplay, "eglInitialize": &initialize, "eglBindAPI": &bindAPI,
+		"eglInitialize": &initialize, "eglBindAPI": &bindAPI,
 		"eglChooseConfig": &chooseConfig, "eglCreateContext": &createContext, "eglMakeCurrent": &makeCurrent,
 		"eglDestroyContext": &destroyContext, "eglTerminate": &terminate,
 	} {
@@ -70,6 +71,12 @@ func NewOffscreen(es bool, w, h int) (_ *Offscreen, err error) {
 			return nil, fmt.Errorf("gl: EGL has no %s", name)
 		}
 		purego.RegisterFunc(fn, sym)
+	}
+	if sym, err := purego.Dlsym(lib, "eglGetPlatformDisplay"); err == nil && sym != 0 {
+		purego.RegisterFunc(&getPlatformDisplay, sym)
+	}
+	if sym, err := purego.Dlsym(lib, "eglGetDisplay"); err == nil && sym != 0 {
+		purego.RegisterFunc(&getDisplay, sym)
 	}
 	// A variable of its own, not a named result: returning an error would
 	// set that to nil before the undoing below runs.
@@ -85,11 +92,24 @@ func NewOffscreen(es bool, w, h int) (_ *Offscreen, err error) {
 			off.release()
 		}
 	}()
-	display := getPlatformDisplay(eglPlatformSurfaceless, 0, nil)
-	if display == 0 || initialize(display, nil, nil) == 0 {
+	var display uintptr
+	if getPlatformDisplay != nil {
+		display = getPlatformDisplay(eglPlatformSurfaceless, 0, nil)
+	}
+	if (display == 0 || initialize(display, nil, nil) == 0) && getDisplay != nil {
+		display = getDisplay(0)
+		if display == 0 || initialize(display, nil, nil) == 0 {
+			return nil, errors.New("gl: no surfaceless EGL display")
+		}
+	} else if display == 0 {
 		return nil, errors.New("gl: no surfaceless EGL display")
 	}
-	undo = append(undo, func() { terminate(display) })
+	// On OpenHarmony EGL 1.4, eglTerminate invalidates the process-wide default
+	// display handle for subsequent tests on other threads; only terminate
+	// surfaceless Mesa displays created via eglGetPlatformDisplay.
+	if getPlatformDisplay != nil {
+		undo = append(undo, func() { terminate(display) })
+	}
 	api, bit, contextAttribs := uint32(eglOpenGLAPI), int32(eglOpenGLBit), []int32{eglContextMajorVersion, 3, eglContextMinorVersion, 3, eglContextProfileMask, eglContextCoreProfileBit, eglNone}
 	if es {
 		api, bit, contextAttribs = eglOpenGLESAPI, eglOpenGLES3Bit, []int32{eglContextMajorVersion, 3, eglContextMinorVersion, 0, eglNone}

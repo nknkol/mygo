@@ -256,6 +256,17 @@ type SurfaceNative struct {
 	// Context.ID), current while SurfaceFrame events are handled
 	// (browsers).
 	Canvas uintptr
+	// OHOSSurface backs OpenGL ES hardware rendering into OH_NativeBuffer
+	// targets on HarmonyOS.
+	OHOSSurface OHOSSurface
+}
+
+// OHOSSurface presents frames rendered into an OpenGL ES framebuffer backed by
+// an OH_NativeBuffer on HarmonyOS.
+type OHOSSurface interface {
+	BeginGL(width, height int) (reallocated bool, err error)
+	EndGL(width, height int, damage []image.Rectangle, whole, unchanged bool) error
+	ReleaseGL()
 }
 
 // RectF is a rectangle in DIPs with fractional coordinates.

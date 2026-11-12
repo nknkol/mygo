@@ -5,10 +5,12 @@ package gl
 import (
 	"bytes"
 	"runtime"
+	"slices"
 	"testing"
 
 	"github.com/egoist/mygo/internal/gpu/gputest"
 	"github.com/egoist/mygo/internal/raster"
+	"github.com/egoist/mygo/internal/scene"
 )
 
 // apis are the APIs the renderer draws with: OpenGL 3.3 and OpenGL ES 3.0.
@@ -51,6 +53,13 @@ func TestDrawsAsTheCPURenderer(t *testing.T) {
 			if r.es != api.es {
 				t.Fatalf("the renderer takes the context for OpenGL ES: %v", r.es)
 			}
+			prep := func(sc *scene.Scene) *scene.Scene {
+				if !r.dual {
+					withoutSubpixelGlyphsTest(sc)
+				}
+				return sc
+			}
+			s = prep(s)
 			// Twice: the second frame updates what the first uploaded.
 			for range 2 {
 				if err := r.Render(s); err != nil {
@@ -59,21 +68,21 @@ func TestDrawsAsTheCPURenderer(t *testing.T) {
 				gputest.Compare(t, "gl", read(), s.Width*4, s)
 			}
 
-			s = gputest.TransformedScene()
+			s = prep(gputest.TransformedScene())
 			for range 2 {
 				if err := r.Render(s); err != nil {
 					t.Fatal(err)
 				}
 				gputest.Compare(t, "gl-affine", read(), s.Width*4, s)
 			}
-			s = gputest.PerspectiveScene()
+			s = prep(gputest.PerspectiveScene())
 			for range 2 {
 				if err := r.Render(s); err != nil {
 					t.Fatal(err)
 				}
 				gputest.Compare(t, "gl-perspective", read(), s.Width*4, s)
 			}
-			s = gputest.BehindOriginScene()
+			s = prep(gputest.BehindOriginScene())
 			for range 2 {
 				if err := r.Render(s); err != nil {
 					t.Fatal(err)
@@ -85,12 +94,13 @@ func TestDrawsAsTheCPURenderer(t *testing.T) {
 				}
 			}
 			for i, s := range gputest.TranslatedScenes() {
+				s = prep(s)
 				if err := r.Render(s); err != nil {
 					t.Fatal(err)
 				}
 				gputest.Compare(t, "gl-translated"+[]string{"", "-between-pixels"}[i], read(), s.Width*4, s)
 			}
-			s = gputest.MaskedClipScene()
+			s = prep(gputest.MaskedClipScene())
 			// Twice: the second frame finds the clips' masks it made.
 			for range 2 {
 				if err := r.Render(s); err != nil {
@@ -98,7 +108,7 @@ func TestDrawsAsTheCPURenderer(t *testing.T) {
 				}
 				gputest.Compare(t, "gl-masked-clips", read(), s.Width*4, s)
 			}
-			s = gputest.CornerClipScene()
+			s = prep(gputest.CornerClipScene())
 			for range 2 {
 				if err := r.Render(s); err != nil {
 					t.Fatal(err)
@@ -107,6 +117,27 @@ func TestDrawsAsTheCPURenderer(t *testing.T) {
 			}
 		})
 	}
+}
+
+// withoutSubpixelGlyphsTest leaves subpixel glyphs out where GLES lacks
+// EXT_blend_func_extended, matching gl_js_test.go.
+func withoutSubpixelGlyphsTest(s *scene.Scene) {
+	ops := s.Ops[:0]
+	for _, op := range s.Ops {
+		if op.Kind == scene.OpGlyphs {
+			gs := s.Glyphs[op.Start:op.End]
+			if !slices.ContainsFunc(gs, func(g scene.Glyph) bool { return !g.Subpixel }) {
+				continue
+			}
+			for i := range gs {
+				if gs[i].Subpixel {
+					gs[i].Color = scene.Color{}
+				}
+			}
+		}
+		ops = append(ops, op)
+	}
+	s.Ops = ops
 }
 
 // TestBorderedCardDrawsAsTheCPURenderer draws the card of #531 (a large

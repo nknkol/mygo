@@ -20,6 +20,9 @@ var (
 	epoxyIsDesktopGL  func() bool
 	epoxyHasExtension func(name string) bool
 	currentGDKContext func() uintptr // gdk_gl_context_get_current, when GDK is loaded
+	currentEGLContext func() uintptr // eglGetCurrentContext, when EGL is loaded without GDK
+	glGetStringi      func(name, index uint32) uintptr
+	directGLES        bool
 
 	// GTK's functions of a GtkGLArea's context, when GTK is loaded
 	// (MakeAreaCurrent).
@@ -94,6 +97,9 @@ func load() error {
 	loadOnce.Do(func() {
 		lib, err := purego.Dlopen("libepoxy.so.0", purego.RTLD_NOW|purego.RTLD_GLOBAL)
 		if err != nil {
+			if errGLES := loadDirectGLES(); errGLES == nil {
+				return
+			}
 			errLoad = fmt.Errorf("gl: cannot load libepoxy: %w", err)
 			return
 		}
@@ -119,71 +125,18 @@ func load() error {
 		fn(&epoxyGLVersion, "epoxy_gl_version")
 		fn(&epoxyIsDesktopGL, "epoxy_is_desktop_gl")
 		fn(&epoxyHasExtension, "epoxy_has_gl_extension")
-		gl(&glGetString, "glGetString")
-		gl(&glGetError, "glGetError")
-		gl(&glGetIntegerv, "glGetIntegerv")
-		gl(&glCreateShader, "glCreateShader")
-		gl(&glShaderSource, "glShaderSource")
-		gl(&glCompileShader, "glCompileShader")
-		gl(&glGetShaderiv, "glGetShaderiv")
-		gl(&glGetShaderInfoLog, "glGetShaderInfoLog")
-		gl(&glDeleteShader, "glDeleteShader")
-		gl(&glCreateProgram, "glCreateProgram")
-		gl(&glAttachShader, "glAttachShader")
-		gl(&glLinkProgram, "glLinkProgram")
-		gl(&glGetProgramiv, "glGetProgramiv")
-		gl(&glGetProgramInfoLog, "glGetProgramInfoLog")
-		gl(&glUseProgram, "glUseProgram")
-		gl(&glDeleteProgram, "glDeleteProgram")
-		gl(&glGetUniformLocation, "glGetUniformLocation")
-		gl(&glGetUniformBlockIndex, "glGetUniformBlockIndex")
-		gl(&glUniformBlockBinding, "glUniformBlockBinding")
-		gl(&glBindBufferBase, "glBindBufferBase")
-		gl(&glUniform1i, "glUniform1i")
-		gl(&glUniform2f, "glUniform2f")
-		gl(&glUniform1f, "glUniform1f")
-		gl(&glUniform2i, "glUniform2i")
-		gl(&glUniform4i, "glUniform4i")
-		gl(&glCopyTexSubImage2D, "glCopyTexSubImage2D")
-		gl(&glGenVertexArrays, "glGenVertexArrays")
-		gl(&glBindVertexArray, "glBindVertexArray")
-		gl(&glDeleteVertexArrays, "glDeleteVertexArrays")
-		gl(&glGenBuffers, "glGenBuffers")
-		gl(&glBindBuffer, "glBindBuffer")
-		gl(&glBufferData, "glBufferData")
-		gl(&glDeleteBuffers, "glDeleteBuffers")
-		gl(&glEnableVertexAttrib, "glEnableVertexAttribArray")
-		gl(&glVertexAttribPointer, "glVertexAttribPointer")
-		gl(&glVertexAttribDivisor, "glVertexAttribDivisor")
-		gl(&glGenTextures, "glGenTextures")
-		gl(&glBindTexture, "glBindTexture")
-		gl(&glActiveTexture, "glActiveTexture")
-		gl(&glTexImage2D, "glTexImage2D")
-		gl(&glTexSubImage2D, "glTexSubImage2D")
-		gl(&glTexParameteri, "glTexParameteri")
-		gl(&glDeleteTextures, "glDeleteTextures")
-		gl(&glPixelStorei, "glPixelStorei")
-		gl(&glViewport, "glViewport")
-		gl(&glScissor, "glScissor")
-		gl(&glEnable, "glEnable")
-		gl(&glDisable, "glDisable")
-		gl(&glBlendFunc, "glBlendFunc")
-		gl(&glBlendFuncSeparate, "glBlendFuncSeparate")
-		gl(&glClearColor, "glClearColor")
-		gl(&glClear, "glClear")
-		gl(&glDrawArraysInstanced, "glDrawArraysInstanced")
-		gl(&glReadPixels, "glReadPixels")
-		gl(&glGenFramebuffers, "glGenFramebuffers")
-		gl(&glBindFramebuffer, "glBindFramebuffer")
-		gl(&glFramebufferTexture2D, "glFramebufferTexture2D")
-		gl(&glCheckFramebufferState, "glCheckFramebufferStatus")
-		gl(&glDeleteFramebuffers, "glDeleteFramebuffers")
-		gl(&glBlitFramebuffer, "glBlitFramebuffer")
+		registerAllGL(gl)
 		if len(missing) > 0 {
 			errLoad = fmt.Errorf("gl: libepoxy lacks %s", strings.Join(missing, ", "))
 			return
 		}
-		direct(lib)
+		direct(func(name string) *uintptr {
+			sym, err := purego.Dlsym(lib, "epoxy_"+name)
+			if err != nil || sym == 0 {
+				return nil
+			}
+			return *(**uintptr)(unsafe.Pointer(&sym))
+		})
 		// GDK is loaded in apps, where its context tells when GTK
 		// realized the area again; tests make contexts of their own.
 		if sym, err := purego.Dlsym(purego.RTLD_DEFAULT, "gdk_gl_context_get_current"); err == nil && sym != 0 {
@@ -201,22 +154,150 @@ func load() error {
 			}
 			purego.RegisterFunc(f, sym)
 		}
+		if gdkClearCurrent == nil {
+			if eglLib, err := purego.Dlopen("/system/lib64/libEGL.so", purego.RTLD_LAZY|purego.RTLD_LOCAL); err == nil {
+				if sym, err := purego.Dlsym(eglLib, "eglGetCurrentContext"); err == nil && sym != 0 {
+					purego.RegisterFunc(&currentEGLContext, sym)
+				}
+			}
+		}
 	})
 	return errLoad
 }
 
-// direct calls the GL functions a frame calls for each batch with
-// purego.SyscallN, through libepoxy's pointer to each: a function
-// RegisterFunc made builds its arguments with reflection on every call,
-// which cost more than the call itself, and a frame makes hundreds.
-func direct(lib uintptr) {
-	ptr := func(name string) *uintptr {
-		sym, err := purego.Dlsym(lib, "epoxy_"+name)
-		if err != nil || sym == 0 {
-			return nil
-		}
-		return *(**uintptr)(unsafe.Pointer(&sym))
+func registerAllGL(gl func(f any, name string)) {
+	gl(&glGetString, "glGetString")
+	gl(&glGetError, "glGetError")
+	gl(&glGetIntegerv, "glGetIntegerv")
+	gl(&glCreateShader, "glCreateShader")
+	gl(&glShaderSource, "glShaderSource")
+	gl(&glCompileShader, "glCompileShader")
+	gl(&glGetShaderiv, "glGetShaderiv")
+	gl(&glGetShaderInfoLog, "glGetShaderInfoLog")
+	gl(&glDeleteShader, "glDeleteShader")
+	gl(&glCreateProgram, "glCreateProgram")
+	gl(&glAttachShader, "glAttachShader")
+	gl(&glLinkProgram, "glLinkProgram")
+	gl(&glGetProgramiv, "glGetProgramiv")
+	gl(&glGetProgramInfoLog, "glGetProgramInfoLog")
+	gl(&glUseProgram, "glUseProgram")
+	gl(&glDeleteProgram, "glDeleteProgram")
+	gl(&glGetUniformLocation, "glGetUniformLocation")
+	gl(&glGetUniformBlockIndex, "glGetUniformBlockIndex")
+	gl(&glUniformBlockBinding, "glUniformBlockBinding")
+	gl(&glBindBufferBase, "glBindBufferBase")
+	gl(&glUniform1i, "glUniform1i")
+	gl(&glUniform2f, "glUniform2f")
+	gl(&glUniform1f, "glUniform1f")
+	gl(&glUniform2i, "glUniform2i")
+	gl(&glUniform4i, "glUniform4i")
+	gl(&glCopyTexSubImage2D, "glCopyTexSubImage2D")
+	gl(&glGenVertexArrays, "glGenVertexArrays")
+	gl(&glBindVertexArray, "glBindVertexArray")
+	gl(&glDeleteVertexArrays, "glDeleteVertexArrays")
+	gl(&glGenBuffers, "glGenBuffers")
+	gl(&glBindBuffer, "glBindBuffer")
+	gl(&glBufferData, "glBufferData")
+	gl(&glDeleteBuffers, "glDeleteBuffers")
+	gl(&glEnableVertexAttrib, "glEnableVertexAttribArray")
+	gl(&glVertexAttribPointer, "glVertexAttribPointer")
+	gl(&glVertexAttribDivisor, "glVertexAttribDivisor")
+	gl(&glGenTextures, "glGenTextures")
+	gl(&glBindTexture, "glBindTexture")
+	gl(&glActiveTexture, "glActiveTexture")
+	gl(&glTexImage2D, "glTexImage2D")
+	gl(&glTexSubImage2D, "glTexSubImage2D")
+	gl(&glTexParameteri, "glTexParameteri")
+	gl(&glDeleteTextures, "glDeleteTextures")
+	gl(&glPixelStorei, "glPixelStorei")
+	gl(&glViewport, "glViewport")
+	gl(&glScissor, "glScissor")
+	gl(&glEnable, "glEnable")
+	gl(&glDisable, "glDisable")
+	gl(&glBlendFunc, "glBlendFunc")
+	gl(&glBlendFuncSeparate, "glBlendFuncSeparate")
+	gl(&glClearColor, "glClearColor")
+	gl(&glClear, "glClear")
+	gl(&glDrawArraysInstanced, "glDrawArraysInstanced")
+	gl(&glReadPixels, "glReadPixels")
+	gl(&glGenFramebuffers, "glGenFramebuffers")
+	gl(&glBindFramebuffer, "glBindFramebuffer")
+	gl(&glFramebufferTexture2D, "glFramebufferTexture2D")
+	gl(&glCheckFramebufferState, "glCheckFramebufferStatus")
+	gl(&glDeleteFramebuffers, "glDeleteFramebuffers")
+	gl(&glBlitFramebuffer, "glBlitFramebuffer")
+}
+
+// loadDirectGLES loads libGLESv3.so and libEGL.so directly when libepoxy is
+// unavailable, as in HarmonyOS native packages.
+func loadDirectGLES() error {
+	eglLib, err := openAnyLib("libEGL.so", "libEGL.so.1")
+	if err != nil {
+		return err
 	}
+	glesLib, err := openAnyLib("libGLESv3.so", "libGLESv2.so.2", "libGLESv2.so")
+	if err != nil {
+		return err
+	}
+	var eglGetProcAddress func(name string) uintptr
+	if sym, err := purego.Dlsym(eglLib, "eglGetProcAddress"); err == nil && sym != 0 {
+		purego.RegisterFunc(&eglGetProcAddress, sym)
+	}
+	if sym, err := purego.Dlsym(eglLib, "eglGetCurrentContext"); err == nil && sym != 0 {
+		purego.RegisterFunc(&currentEGLContext, sym)
+	}
+	resolve := func(name string) uintptr {
+		if sym, err := purego.Dlsym(glesLib, name); err == nil && sym != 0 {
+			return sym
+		}
+		if eglGetProcAddress != nil {
+			return eglGetProcAddress(name)
+		}
+		return 0
+	}
+	var missing []string
+	addrs := make(map[string]*uintptr, 16)
+	gl := func(f any, name string) {
+		sym := resolve(name)
+		if sym == 0 {
+			missing = append(missing, name)
+			return
+		}
+		purego.RegisterFunc(f, sym)
+		p := new(uintptr)
+		*p = sym
+		addrs[name] = p
+	}
+	registerAllGL(gl)
+	if sym := resolve("glGetStringi"); sym != 0 {
+		purego.RegisterFunc(&glGetStringi, sym)
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("gl: libGLESv3 lacks %s", strings.Join(missing, ", "))
+	}
+	directGLES = true
+	direct(func(name string) *uintptr { return addrs[name] })
+	return nil
+}
+
+func openAnyLib(names ...string) (uintptr, error) {
+	var lastErr error
+	for _, name := range names {
+		lib, err := purego.Dlopen(name, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+		if err == nil {
+			return lib, nil
+		}
+		lastErr = err
+	}
+	return 0, lastErr
+}
+
+// direct calls the GL functions a frame calls for each batch with
+// purego.SyscallN, through libepoxy's pointer to each (or direct symbol
+// address on GLES): a function RegisterFunc made builds its arguments with
+// reflection on every call, which cost more than the call itself, and a
+// frame makes hundreds.
+func direct(ptr func(name string) *uintptr) {
 	b := func(v bool) uintptr {
 		if v {
 			return 1
@@ -301,10 +382,13 @@ func needsRestore(area, current uintptr, has bool) bool {
 }
 
 func currentContext() uintptr {
-	if currentGDKContext == nil {
-		return 0
+	if currentGDKContext != nil {
+		return currentGDKContext()
 	}
-	return currentGDKContext()
+	if currentEGLContext != nil {
+		return currentEGLContext()
+	}
+	return 0
 }
 
 func goString(p uintptr) string {
@@ -321,17 +405,81 @@ func goString(p uintptr) string {
 	}
 }
 
+const (
+	glExtensions    = 0x1F03
+	glNumExtensions = 0x821D
+)
+
 // contextVersion returns the version of the current context, major × 10 +
 // minor, and whether it is OpenGL ES.
-func contextVersion() (version int32, es bool) { return epoxyGLVersion(), !epoxyIsDesktopGL() }
+func contextVersion() (version int32, es bool) {
+	if !directGLES {
+		return epoxyGLVersion(), !epoxyIsDesktopGL()
+	}
+	return parseGLVersionString(versionString())
+}
+
+func parseGLVersionString(s string) (version int32, es bool) {
+	s = strings.TrimSpace(s)
+	if rest, ok := strings.CutPrefix(s, "OpenGL ES-CM "); ok {
+		es, s = true, rest
+	} else if rest, ok := strings.CutPrefix(s, "OpenGL ES-CL "); ok {
+		es, s = true, rest
+	} else if rest, ok := strings.CutPrefix(s, "OpenGL ES "); ok {
+		es, s = true, rest
+	}
+	var major, minor int32
+	i := 0
+	for i < len(s) && (s[i] < '0' || s[i] > '9') {
+		i++
+	}
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		major = major*10 + int32(s[i]-'0')
+		i++
+	}
+	if i < len(s) && s[i] == '.' {
+		i++
+		if i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			minor = int32(s[i] - '0')
+		}
+	}
+	return major*10 + minor, es
+}
 
 // hasExtension reports whether the current context has an extension.
-func hasExtension(name string) bool { return epoxyHasExtension(name) }
+func hasExtension(name string) bool {
+	if !directGLES {
+		return epoxyHasExtension(name)
+	}
+	if glGetStringi != nil {
+		var n int32
+		glGetIntegerv(glNumExtensions, &n)
+		for i := int32(0); i < n; i++ {
+			if goString(glGetStringi(glExtensions, uint32(i))) == name {
+				return true
+			}
+		}
+		if n > 0 {
+			return false
+		}
+	}
+	for _, ext := range strings.Fields(goString(glGetString(glExtensions))) {
+		if ext == name {
+			return true
+		}
+	}
+	return false
+}
 
 // hasContext reports whether a context is current, which GDK may think one
 // is when OpenGL does not: libepoxy aborts the first call of most GL
 // functions without one. glGetString it finds without.
-func hasContext() bool { return glGetString(glVersion) != 0 }
+func hasContext() bool {
+	if currentEGLContext != nil {
+		return currentEGLContext() != 0 && glGetString(glVersion) != 0
+	}
+	return glGetString(glVersion) != 0
+}
 
 // versionString describes the current context's version, for errors.
 func versionString() string { return goString(glGetString(glVersion)) }

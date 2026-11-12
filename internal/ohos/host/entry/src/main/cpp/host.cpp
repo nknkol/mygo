@@ -2108,6 +2108,7 @@ void WinSession::renderLoop() {
         return;
     }
 
+    OH_NativeWindow_NativeWindowHandleOpt(win, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_RGBA_8888);
     int32_t rc = OH_NativeWindow_NativeWindowHandleOpt(win, SET_BUFFER_GEOMETRY, w, h);
     uint64_t usage = 0;
     OH_NativeWindow_NativeWindowHandleOpt(win, GET_USAGE, &usage);

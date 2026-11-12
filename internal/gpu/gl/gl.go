@@ -1362,6 +1362,23 @@ func (r *Renderer) FrameInfo() string {
 	return r.b.Summary()
 }
 
+// LastRedraw reports what the most recent Render call drew into the bound
+// framebuffer, in top-down device pixel coordinates.
+func (r *Renderer) LastRedraw() (whole, unchanged bool, damage []image.Rectangle) {
+	switch r.redrew {
+	case redrewNothing:
+		return false, true, nil
+	case redrewPart:
+		out := make([]image.Rectangle, len(r.part.Rects))
+		for i, sc := range r.part.Rects {
+			out[i] = image.Rect(int(sc.Left), int(sc.Top), int(sc.Right), int(sc.Bottom))
+		}
+		return false, false, out
+	default:
+		return true, false, nil
+	}
+}
+
 // sweep frees the textures of images no frame drew for a while, and
 // those of canvases gone, or transient and not drawn this frame: render
 // calls it every 120 frames.

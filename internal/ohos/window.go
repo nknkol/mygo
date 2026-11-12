@@ -551,6 +551,7 @@ func (w *Window) closeInternal(notifyHost bool) {
 	w.visible = false
 	if w.surface != nil {
 		w.surface.Idle()
+		w.surface.ReleaseGL()
 	}
 	if w.b != nil {
 		w.b.removeWindow(w.id)

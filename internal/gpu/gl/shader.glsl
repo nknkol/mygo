@@ -430,6 +430,27 @@ vec4 stopsAt(vec4 c2, float t, bool lab) {
 	return vec4(clamp(fromOklab(mix(ap.yzw * a.a, bp.yzw * b.a, f) / alpha), 0.0, 1.0) * alpha, alpha);
 }
 
+// atan2f computes atan(y, x) to float32 precision where mobile GLSL ES
+// drivers approximate hardware atan coarsely near hard conic stops.
+float atan2f(float y, float x) {
+	float ax = abs(x), ay = abs(y);
+	float mx = max(ax, ay);
+	if (mx == 0.0) {
+		return 0.0;
+	}
+	float a = min(ax, ay) / mx;
+	float s = a * a;
+	float r = (((((((0.0028662257 * s - 0.0161657367) * s + 0.0429096138) * s - 0.0752896400) * s +
+				  0.1065626393) * s - 0.1420889944) * s + 0.1999355085) * s - 0.3333314528) * s * a + a;
+	if (ay > ax) {
+		r = 1.5707963267948966 - r;
+	}
+	if (x < 0.0) {
+		r = 3.141592653589793 - r;
+	}
+	return y < 0.0 ? -r : r;
+}
+
 // paint returns the premultiplied color at p of plain color, a gradient
 // mixed in sRGB (1) or Oklab (2), stripes (3), or a gradient of stops,
 // linear (4, 5), conic (6, 7) or radial (8, 9), mixed in sRGB or in
@@ -445,7 +466,7 @@ vec4 paint(vec2 p, float mode, vec4 rect, vec4 c1, vec4 c2, vec4 g) {
 			t = dot(p - g.xy, d) / max(dot(d, d), 0.0001);
 		} else if (mode < 7.5) {
 			vec2 d = p - g.xy;
-			t = (atan(d.x, -d.y) - g.z) * 0.15915494309189535;
+			t = (atan2f(d.x, -d.y) - g.z) * 0.15915494309189535;
 			t -= floor(t);
 		} else {
 			t = length(p - g.xy) / max(g.z, 0.0001);

@@ -7,6 +7,7 @@ import (
 	"math"
 	"sync"
 	"syscall"
+	"unsafe"
 
 	"github.com/egoist/mygo/internal/platform"
 	"github.com/egoist/mygo/transfer"
@@ -61,6 +62,8 @@ type Surface struct {
 	touch             touchGesture
 	pinch             float64
 	lastX, lastY      float64
+	glCtx             uintptr
+	gl                *glTarget
 }
 
 type buffer struct {
@@ -75,7 +78,12 @@ type buffer struct {
 	lastUsed uint64
 }
 
-func (s *Surface) Native() platform.SurfaceNative { return platform.SurfaceNative{} }
+func (s *Surface) Native() platform.SurfaceNative {
+	if s == nil || !gpuAvailable() {
+		return platform.SurfaceNative{}
+	}
+	return platform.SurfaceNative{OHOSSurface: s}
+}
 
 func (s *Surface) Size() (width, height, scale float64) {
 	s.mu.Lock()
@@ -124,14 +132,14 @@ func (s *Surface) RequestFrame() {
 }
 
 func (s *Surface) PresentPixels(pix []byte, stride, width, height int) {
-	s.present(pix, stride, width, height, nil, true)
+	s.presentInternal(pix, stride, width, height, nil, true, false)
 }
 
 func (s *Surface) PresentDamage(pix []byte, stride, width, height int, damage []image.Rectangle) {
-	s.present(pix, stride, width, height, damage, false)
+	s.presentInternal(pix, stride, width, height, damage, false, false)
 }
 
-func (s *Surface) present(pix []byte, stride, width, height int, damage []image.Rectangle, whole bool) {
+func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage []image.Rectangle, whole, fromGPU bool) {
 	s.mu.Lock()
 	b := s.cur
 	if b == nil {
@@ -214,7 +222,11 @@ func (s *Surface) present(pix []byte, stride, width, height int, damage []image.
 
 	var rects []rect
 	if paintWhole {
-		copyRect(b, pix, stride, width, height, pixBounds)
+		if fromGPU {
+			copyRectGPUFlipY(b, pix, stride, width, height, pixBounds)
+		} else {
+			copyRectBGRAtoRGBA(b, pix, stride, width, height, pixBounds)
+		}
 	} else {
 		rects = make([]rect, 0, len(acc))
 		bufBounds := image.Rect(0, 0, min(width, b.w), min(height, b.h))
@@ -223,7 +235,11 @@ func (s *Surface) present(pix []byte, stride, width, height int, damage []image.
 			if r.Empty() {
 				continue
 			}
-			copyRect(b, pix, stride, width, height, r)
+			if fromGPU {
+				copyRectGPUFlipY(b, pix, stride, width, height, r)
+			} else {
+				copyRectBGRAtoRGBA(b, pix, stride, width, height, r)
+			}
 			rects = append(rects, rect{int32(r.Min.X), int32(r.Min.Y), uint32(r.Dx()), uint32(r.Dy())})
 		}
 	}
@@ -239,7 +255,9 @@ func (s *Surface) present(pix []byte, stride, width, height int, damage []image.
 	}
 }
 
-func copyRect(b *buffer, pix []byte, stride, width, height int, r image.Rectangle) {
+// copyRectBGRAtoRGBA copies top-down premultiplied BGRA pixels from raster.Image
+// into OHNativeWindow's top-down premultiplied RGBA_8888 buffer.
+func copyRectBGRAtoRGBA(b *buffer, pix []byte, stride, width, height int, r image.Rectangle) {
 	r = r.Intersect(image.Rect(0, 0, min(width, b.w), min(height, b.h)))
 	if r.Empty() {
 		return
@@ -249,7 +267,7 @@ func copyRect(b *buffer, pix []byte, stride, width, height int, r image.Rectangl
 		src := r.Min.Y * stride
 		end := r.Max.Y * stride
 		if end <= len(pix) && end <= len(b.mem) {
-			copy(b.mem[src:end], pix[src:end])
+			swizzleBGRAtoRGBA(b.mem[src:end], pix[src:end])
 			return
 		}
 	}
@@ -257,6 +275,46 @@ func copyRect(b *buffer, pix []byte, stride, width, height int, r image.Rectangl
 		src := y*stride + r.Min.X*4
 		dst := y*b.stride + r.Min.X*4
 		if src+n > len(pix) || dst+n > len(b.mem) {
+			return
+		}
+		swizzleBGRAtoRGBA(b.mem[dst:dst+n], pix[src:src+n])
+	}
+}
+
+func swizzleBGRAtoRGBA(dst, src []byte) {
+	n := min(len(dst), len(src)) &^ 3
+	if n == 0 {
+		return
+	}
+	dp := unsafe.Pointer(&dst[0])
+	sp := unsafe.Pointer(&src[0])
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		v := *(*uint64)(unsafe.Add(sp, i))
+		*(*uint64)(unsafe.Add(dp, i)) = (v & 0xff00ff00ff00ff00) |
+			((v & 0x00ff000000ff0000) >> 16) |
+			((v & 0x000000ff000000ff) << 16)
+	}
+	for ; i+4 <= n; i += 4 {
+		b0, g0, r0, a0 := src[i], src[i+1], src[i+2], src[i+3]
+		dst[i], dst[i+1], dst[i+2], dst[i+3] = r0, g0, b0, a0
+	}
+}
+
+// copyRectGPUFlipY copies OpenGL ES's bottom-up RGBA_8888 framebuffer rows into
+// OHNativeWindow's top-down RGBA_8888 buffer for top-down damage rect r.
+func copyRectGPUFlipY(b *buffer, pix []byte, stride, width, height int, r image.Rectangle) {
+	r = r.Intersect(image.Rect(0, 0, min(width, b.w), min(height, b.h)))
+	if r.Empty() {
+		return
+	}
+	n := r.Dx() * 4
+	xOff := r.Min.X * 4
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		srcY := height - 1 - y
+		src := srcY*stride + xOff
+		dst := y*b.stride + xOff
+		if src < 0 || src+n > len(pix) || dst+n > len(b.mem) {
 			return
 		}
 		copy(b.mem[dst:dst+n], pix[src:src+n])
@@ -361,9 +419,11 @@ func (s *Surface) SetFrameRate(fps float64) {
 	}
 }
 
-// Idle releases cached swapchain mappings and damage history once package ui
-// has dropped its backing image after frameIdle or when the window closes.
+// Idle releases cached swapchain mappings, GPU target buffers and damage
+// history once package ui has dropped its backing image after frameIdle or when
+// the window closes.
 func (s *Surface) Idle() {
+	s.releaseGLTarget()
 	s.mu.Lock()
 	s.history = nil
 	for id, b := range s.buffers {
