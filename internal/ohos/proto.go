@@ -64,6 +64,37 @@ const (
 	kindNotifRemove = 37 // engine -> host: {u8 all, 3×pad, str id}
 	kindPowerReq    = 38 // engine -> host: {u8 keepSys, u8 keepDisp, u8 keepRun, u8 pad, str reason}
 	kindNetWatch    = 39 // engine -> host: {}
+
+	kindCookieReq    = 40 // engine -> host: {u32 reqID, u8 op, u8 incognito, 2×pad, u32 siteDataTypes, str url, str headerOrName, str domain, str path}
+	kindCookieResult = 41 // host -> engine: {u32 reqID, str err, u32 count, cookies...}
+	kindWebReq       = 42 // engine -> host: {u32 winID, u8 op, 3×pad, str arg1, str arg2}
+	kindWebEvent     = 43 // host -> engine: {u32 winID, u8 ev, u8 canBack, u8 canForward, u8 pad, i32 errCode, str text, str desc}
+)
+
+// Cookie & WebsiteDataStore operations (kindCookieReq).
+const (
+	cookieOpList      byte = 1
+	cookieOpSet       byte = 2
+	cookieOpDelete    byte = 3
+	cookieOpClear     byte = 4
+	cookieOpClearData byte = 5
+)
+
+// Standalone ArkWeb operations (kindWebReq) and events (kindWebEvent).
+const (
+	webOpLoadURL  byte = 1
+	webOpLoadHTML byte = 2
+	webOpReload   byte = 3
+	webOpStop     byte = 4
+	webOpBack     byte = 5
+	webOpForward  byte = 6
+	webOpEval     byte = 7
+	webOpSetUA    byte = 8
+
+	webEvPageBegin byte = 1
+	webEvPageEnd   byte = 2
+	webEvTitle     byte = 3
+	webEvError     byte = 4
 )
 
 // NowPlaying playback state bytes (kindNowPlaying).
@@ -196,6 +227,9 @@ const (
 	winFlagFrameless      uint32 = 1 << 11
 	winFlagHasBg          uint32 = 1 << 12
 	winFlagMovable        uint32 = 1 << 13
+	winFlagWebView        uint32 = 1 << 14
+	winFlagWebIncognito   uint32 = 1 << 15
+	winFlagTransparent    uint32 = 1 << 16
 )
 
 // Configuration field mask (kindWinConfig).

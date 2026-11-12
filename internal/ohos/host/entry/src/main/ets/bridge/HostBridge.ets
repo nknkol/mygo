@@ -2,6 +2,8 @@ import host, {
   HostBridgeCallbacks,
   HostClipRep,
   HostClipWrite,
+  HostCookie,
+  HostCookieReq,
   HostDisplayInfo,
   HostFileDialog,
   HostFileFilter,
@@ -17,6 +19,7 @@ import { avSession } from '@kit.AVSessionKit';
 import { preferences } from '@kit.ArkData';
 import { util } from '@kit.ArkTS';
 import { display, window } from '@kit.ArkUI';
+import { webview } from '@kit.ArkWeb';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { BusinessError, batteryInfo, commonEventManager, pasteboard } from '@kit.BasicServicesKit';
 import { fileIo, fileShare, fileUri, picker } from '@kit.CoreFileKit';
@@ -43,6 +46,9 @@ const WIN_FLAG_FULLSCREEN: number = 1 << 9;
 const WIN_FLAG_CENTER: number = 1 << 10;
 const WIN_FLAG_FRAMELESS: number = 1 << 11;
 const WIN_FLAG_HAS_BG: number = 1 << 12;
+const WIN_FLAG_WEBVIEW: number = 1 << 14;
+const WIN_FLAG_WEB_INCOGNITO: number = 1 << 15;
+const WIN_FLAG_TRANSPARENT: number = 1 << 16;
 
 const CFG_MASK_TITLE: number = 1 << 0;
 const CFG_MASK_BOUNDS: number = 1 << 1;
@@ -103,6 +109,27 @@ const MEDIA_CMD_NEXT: number = 1 << 4;
 const MEDIA_CMD_PREV: number = 1 << 5;
 const MEDIA_CMD_SEEK: number = 1 << 6;
 
+const COOKIE_OP_LIST: number = 1;
+const COOKIE_OP_SET: number = 2;
+const COOKIE_OP_DELETE: number = 3;
+const COOKIE_OP_CLEAR: number = 4;
+const COOKIE_OP_CLEAR_DATA: number = 5;
+
+const SITE_DATA_COOKIES: number = 1 << 0;
+const SITE_DATA_LOCAL_STORAGE: number = 1 << 1;
+const SITE_DATA_INDEXED_DB: number = 1 << 2;
+const SITE_DATA_CACHES: number = 1 << 3;
+
+export const WEB_OP_LOAD_URL: number = 1;
+export const WEB_OP_LOAD_HTML: number = 2;
+export const WEB_OP_RELOAD: number = 3;
+export const WEB_OP_STOP: number = 4;
+export const WEB_OP_BACK: number = 5;
+export const WEB_OP_FORWARD: number = 6;
+export const WEB_OP_EVAL: number = 7;
+export const WEB_OP_SET_UA: number = 8;
+export const WEB_OP_CLEAR_CACHE: number = 99;
+
 const NOTIF_PARAM_KEY: string = 'mygoNotificationId';
 
 function hashNotifId(id: string): number {
@@ -120,6 +147,7 @@ const PREF_KEY_URIS: string = 'persisted_uris';
 
 export type PopupMenuOpener = (reqId: number, x: number, y: number, rtl: boolean, items: HostMenuItem[]) => void;
 export type MessageBoxOpener = (box: HostMessageBox) => void;
+export type WebCommandRunner = (op: number, arg1: string, arg2: string) => void;
 
 class ManagedWindow {
   winId: number = 1;
@@ -127,6 +155,15 @@ class ManagedWindow {
   win: window.Window | undefined = undefined;
   ready: boolean = false;
   active: boolean = false;
+  isWeb: boolean = false;
+  webIncognito: boolean = false;
+  webUrl: string = '';
+  webUserAgent: string = '';
+  pendingWebHtml: string = '';
+  pendingWebBaseUrl: string = '';
+  firstFrameReady: boolean = false;
+  pendingShowAction: number = 0;
+  showTimerId: number = -1;
   closingFromEngine: boolean = false;
   lastStatus: window.WindowStatusType = window.WindowStatusType.FLOATING;
   cfg: HostWinConfig | undefined = undefined;
@@ -141,6 +178,60 @@ function rgbaToHexColor(rgba: number): string {
   const a: number = rgba & 0xFF;
   const to2 = (v: number): string => v.toString(16).padStart(2, '0');
   return '#' + to2(a) + to2(r) + to2(g) + to2(b);
+}
+
+function rgbaToArgb(rgba: number): number {
+  const r: number = (rgba >>> 24) & 0xFF;
+  const g: number = (rgba >>> 16) & 0xFF;
+  const b: number = (rgba >>> 8) & 0xFF;
+  const a: number = rgba & 0xFF;
+  return ((a << 24) | (r << 16) | (g << 8) | b) >>> 0;
+}
+
+function resolveWindowBg(cfg: HostWinConfig | undefined, isWeb: boolean, darkMode: boolean): [string, number] {
+  if (cfg !== undefined && (cfg.flags & WIN_FLAG_HAS_BG) !== 0) {
+    return [rgbaToHexColor(cfg.bgRGBA), rgbaToArgb(cfg.bgRGBA)];
+  }
+  if (cfg !== undefined && (cfg.flags & WIN_FLAG_TRANSPARENT) !== 0) {
+    return ['#00000000', 0x00000000];
+  }
+  if (darkMode) {
+    return ['#FF1C1C1F', 0xFF1C1C1F];
+  }
+  if (isWeb) {
+    return ['#FFFFFFFF', 0xFFFFFFFF];
+  }
+  return ['#FFF4F4F6', 0xFFF4F4F6];
+}
+
+function extractHostFromUrl(rawUrl: string): string {
+  const schemeEnd: number = rawUrl.indexOf('://');
+  const rest: string = schemeEnd >= 0 ? rawUrl.substring(schemeEnd + 3) : rawUrl;
+  let end: number = rest.length;
+  const slash: number = rest.indexOf('/');
+  if (slash >= 0 && slash < end) {
+    end = slash;
+  }
+  const q: number = rest.indexOf('?');
+  if (q >= 0 && q < end) {
+    end = q;
+  }
+  const hash: number = rest.indexOf('#');
+  if (hash >= 0 && hash < end) {
+    end = hash;
+  }
+  let authority: string = rest.substring(0, end);
+  const atIdx: number = authority.lastIndexOf('@');
+  if (atIdx >= 0) {
+    authority = authority.substring(atIdx + 1);
+  }
+  if (!authority.startsWith('[')) {
+    const colon: number = authority.indexOf(':');
+    if (colon >= 0) {
+      authority = authority.substring(0, colon);
+    }
+  }
+  return authority.trim().toLowerCase();
 }
 
 function encodeUtf8Buffer(text: string): ArrayBuffer {
@@ -193,6 +284,8 @@ class HostBridgeManager {
   private windows: Map<number, ManagedWindow> = new Map<number, ManagedWindow>();
   private popupOpeners: Map<number, PopupMenuOpener> = new Map<number, PopupMenuOpener>();
   private msgBoxOpeners: Map<number, MessageBoxOpener> = new Map<number, MessageBoxOpener>();
+  private webRunners: Map<number, WebCommandRunner> = new Map<number, WebCommandRunner>();
+  private webEngineInitialized: boolean = false;
   private displayListenersRegistered: boolean = false;
   private pasteboardListenerRegistered: boolean = false;
   private callbacksRegistered: boolean = false;
@@ -250,6 +343,9 @@ class HostBridgeManager {
         onWinAction: (winId: number, action: number): void => {
           this.handleWinAction(winId, action);
         },
+        onFirstFrame: (winId: number): void => {
+          this.handleFirstFrame(winId);
+        },
         onPopupMenu: (reqId: number, winId: number, x: number, y: number, rtl: boolean, items: HostMenuItem[]): void => {
           this.handlePopupMenu(reqId, winId, x, y, rtl, items);
         },
@@ -285,6 +381,12 @@ class HostBridgeManager {
         },
         onNetWatch: (): void => {
           this.handleNetWatch();
+        },
+        onCookieReq: (req: HostCookieReq): void => {
+          this.handleCookieReq(req);
+        },
+        onWebReq: (winId: number, op: number, arg1: string, arg2: string): void => {
+          this.handleWebReq(winId, op, arg1, arg2);
         },
         onEngineQuit: (): void => {
           this.handleEngineQuit();
@@ -381,11 +483,16 @@ class HostBridgeManager {
     this.unregisterNetWatch();
     this.teardownAVSessionAndBackground();
     this.windows.forEach((mw: ManagedWindow): void => {
+      if (mw.showTimerId >= 0) {
+        clearTimeout(mw.showTimerId);
+        mw.showTimerId = -1;
+      }
       this.detachWindowListeners(mw);
     });
     this.windows.clear();
     this.popupOpeners.clear();
     this.msgBoxOpeners.clear();
+    this.webRunners.clear();
     this.windowStage = undefined;
   }
 
@@ -411,6 +518,34 @@ class HostBridgeManager {
 
   unregisterMessageBoxOpener(winId: number): void {
     this.msgBoxOpeners.delete(winId);
+  }
+
+  registerWebRunner(winId: number, runner: WebCommandRunner): void {
+    this.webRunners.set(winId, runner);
+  }
+
+  unregisterWebRunner(winId: number): void {
+    this.webRunners.delete(winId);
+  }
+
+  getWebUrl(winId: number): string {
+    return this.windows.get(winId)?.webUrl ?? '';
+  }
+
+  getWebUserAgent(winId: number): string {
+    return this.windows.get(winId)?.webUserAgent ?? '';
+  }
+
+  consumePendingWebHtml(winId: number): [string, string] {
+    const mw: ManagedWindow | undefined = this.windows.get(winId);
+    if (mw === undefined || mw.pendingWebHtml.length === 0) {
+      return ['', ''];
+    }
+    const html: string = mw.pendingWebHtml;
+    const base: string = mw.pendingWebBaseUrl;
+    mw.pendingWebHtml = '';
+    mw.pendingWebBaseUrl = '';
+    return [html, base];
   }
 
   // ---------- Pasteboard Bridge ----------
@@ -727,18 +862,25 @@ class HostBridgeManager {
       const pref: preferences.Preferences = preferences.getPreferencesSync(this.context, { name: PREF_STORE_NAME });
       const raw: preferences.ValueType = pref.getSync(PREF_KEY_URIS, []);
       if (Array.isArray(raw) && raw.length > 0) {
-        const policies: fileShare.PolicyInfo[] = [];
+        const rwPolicies: fileShare.PolicyInfo[] = [];
+        const roPolicies: fileShare.PolicyInfo[] = [];
         for (let i: number = 0; i < raw.length; i++) {
           const u: string = String(raw[i]);
           if (u.length > 0) {
-            policies.push({
+            rwPolicies.push({
               uri: u,
               operationMode: fileShare.OperationMode.READ_MODE | fileShare.OperationMode.WRITE_MODE
             });
+            roPolicies.push({
+              uri: u,
+              operationMode: fileShare.OperationMode.READ_MODE
+            });
           }
         }
-        if (policies.length > 0) {
-          fileShare.activatePermission(policies).catch((): void => {});
+        if (rwPolicies.length > 0) {
+          fileShare.activatePermission(rwPolicies).catch((): void => {
+            fileShare.activatePermission(roPolicies).catch((): void => {});
+          });
         }
       }
     } catch (_) {}
@@ -752,16 +894,26 @@ class HostBridgeManager {
       ? (fileShare.OperationMode.READ_MODE | fileShare.OperationMode.WRITE_MODE)
       : fileShare.OperationMode.READ_MODE;
     const policies: fileShare.PolicyInfo[] = [];
+    const roPolicies: fileShare.PolicyInfo[] = [];
     for (let i: number = 0; i < uris.length; i++) {
       if (uris[i].length > 0) {
         policies.push({ uri: uris[i], operationMode: mode });
+        roPolicies.push({ uri: uris[i], operationMode: fileShare.OperationMode.READ_MODE });
       }
     }
     if (policies.length === 0) {
       return;
     }
     try {
-      await fileShare.persistPermission(policies);
+      try {
+        await fileShare.persistPermission(policies);
+      } catch (e) {
+        if (writable) {
+          await fileShare.persistPermission(roPolicies);
+        } else {
+          throw e as Error;
+        }
+      }
       const pref: preferences.Preferences = preferences.getPreferencesSync(this.context, { name: PREF_STORE_NAME });
       const prevRaw: preferences.ValueType = pref.getSync(PREF_KEY_URIS, []);
       const merged: string[] = [];
@@ -1194,6 +1346,45 @@ class HostBridgeManager {
     }
   }
 
+  private computeInitialSubWindowRect(cfg: HostWinConfig, sc: number): window.Rect {
+    const wPx: number = Math.max(100, Math.round((cfg.w > 0 ? cfg.w : 800) * sc));
+    const hPx: number = Math.max(80, Math.round((cfg.h > 0 ? cfg.h : 600) * sc));
+    if ((cfg.flags & WIN_FLAG_CENTER) === 0) {
+      return {
+        left: Math.round(cfg.x * sc),
+        top: Math.round(cfg.y * sc),
+        width: wPx,
+        height: hPx
+      };
+    }
+    const parentId: number = cfg.parentOrMask > 0 ? cfg.parentOrMask : 1;
+    const parentMw: ManagedWindow | undefined = this.windows.get(parentId) ?? this.windows.get(1);
+    if (parentMw !== undefined && parentMw.win !== undefined) {
+      try {
+        const pr: window.Rect = parentMw.win.getWindowProperties().windowRect;
+        if (pr.width > 0 && pr.height > 0) {
+          return {
+            left: Math.max(0, Math.round(pr.left + (pr.width - wPx) / 2)),
+            top: Math.max(0, Math.round(pr.top + (pr.height - hPx) / 2)),
+            width: wPx,
+            height: hPx
+          };
+        }
+      } catch (_) {}
+    }
+    try {
+      const d: display.Display = display.getDefaultDisplaySync();
+      return {
+        left: Math.max(0, Math.round((d.width - wPx) / 2)),
+        top: Math.max(0, Math.round((d.height - hPx) / 2)),
+        width: wPx,
+        height: hPx
+      };
+    } catch (_) {
+      return { left: 100, top: 80, width: wPx, height: hPx };
+    }
+  }
+
   private handleWinCreate(cfg: HostWinConfig): void {
     if (cfg.winId === 1) {
       let mw: ManagedWindow | undefined = this.windows.get(1);
@@ -1202,6 +1393,8 @@ class HostBridgeManager {
         mw.winId = 1;
         this.windows.set(1, mw);
       }
+      mw.isWeb = (cfg.flags & WIN_FLAG_WEBVIEW) !== 0;
+      mw.webIncognito = (cfg.flags & WIN_FLAG_WEB_INCOGNITO) !== 0;
       mw.cfg = cfg;
       if (mw.ready && mw.win !== undefined) {
         this.applyWindowConfig(mw, cfg, CFG_MASK_ALL, true);
@@ -1214,25 +1407,26 @@ class HostBridgeManager {
     }
     const mw: ManagedWindow = new ManagedWindow();
     mw.winId = cfg.winId;
+    mw.isWeb = (cfg.flags & WIN_FLAG_WEBVIEW) !== 0;
+    mw.webIncognito = (cfg.flags & WIN_FLAG_WEB_INCOGNITO) !== 0;
     mw.cfg = cfg;
     this.windows.set(cfg.winId, mw);
+
+    if (mw.isWeb) {
+      this.ensureWebEngineInitialized();
+    }
 
     const sc: number = this.currentScale();
     const frameless: boolean = (cfg.flags & WIN_FLAG_FRAMELESS) !== 0;
     const modal: boolean = (cfg.flags & WIN_FLAG_MODAL) !== 0;
+    const maximizable: boolean = (cfg.flags & WIN_FLAG_MAXIMIZABLE) !== 0;
     const opts: window.SubWindowOptions = {
       title: cfg.title.length > 0 ? cfg.title : 'Window',
       decorEnabled: !frameless,
-      isModal: modal
+      isModal: modal,
+      maximizeSupported: maximizable,
+      windowRect: this.computeInitialSubWindowRect(cfg, sc)
     };
-    if (cfg.w > 0 && cfg.h > 0) {
-      opts.windowRect = {
-        left: Math.round(cfg.x * sc),
-        top: Math.round(cfg.y * sc),
-        width: Math.max(100, Math.round(cfg.w * sc)),
-        height: Math.max(80, Math.round(cfg.h * sc))
-      };
-    }
 
     const stage: window.WindowStage = this.windowStage;
     stage.createSubWindowWithOptions('mygo_win_' + cfg.winId.toString(), opts).then((subWin: window.Window): void => {
@@ -1246,9 +1440,15 @@ class HostBridgeManager {
       } catch (_) {}
       this.attachWindowListeners(mw);
 
+      const darkMode: boolean = AppStorage.get<boolean>('darkMode') ?? false;
+      const bgPair: [string, number] = resolveWindowBg(mw.cfg, mw.isWeb, darkMode);
       const storage: LocalStorage = new LocalStorage();
       storage.setOrCreate<number>('winId', cfg.winId);
       storage.setOrCreate<number>('arkWindowId', mw.arkWindowId);
+      storage.setOrCreate<boolean>('isWebWindow', mw.isWeb);
+      storage.setOrCreate<boolean>('webIncognito', mw.webIncognito);
+      storage.setOrCreate<string>('bgHex', bgPair[0]);
+      storage.setOrCreate<number>('bgARGB', bgPair[1]);
 
       subWin.loadContent('pages/Index', storage).then((): void => {
         if (!this.windows.has(cfg.winId)) {
@@ -1257,6 +1457,9 @@ class HostBridgeManager {
         mw.ready = true;
         if (mw.cfg !== undefined) {
           this.applyWindowConfig(mw, mw.cfg, CFG_MASK_ALL, true);
+        }
+        if (this.powerKeepDisplay) {
+          try { subWin.setWindowKeepScreenOn(true).catch((): void => {}); } catch (_) {}
         }
         this.reportWindowRect(mw);
         this.flushPendingActions(mw);
@@ -1317,9 +1520,11 @@ class HostBridgeManager {
       } catch (_) {}
     }
 
-    if ((mask & CFG_MASK_BG) !== 0 && (cfg.flags & WIN_FLAG_HAS_BG) !== 0) {
+    if ((mask & CFG_MASK_BG) !== 0 || isCreate) {
+      const darkMode: boolean = AppStorage.get<boolean>('darkMode') ?? false;
+      const bgPair: [string, number] = resolveWindowBg(cfg, mw.isWeb, darkMode);
       try {
-        w.setWindowBackgroundColor(rgbaToHexColor(cfg.bgRGBA));
+        w.setWindowBackgroundColor(bgPair[0]);
       } catch (_) {}
     }
 
@@ -1355,15 +1560,15 @@ class HostBridgeManager {
       }
     }
 
-    if ((mask & CFG_MASK_BOUNDS) !== 0 && (!isCreate || mw.winId !== 1)) {
-      if (cfg.w > 0 && cfg.h > 0 && !isCreate) {
+    if ((mask & CFG_MASK_BOUNDS) !== 0 && !isCreate) {
+      if (cfg.w > 0 && cfg.h > 0) {
         try {
           w.resize(Math.max(100, Math.round(cfg.w * sc)), Math.max(80, Math.round(cfg.h * sc))).catch((): void => {});
         } catch (_) {}
       }
       if ((cfg.flags & WIN_FLAG_CENTER) !== 0) {
         this.centerWindow(mw);
-      } else if (!isCreate || cfg.x !== 0 || cfg.y !== 0) {
+      } else {
         try {
           w.moveWindowTo(Math.round(cfg.x * sc), Math.round(cfg.y * sc)).catch((): void => {});
         } catch (_) {}
@@ -1480,6 +1685,51 @@ class HostBridgeManager {
     }
   }
 
+  private handleFirstFrame(winId: number): void {
+    const mw: ManagedWindow | undefined = this.windows.get(winId);
+    if (mw === undefined) {
+      return;
+    }
+    mw.firstFrameReady = true;
+    this.revealSubWindow(mw);
+  }
+
+  private showManagedWindowNow(mw: ManagedWindow, action: number): void {
+    const w: window.Window | undefined = mw.win;
+    if (w === undefined) {
+      return;
+    }
+    try {
+      w.showWindow().then((): void => {
+        this.reportWindowRect(mw);
+        if (action === WIN_ACT_SHOW) {
+          this.focusManagedWindow(mw);
+        }
+      }).catch((): void => {});
+    } catch (_) {}
+  }
+
+  private revealSubWindow(mw: ManagedWindow): void {
+    if (mw.showTimerId >= 0) {
+      clearTimeout(mw.showTimerId);
+      mw.showTimerId = -1;
+    }
+    if (!mw.ready || mw.win === undefined || mw.pendingShowAction === 0) {
+      return;
+    }
+    const act: number = mw.pendingShowAction;
+    mw.pendingShowAction = 0;
+    this.showManagedWindowNow(mw, act);
+  }
+
+  private clearSubWindowTimers(mw: ManagedWindow): void {
+    if (mw.showTimerId >= 0) {
+      clearTimeout(mw.showTimerId);
+      mw.showTimerId = -1;
+    }
+    mw.pendingShowAction = 0;
+  }
+
   private executeWindowAction(mw: ManagedWindow, action: number): void {
     const w: window.Window | undefined = mw.win;
     if (w === undefined) {
@@ -1488,16 +1738,21 @@ class HostBridgeManager {
     switch (action) {
       case WIN_ACT_SHOW:
       case WIN_ACT_SHOW_INACTIVE:
-        try {
-          w.showWindow().then((): void => {
-            this.reportWindowRect(mw);
-            if (action === WIN_ACT_SHOW) {
-              this.focusManagedWindow(mw);
-            }
-          }).catch((): void => {});
-        } catch (_) {}
+        if (mw.winId >= 2 && !mw.isWeb && !mw.firstFrameReady) {
+          mw.pendingShowAction = action;
+          if (mw.showTimerId < 0) {
+            mw.showTimerId = setTimeout((): void => {
+              mw.showTimerId = -1;
+              mw.firstFrameReady = true;
+              this.revealSubWindow(mw);
+            }, 90);
+          }
+          break;
+        }
+        this.showManagedWindowNow(mw, action);
         break;
       case WIN_ACT_HIDE:
+        this.clearSubWindowTimers(mw);
         if (mw.winId >= 2) {
           try {
             w.minimize().catch((): void => {});
@@ -1506,6 +1761,7 @@ class HostBridgeManager {
         break;
       case WIN_ACT_CLOSE:
         mw.closingFromEngine = true;
+        this.clearSubWindowTimers(mw);
         if (mw.winId === 1) {
           this.handleEngineQuit();
         } else {
@@ -1513,6 +1769,7 @@ class HostBridgeManager {
           this.windows.delete(mw.winId);
           this.popupOpeners.delete(mw.winId);
           this.msgBoxOpeners.delete(mw.winId);
+          this.webRunners.delete(mw.winId);
           try {
             w.destroyWindow().catch((): void => {});
           } catch (_) {}
@@ -1683,10 +1940,12 @@ class HostBridgeManager {
     if (mw === undefined) {
       return;
     }
+    this.clearSubWindowTimers(mw);
     this.detachWindowListeners(mw);
     this.windows.delete(winId);
     this.popupOpeners.delete(winId);
     this.msgBoxOpeners.delete(winId);
+    this.webRunners.delete(winId);
     if (mw.win !== undefined) {
       try {
         mw.win.destroyWindow().catch((): void => {});
@@ -2297,6 +2556,212 @@ class HostBridgeManager {
       try {
         conn.unregister((): void => {});
       } catch (_) {}
+    }
+  }
+
+  // ---------- ArkWeb Window Commands & Cookie / DataStore Bridge ----------
+
+  private ensureWebEngineInitialized(): void {
+    if (this.webEngineInitialized) {
+      return;
+    }
+    this.webEngineInitialized = true;
+    try {
+      webview.WebviewController.initializeWebEngine();
+    } catch (_) {}
+    try {
+      webview.WebCookieManager.putAcceptCookieEnabled(true);
+      webview.WebCookieManager.putAcceptThirdPartyCookieEnabled(true);
+    } catch (_) {}
+  }
+
+  private handleWebReq(winId: number, op: number, arg1: string, arg2: string): void {
+    hilog.info(DOMAIN, TAG, 'onWebReq win=%{public}d op=%{public}d arg1=%{public}s', winId, op, arg1);
+    const mw: ManagedWindow | undefined = this.windows.get(winId);
+    if (mw !== undefined) {
+      if (op === WEB_OP_LOAD_URL) {
+        mw.webUrl = arg1;
+        mw.pendingWebHtml = '';
+        mw.pendingWebBaseUrl = '';
+      } else if (op === WEB_OP_LOAD_HTML) {
+        mw.pendingWebHtml = arg1;
+        mw.pendingWebBaseUrl = arg2;
+      } else if (op === WEB_OP_SET_UA) {
+        mw.webUserAgent = arg1;
+      }
+    }
+    const runner: WebCommandRunner | undefined = this.webRunners.get(winId);
+    if (runner !== undefined) {
+      runner(op, arg1, arg2);
+    }
+  }
+
+  private handleCookieReq(req: HostCookieReq): void {
+    this.ensureWebEngineInitialized();
+    this.runCookieReqAsync(req).then((cookies: HostCookie[]): void => {
+      host.resolveCookie(req.reqId, '', cookies);
+    }).catch((err: BusinessError): void => {
+      const msg: string = err?.message ?? 'cookie operation failed';
+      host.resolveCookie(req.reqId, msg, []);
+    });
+  }
+
+  private async runCookieReqAsync(req: HostCookieReq): Promise<HostCookie[]> {
+    switch (req.op) {
+      case COOKIE_OP_LIST: {
+        const out: HostCookie[] = [];
+        const seenNames: Map<string, boolean> = new Map<string, boolean>();
+        try {
+          const rawList: webview.WebHttpCookie[] = await webview.WebCookieManager.fetchAllCookies(req.incognito);
+          for (let i: number = 0; i < rawList.length; i++) {
+            const c: webview.WebHttpCookie = rawList[i];
+            let expiresUnix: number = 0;
+            if (!c.isSessionCookie && c.expiresDate && c.expiresDate.length > 0) {
+              const ms: number = Date.parse(c.expiresDate);
+              if (!Number.isNaN(ms) && ms > 0) {
+                expiresUnix = Math.floor(ms / 1000);
+              }
+            }
+            let sameSite: string = '';
+            if (c.samesitePolicy === webview.WebHttpCookieSameSitePolicy.STRICT) {
+              sameSite = 'strict';
+            } else if (c.samesitePolicy === webview.WebHttpCookieSameSitePolicy.LAX) {
+              sameSite = 'lax';
+            } else if (c.samesitePolicy === webview.WebHttpCookieSameSitePolicy.NONE) {
+              sameSite = 'none';
+            }
+            const hc: HostCookie = {
+              name: c.name ?? '',
+              value: c.value ?? '',
+              domain: c.domain ?? '',
+              path: (c.path && c.path.length > 0) ? c.path : '/',
+              expiresUnix: expiresUnix,
+              secure: c.isSecure ?? false,
+              httpOnly: c.isHttpOnly ?? false,
+              sameSite: sameSite
+            };
+            if (hc.name.length > 0) {
+              out.push(hc);
+              seenNames.set(hc.name, true);
+            }
+          }
+        } catch (_) {}
+
+        if (req.url.length > 0) {
+          try {
+            const cookieStr: string = webview.WebCookieManager.fetchCookieSync(req.url, req.incognito, true);
+            if (cookieStr.length > 0) {
+              const hostName: string = extractHostFromUrl(req.url);
+              const isHttps: boolean = req.url.toLowerCase().startsWith('https://');
+              const parts: string[] = cookieStr.split(';');
+              for (let i: number = 0; i < parts.length; i++) {
+                const seg: string = parts[i].trim();
+                const eq: number = seg.indexOf('=');
+                if (eq <= 0) {
+                  continue;
+                }
+                const k: string = seg.substring(0, eq).trim();
+                const v: string = seg.substring(eq + 1);
+                if (k.length > 0 && !seenNames.has(k)) {
+                  seenNames.set(k, true);
+                  out.push({
+                    name: k,
+                    value: v,
+                    domain: hostName,
+                    path: '/',
+                    expiresUnix: 0,
+                    secure: isHttps,
+                    httpOnly: false,
+                    sameSite: ''
+                  });
+                }
+              }
+            }
+          } catch (_) {}
+        }
+        return out;
+      }
+
+      case COOKIE_OP_SET: {
+        webview.WebCookieManager.configCookieSync(req.url, req.headerOrName, req.incognito, true);
+        if (!req.incognito) {
+          try {
+            await webview.WebCookieManager.saveCookieAsync();
+          } catch (_) {}
+        }
+        return [];
+      }
+
+      case COOKIE_OP_DELETE: {
+        const cleanHost: string = req.domain.startsWith('.') ? req.domain.substring(1) : req.domain;
+        const p: string = req.path.length > 0 ? req.path : '/';
+        if (cleanHost.length > 0 && req.headerOrName.length > 0) {
+          const baseExp: string = req.headerOrName + '=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=' + p;
+          const urls: string[] = ['https://' + cleanHost + p, 'http://' + cleanHost + p];
+          const variants: string[] = [
+            baseExp,
+            baseExp + '; HttpOnly',
+            baseExp + '; Domain=' + req.domain,
+            baseExp + '; Domain=' + req.domain + '; HttpOnly'
+          ];
+          for (let uIdx: number = 0; uIdx < urls.length; uIdx++) {
+            for (let vIdx: number = 0; vIdx < variants.length; vIdx++) {
+              try {
+                webview.WebCookieManager.configCookieSync(urls[uIdx], variants[vIdx], req.incognito, true);
+              } catch (_) {}
+            }
+          }
+          try {
+            webview.WebCookieManager.configCookieSync(
+              'https://' + cleanHost + p,
+              baseExp + '; Secure; HttpOnly',
+              req.incognito,
+              true
+            );
+          } catch (_) {}
+        }
+        if (!req.incognito) {
+          try {
+            await webview.WebCookieManager.saveCookieAsync();
+          } catch (_) {}
+        }
+        return [];
+      }
+
+      case COOKIE_OP_CLEAR: {
+        webview.WebCookieManager.clearAllCookiesSync(req.incognito);
+        if (!req.incognito) {
+          try {
+            await webview.WebCookieManager.saveCookieAsync();
+          } catch (_) {}
+        }
+        return [];
+      }
+
+      case COOKIE_OP_CLEAR_DATA: {
+        if ((req.siteDataTypes & SITE_DATA_COOKIES) !== 0) {
+          try {
+            webview.WebCookieManager.clearAllCookiesSync(req.incognito);
+            if (!req.incognito) {
+              await webview.WebCookieManager.saveCookieAsync();
+            }
+          } catch (_) {}
+        }
+        if ((req.siteDataTypes & (SITE_DATA_LOCAL_STORAGE | SITE_DATA_INDEXED_DB)) !== 0) {
+          try {
+            webview.WebStorage.deleteAllData(req.incognito);
+          } catch (_) {}
+        }
+        if ((req.siteDataTypes & SITE_DATA_CACHES) !== 0) {
+          this.webRunners.forEach((runner: WebCommandRunner): void => {
+            runner(WEB_OP_CLEAR_CACHE, '', '');
+          });
+        }
+        return [];
+      }
+
+      default:
+        throw new Error('unsupported cookie op');
     }
   }
 }

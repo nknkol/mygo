@@ -1,19 +1,46 @@
 import host, { HostMenuItem, HostMessageBox } from 'libmygo_host.so';
-import { ComponentContent, NodeContent, UIContext, display } from '@kit.ArkUI';
-import { hostBridge } from '../bridge/HostBridge';
+import { ComponentContent, LengthMetrics, NodeContent, UIContext, display } from '@kit.ArkUI';
+import { webview } from '@kit.ArkWeb';
+import {
+  WEB_OP_BACK,
+  WEB_OP_CLEAR_CACHE,
+  WEB_OP_EVAL,
+  WEB_OP_FORWARD,
+  WEB_OP_LOAD_HTML,
+  WEB_OP_LOAD_URL,
+  WEB_OP_RELOAD,
+  WEB_OP_SET_UA,
+  WEB_OP_STOP,
+  hostBridge
+} from '../bridge/HostBridge';
 
-const MENU_KIND_SEPARATOR: number = 3;
-const MENU_KIND_SUBMENU: number = 4;
+const MENU_KIND_SEPARATOR: number = 1;
+const MENU_KIND_SUBMENU: number = 2;
+const MENU_KIND_CHECKBOX: number = 3;
+const MENU_KIND_RADIO: number = 4;
+
+const WEB_EV_PAGE_BEGIN: number = 1;
+const WEB_EV_PAGE_END: number = 2;
+const WEB_EV_TITLE: number = 3;
+const WEB_EV_ERROR: number = 4;
+
+class QueuedWebCmd {
+  op: number = 0;
+  arg1: string = '';
+  arg2: string = '';
+}
 
 class MenuEntryModel {
   key: string = '';
   itemId: number = 0;
   label: string = '';
-  labelInfo: string | undefined = undefined;
+  labelInfo: string = '';
   enabled: boolean = true;
+  checkable: boolean = false;
+  isRadio: boolean = false;
   checked: boolean = false;
   hasSubmenu: boolean = false;
-  subSections: MenuSectionModel[] = [];
+  subLevel: MenuLevelModel | undefined = undefined;
 }
 
 class MenuSectionModel {
@@ -21,8 +48,15 @@ class MenuSectionModel {
   entries: MenuEntryModel[] = [];
 }
 
-class PopupMenuContext {
+class MenuLevelModel {
   sections: MenuSectionModel[] = [];
+  hasCheckable: boolean = false;
+  widthVp: number = 148;
+}
+
+class PopupMenuContext {
+  root: MenuLevelModel = new MenuLevelModel();
+  darkMode: boolean = false;
   direction: Direction = Direction.Auto;
   onSelect: (chosenId: number) => void = (_chosenId: number): void => {};
 }
@@ -47,10 +81,53 @@ class MessageBoxContext {
   onChoose: (index: number) => void = (_index: number): void => {};
 }
 
-function buildMenuSections(items: HostMenuItem[], prefix: string): MenuSectionModel[] {
+function measureMenuLevelWidthVp(uiCtx: UIContext, sections: MenuSectionModel[], hasCheckable: boolean): number {
+  let maxRowVp: number = 128;
+  for (let s: number = 0; s < sections.length; s++) {
+    const entries: MenuEntryModel[] = sections[s].entries;
+    for (let i: number = 0; i < entries.length; i++) {
+      const ent: MenuEntryModel = entries[i];
+      let labelVp: number = ent.label.length * 13;
+      let infoVp: number = ent.labelInfo.length * 8;
+      try {
+        const labelPx: number = uiCtx.getMeasureUtils().measureText({
+          textContent: ent.label,
+          fontSize: 13,
+          fontWeight: FontWeight.Normal
+        });
+        labelVp = uiCtx.px2vp(labelPx);
+        if (ent.labelInfo.length > 0) {
+          const infoPx: number = uiCtx.getMeasureUtils().measureText({
+            textContent: ent.labelInfo,
+            fontSize: 12,
+            fontWeight: FontWeight.Normal
+          });
+          infoVp = uiCtx.px2vp(infoPx);
+        }
+      } catch (_) {}
+      let rowVp: number = 28 + labelVp;
+      if (hasCheckable) {
+        rowVp += 18;
+      }
+      if (ent.labelInfo.length > 0) {
+        rowVp += 18 + infoVp;
+      }
+      if (ent.hasSubmenu) {
+        rowVp += 20;
+      }
+      if (rowVp > maxRowVp) {
+        maxRowVp = rowVp;
+      }
+    }
+  }
+  return Math.min(300, Math.max(128, Math.ceil(maxRowVp + 8)));
+}
+
+function buildMenuLevel(uiCtx: UIContext, items: HostMenuItem[], prefix: string): MenuLevelModel {
   const sections: MenuSectionModel[] = [];
   let current: MenuEntryModel[] = [];
   let secIdx: number = 0;
+  let hasCheckable: boolean = false;
   for (let i: number = 0; i < items.length; i++) {
     const raw: HostMenuItem = items[i];
     if (raw.kind === MENU_KIND_SEPARATOR) {
@@ -68,14 +145,20 @@ function buildMenuSections(items: HostMenuItem[], prefix: string): MenuSectionMo
     ent.key = prefix + '_it_' + i.toString() + '_' + raw.id.toString();
     ent.itemId = raw.id;
     ent.label = raw.label;
-    if (raw.accel.length > 0) {
-      ent.labelInfo = raw.accel;
-    }
+    ent.labelInfo = raw.accel;
     ent.enabled = raw.enabled;
-    ent.checked = raw.checked;
+    ent.checkable = raw.kind === MENU_KIND_CHECKBOX || raw.kind === MENU_KIND_RADIO;
+    ent.isRadio = raw.kind === MENU_KIND_RADIO;
+    ent.checked = raw.checked && ent.checkable;
+    if (ent.checkable) {
+      hasCheckable = true;
+    }
     if (raw.kind === MENU_KIND_SUBMENU && raw.items.length > 0) {
-      ent.subSections = buildMenuSections(raw.items, ent.key);
-      ent.hasSubmenu = ent.subSections.length > 0;
+      const sub: MenuLevelModel = buildMenuLevel(uiCtx, raw.items, ent.key);
+      if (sub.sections.length > 0) {
+        ent.subLevel = sub;
+        ent.hasSubmenu = true;
+      }
     }
     current.push(ent);
   }
@@ -85,22 +168,78 @@ function buildMenuSections(items: HostMenuItem[], prefix: string): MenuSectionMo
     lastSec.entries = current;
     sections.push(lastSec);
   }
-  return sections;
+  const level: MenuLevelModel = new MenuLevelModel();
+  level.sections = sections;
+  level.hasCheckable = hasCheckable;
+  level.widthVp = measureMenuLevelWidthVp(uiCtx, sections, hasCheckable);
+  return level;
 }
 
 @Builder
-function buildLevel3SubMenu(sections: MenuSectionModel[], ctx: PopupMenuContext): void {
+function buildMenuItemRow(ent: MenuEntryModel, hasCheckable: boolean, darkMode: boolean): void {
+  Row() {
+    if (hasCheckable) {
+      Row() {
+        Text(ent.checked ? (ent.isRadio ? '•' : '✓') : '')
+          .fontSize(ent.isRadio ? 15 : 13)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(
+            ent.enabled
+              ? (darkMode ? '#F1F3F5' : '#182431')
+              : (darkMode ? '#66FFFFFF' : '#66182431')
+          )
+      }
+      .width(18)
+      .height('100%')
+      .alignItems(VerticalAlign.Center)
+      .justifyContent(FlexAlign.Start)
+    }
+    Text(ent.label)
+      .fontSize(13)
+      .fontWeight(FontWeight.Normal)
+      .fontColor(
+        ent.enabled
+          ? (darkMode ? '#F1F3F5' : '#182431')
+          : (darkMode ? '#66FFFFFF' : '#66182431')
+      )
+      .maxLines(1)
+      .textOverflow({ overflow: TextOverflow.Ellipsis })
+      .layoutWeight(1)
+    if (ent.labelInfo.length > 0) {
+      Text(ent.labelInfo)
+        .fontSize(12)
+        .fontWeight(FontWeight.Normal)
+        .fontColor(darkMode ? '#8CFFFFFF' : '#8C182431')
+        .margin({ left: 16 })
+    }
+    if (ent.hasSubmenu) {
+      Text('›')
+        .fontSize(16)
+        .fontWeight(FontWeight.Normal)
+        .fontColor(
+          ent.enabled
+            ? (darkMode ? '#A6FFFFFF' : '#99182431')
+            : (darkMode ? '#4DFFFFFF' : '#4D182431')
+        )
+        .margin({ left: 12 })
+    }
+  }
+  .width('100%')
+  .height(30)
+  .padding({ left: 10, right: 10 })
+  .alignItems(VerticalAlign.Center)
+}
+
+@Builder
+function buildLevel3SubMenu(level: MenuLevelModel, ctx: PopupMenuContext): void {
   Menu() {
-    ForEach(sections, (sec3: MenuSectionModel) => {
+    ForEach(level.sections, (sec3: MenuSectionModel) => {
       MenuItemGroup() {
         ForEach(sec3.entries, (ent3: MenuEntryModel) => {
-          MenuItem({
-            content: ent3.label,
-            labelInfo: ent3.labelInfo
+          MenuItem((): void => {
+            buildMenuItemRow(ent3, level.hasCheckable, ctx.darkMode);
           })
           .enabled(ent3.enabled)
-          .selected(ent3.checked)
-          .selectIcon(ent3.checked)
           .onClick((): void => {
             if (ent3.enabled && ent3.itemId !== 0) {
               ctx.onSelect(ent3.itemId);
@@ -110,32 +249,40 @@ function buildLevel3SubMenu(sections: MenuSectionModel[], ctx: PopupMenuContext)
       }
     }, (sec3: MenuSectionModel): string => sec3.key)
   }
+  .width(level.widthVp)
+  .radius(8)
+  .padding(4)
+  .menuItemGroupDivider({
+    strokeWidth: LengthMetrics.px(1),
+    color: ctx.darkMode ? '#24FFFFFF' : '#1A000000',
+    startMargin: LengthMetrics.vp(8),
+    endMargin: LengthMetrics.vp(8),
+    mode: DividerMode.EMBEDDED_IN_MENU
+  })
   .direction(ctx.direction)
 }
 
 @Builder
-function buildLevel2SubMenu(sections: MenuSectionModel[], ctx: PopupMenuContext): void {
+function buildLevel2SubMenu(level: MenuLevelModel, ctx: PopupMenuContext): void {
   Menu() {
-    ForEach(sections, (sec2: MenuSectionModel) => {
+    ForEach(level.sections, (sec2: MenuSectionModel) => {
       MenuItemGroup() {
         ForEach(sec2.entries, (ent2: MenuEntryModel) => {
-          if (ent2.hasSubmenu) {
-            MenuItem({
-              content: ent2.label,
-              labelInfo: ent2.labelInfo,
-              builder: (): void => {
-                buildLevel3SubMenu(ent2.subSections, ctx);
+          if (ent2.hasSubmenu && ent2.subLevel !== undefined) {
+            MenuItem((): void => {
+              buildMenuItemRow(ent2, level.hasCheckable, ctx.darkMode);
+            })
+            .enabled(ent2.enabled)
+            .subMenuBuilder((): void => {
+              if (ent2.subLevel !== undefined) {
+                buildLevel3SubMenu(ent2.subLevel, ctx);
               }
             })
-            .enabled(ent2.enabled)
           } else {
-            MenuItem({
-              content: ent2.label,
-              labelInfo: ent2.labelInfo
+            MenuItem((): void => {
+              buildMenuItemRow(ent2, level.hasCheckable, ctx.darkMode);
             })
             .enabled(ent2.enabled)
-            .selected(ent2.checked)
-            .selectIcon(ent2.checked)
             .onClick((): void => {
               if (ent2.enabled && ent2.itemId !== 0) {
                 ctx.onSelect(ent2.itemId);
@@ -146,32 +293,40 @@ function buildLevel2SubMenu(sections: MenuSectionModel[], ctx: PopupMenuContext)
       }
     }, (sec2: MenuSectionModel): string => sec2.key)
   }
+  .width(level.widthVp)
+  .radius(8)
+  .padding(4)
+  .menuItemGroupDivider({
+    strokeWidth: LengthMetrics.px(1),
+    color: ctx.darkMode ? '#24FFFFFF' : '#1A000000',
+    startMargin: LengthMetrics.vp(8),
+    endMargin: LengthMetrics.vp(8),
+    mode: DividerMode.EMBEDDED_IN_MENU
+  })
   .direction(ctx.direction)
 }
 
 @Builder
 function buildPopupMenuRoot(ctx: PopupMenuContext): void {
   Menu() {
-    ForEach(ctx.sections, (sec1: MenuSectionModel) => {
+    ForEach(ctx.root.sections, (sec1: MenuSectionModel) => {
       MenuItemGroup() {
         ForEach(sec1.entries, (ent1: MenuEntryModel) => {
-          if (ent1.hasSubmenu) {
-            MenuItem({
-              content: ent1.label,
-              labelInfo: ent1.labelInfo,
-              builder: (): void => {
-                buildLevel2SubMenu(ent1.subSections, ctx);
+          if (ent1.hasSubmenu && ent1.subLevel !== undefined) {
+            MenuItem((): void => {
+              buildMenuItemRow(ent1, ctx.root.hasCheckable, ctx.darkMode);
+            })
+            .enabled(ent1.enabled)
+            .subMenuBuilder((): void => {
+              if (ent1.subLevel !== undefined) {
+                buildLevel2SubMenu(ent1.subLevel, ctx);
               }
             })
-            .enabled(ent1.enabled)
           } else {
-            MenuItem({
-              content: ent1.label,
-              labelInfo: ent1.labelInfo
+            MenuItem((): void => {
+              buildMenuItemRow(ent1, ctx.root.hasCheckable, ctx.darkMode);
             })
             .enabled(ent1.enabled)
-            .selected(ent1.checked)
-            .selectIcon(ent1.checked)
             .onClick((): void => {
               if (ent1.enabled && ent1.itemId !== 0) {
                 ctx.onSelect(ent1.itemId);
@@ -182,6 +337,16 @@ function buildPopupMenuRoot(ctx: PopupMenuContext): void {
       }
     }, (sec1: MenuSectionModel): string => sec1.key)
   }
+  .width(ctx.root.widthVp)
+  .radius(8)
+  .padding(4)
+  .menuItemGroupDivider({
+    strokeWidth: LengthMetrics.px(1),
+    color: ctx.darkMode ? '#24FFFFFF' : '#1A000000',
+    startMargin: LengthMetrics.vp(8),
+    endMargin: LengthMetrics.vp(8),
+    mode: DividerMode.EMBEDDED_IN_MENU
+  })
   .direction(ctx.direction)
 }
 
@@ -265,6 +430,14 @@ function buildMessageBoxDialog(ctx: MessageBoxContext): void {
 struct Index {
   private content: NodeContent = new NodeContent();
   private winId: number = 1;
+  private isWebWindow: boolean = false;
+  private webIncognito: boolean = false;
+  private bgHex: string = '#FFF4F4F6';
+  private bgARGB: number = 0xFFF4F4F6;
+  private webCtrl: webview.WebviewController = new webview.WebviewController();
+  private webAttached: boolean = false;
+  private hasRealNavigation: boolean = false;
+  private queuedWebCmds: QueuedWebCmd[] = [];
   private activeMenuNode: ComponentContent<PopupMenuContext> | undefined = undefined;
   private activeMenuReqId: number = 0;
   private activeMsgNode: ComponentContent<MessageBoxContext> | undefined = undefined;
@@ -277,19 +450,14 @@ struct Index {
     const sharedStorage: LocalStorage | undefined = uiCtx.getSharedLocalStorage();
     this.winId = sharedStorage?.get<number>('winId') ?? 1;
     const arkWinId: number = sharedStorage?.get<number>('arkWindowId') ?? hostBridge.getArkWindowId(this.winId);
-
-    let densityPixels: number = 1.5;
-    let refreshRate: number = 120;
-    try {
-      const d: display.Display = display.getDefaultDisplaySync();
-      if (d.densityPixels > 0) {
-        densityPixels = d.densityPixels;
-      }
-      if (d.refreshRate > 0) {
-        refreshRate = d.refreshRate;
-      }
-    } catch (_) {}
     const darkMode: boolean = AppStorage.get<boolean>('darkMode') ?? false;
+
+    this.isWebWindow = sharedStorage?.get<boolean>('isWebWindow') ?? false;
+    this.webIncognito = sharedStorage?.get<boolean>('webIncognito') ?? false;
+    const defaultHex: string = darkMode ? '#FF1C1C1F' : (this.isWebWindow ? '#FFFFFFFF' : '#FFF4F4F6');
+    const defaultARGB: number = darkMode ? 0xFF1C1C1F : (this.isWebWindow ? 0xFFFFFFFF : 0xFFF4F4F6);
+    this.bgHex = sharedStorage?.get<string>('bgHex') ?? defaultHex;
+    this.bgARGB = sharedStorage?.get<number>('bgARGB') ?? defaultARGB;
 
     hostBridge.registerPopupMenuOpener(
       this.winId,
@@ -303,7 +471,30 @@ struct Index {
         this.openNativeMessageBox(box);
       }
     );
-    host.bindWindow(this.winId, uiCtx, this.content, arkWinId, densityPixels, refreshRate, darkMode);
+
+    if (this.isWebWindow) {
+      hostBridge.registerWebRunner(
+        this.winId,
+        (op: number, arg1: string, arg2: string): void => {
+          this.runWebCommand(op, arg1, arg2);
+        }
+      );
+      return;
+    }
+
+    let densityPixels: number = 1.5;
+    let refreshRate: number = 120;
+    try {
+      const d: display.Display = display.getDefaultDisplaySync();
+      if (d.densityPixels > 0) {
+        densityPixels = d.densityPixels;
+      }
+      if (d.refreshRate > 0) {
+        refreshRate = d.refreshRate;
+      }
+    } catch (_) {}
+
+    host.bindWindow(this.winId, uiCtx, this.content, arkWinId, densityPixels, refreshRate, darkMode, this.bgARGB);
   }
 
   aboutToDisappear(): void {
@@ -311,7 +502,128 @@ struct Index {
     this.dismissActiveMessageBox();
     hostBridge.unregisterPopupMenuOpener(this.winId);
     hostBridge.unregisterMessageBoxOpener(this.winId);
+    if (this.isWebWindow) {
+      hostBridge.unregisterWebRunner(this.winId);
+      this.webAttached = false;
+      this.queuedWebCmds = [];
+      return;
+    }
     host.unbindWindow(this.winId);
+  }
+
+  private safeCanBack(): boolean {
+    if (!this.webAttached) {
+      return false;
+    }
+    try {
+      return this.webCtrl.accessBackward();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  private safeCanForward(): boolean {
+    if (!this.webAttached) {
+      return false;
+    }
+    try {
+      return this.webCtrl.accessForward();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  private onWebAttached(): void {
+    this.webAttached = true;
+    const ua: string = hostBridge.getWebUserAgent(this.winId);
+    if (ua.length > 0) {
+      try {
+        this.webCtrl.setCustomUserAgent(ua);
+      } catch (_) {}
+    }
+    const pendingHtml: [string, string] = hostBridge.consumePendingWebHtml(this.winId);
+    const initialUrl: string = hostBridge.getWebUrl(this.winId);
+    if (pendingHtml[0].length > 0) {
+      this.hasRealNavigation = true;
+      const base: string | undefined = pendingHtml[1].length > 0 ? pendingHtml[1] : undefined;
+      try {
+        this.webCtrl.loadData(pendingHtml[0], 'text/html', 'UTF-8', base, base);
+      } catch (_) {}
+    } else if (initialUrl.length > 0) {
+      this.hasRealNavigation = true;
+      try {
+        this.webCtrl.loadUrl(initialUrl);
+      } catch (_) {}
+    }
+
+    const pending: QueuedWebCmd[] = this.queuedWebCmds.slice();
+    this.queuedWebCmds = [];
+    for (let i: number = 0; i < pending.length; i++) {
+      this.executeAttachedWebCmd(pending[i].op, pending[i].arg1, pending[i].arg2);
+    }
+  }
+
+  private runWebCommand(op: number, arg1: string, arg2: string): void {
+    if (!this.webAttached) {
+      if (op === WEB_OP_LOAD_URL || op === WEB_OP_SET_UA || op === WEB_OP_LOAD_HTML) {
+        return;
+      }
+      const cmd: QueuedWebCmd = new QueuedWebCmd();
+      cmd.op = op;
+      cmd.arg1 = arg1;
+      cmd.arg2 = arg2;
+      this.queuedWebCmds.push(cmd);
+      return;
+    }
+    this.executeAttachedWebCmd(op, arg1, arg2);
+  }
+
+  private executeAttachedWebCmd(op: number, arg1: string, arg2: string): void {
+    try {
+      switch (op) {
+        case WEB_OP_LOAD_URL:
+          if (arg1.length > 0) {
+            this.hasRealNavigation = true;
+            this.webCtrl.loadUrl(arg1);
+          }
+          break;
+        case WEB_OP_LOAD_HTML: {
+          this.hasRealNavigation = true;
+          const base: string | undefined = arg2.length > 0 ? arg2 : undefined;
+          this.webCtrl.loadData(arg1, 'text/html', 'UTF-8', base, base);
+          break;
+        }
+        case WEB_OP_RELOAD:
+          this.webCtrl.refresh();
+          break;
+        case WEB_OP_STOP:
+          this.webCtrl.stop();
+          break;
+        case WEB_OP_BACK:
+          if (this.webCtrl.accessBackward()) {
+            this.webCtrl.backward();
+          }
+          break;
+        case WEB_OP_FORWARD:
+          if (this.webCtrl.accessForward()) {
+            this.webCtrl.forward();
+          }
+          break;
+        case WEB_OP_EVAL:
+          if (arg1.length > 0) {
+            this.webCtrl.runJavaScript(arg1).catch((): void => {});
+          }
+          break;
+        case WEB_OP_SET_UA:
+          this.webCtrl.setCustomUserAgent(arg1);
+          break;
+        case WEB_OP_CLEAR_CACHE:
+          this.webCtrl.removeCache(true);
+          break;
+        default:
+          break;
+      }
+    } catch (_) {}
   }
 
   private dismissActiveMenu(chosenId: number): void {
@@ -429,13 +741,13 @@ struct Index {
 
   private openNativePopupMenu(reqId: number, x: number, y: number, rtl: boolean, items: HostMenuItem[]): void {
     this.dismissActiveMenu(0);
-    const sections: MenuSectionModel[] = buildMenuSections(items, 'req_' + reqId.toString());
-    if (sections.length === 0) {
+    const uiCtx: UIContext = this.getUIContext();
+    const rootLevel: MenuLevelModel = buildMenuLevel(uiCtx, items, 'req_' + reqId.toString());
+    if (rootLevel.sections.length === 0) {
       host.resolvePopupMenu(reqId, 0);
       return;
     }
 
-    const uiCtx: UIContext = this.getUIContext();
     let settled: boolean = false;
     const finish = (chosenId: number, closeExplicitly: boolean): void => {
       if (settled) {
@@ -462,7 +774,8 @@ struct Index {
     };
 
     const ctx: PopupMenuContext = new PopupMenuContext();
-    ctx.sections = sections;
+    ctx.root = rootLevel;
+    ctx.darkMode = AppStorage.get<boolean>('darkMode') ?? false;
     ctx.direction = rtl ? Direction.Rtl : Direction.Ltr;
     ctx.onSelect = (chosenId: number): void => {
       finish(chosenId, true);
@@ -498,11 +811,105 @@ struct Index {
 
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
-      ContentSlot(this.content)
+      if (this.isWebWindow) {
+        Web({
+          src: '',
+          controller: this.webCtrl,
+          incognitoMode: this.webIncognito
+        })
+          .width('100%')
+          .height('100%')
+          .backgroundColor(this.bgHex)
+          .javaScriptAccess(true)
+          .domStorageAccess(true)
+          .databaseAccess(true)
+          .imageAccess(true)
+          .onlineImageAccess(true)
+          .mixedMode(MixedMode.All)
+          .darkMode(WebDarkMode.Auto)
+          .zoomAccess(true)
+          .onControllerAttached((): void => {
+            this.onWebAttached();
+          })
+          .onPageBegin((ev: OnPageBeginEvent): void => {
+            if (ev.url === 'about:blank' && !this.hasRealNavigation) {
+              return;
+            }
+            host.notifyWebEvent(
+              this.winId,
+              WEB_EV_PAGE_BEGIN,
+              this.safeCanBack(),
+              this.safeCanForward(),
+              0,
+              ev.url ?? '',
+              ''
+            );
+          })
+          .onPageEnd((ev: OnPageEndEvent): void => {
+            if (ev.url === 'about:blank' && !this.hasRealNavigation) {
+              return;
+            }
+            host.notifyWebEvent(
+              this.winId,
+              WEB_EV_PAGE_END,
+              this.safeCanBack(),
+              this.safeCanForward(),
+              0,
+              ev.url ?? '',
+              ''
+            );
+          })
+          .onTitleReceive((ev: OnTitleReceiveEvent): void => {
+            const t: string = (ev.title ?? '').trim();
+            if (t.length === 0 || t === 'about:blank') {
+              return;
+            }
+            host.notifyWebEvent(
+              this.winId,
+              WEB_EV_TITLE,
+              this.safeCanBack(),
+              this.safeCanForward(),
+              0,
+              t,
+              ''
+            );
+          })
+          .onErrorReceive((ev: OnErrorReceiveEvent): void => {
+            let mainFrame: boolean = false;
+            let reqUrl: string = '';
+            let code: number = -1;
+            let info: string = '';
+            try {
+              mainFrame = ev.request.isMainFrame();
+              reqUrl = ev.request.getRequestUrl();
+            } catch (_) {}
+            if (!mainFrame) {
+              return;
+            }
+            if (reqUrl === 'about:blank' && !this.hasRealNavigation) {
+              return;
+            }
+            try {
+              code = ev.error.getErrorCode();
+              info = ev.error.getErrorInfo();
+            } catch (_) {}
+            host.notifyWebEvent(
+              this.winId,
+              WEB_EV_ERROR,
+              this.safeCanBack(),
+              this.safeCanForward(),
+              code,
+              reqUrl,
+              info
+            );
+          })
+      } else {
+        ContentSlot(this.content)
+      }
     }
     .id(this.rootStackId())
     .width('100%')
     .height('100%')
-    .backgroundColor('#000000')
+    .backgroundColor(this.bgHex)
   }
 }

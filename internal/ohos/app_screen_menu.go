@@ -286,7 +286,10 @@ func (b *Backend) PopupMenu(m *platform.Menu, pw platform.Window, pos *platform.
 		return
 	}
 
-	x, y := int(math.Round(w.surface.lastX)), int(math.Round(w.surface.lastY))
+	var x, y int
+	if w.surface != nil {
+		x, y = int(math.Round(w.surface.lastX)), int(math.Round(w.surface.lastY))
+	}
 	if pos != nil {
 		x, y = pos.X, pos.Y
 	}

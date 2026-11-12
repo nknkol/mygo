@@ -116,6 +116,11 @@ constexpr uint8_t kNotifRemove = 37; // engine -> host: remove notification(s)
 constexpr uint8_t kPowerReq    = 38; // engine -> host: aggregate wake/background lock request
 constexpr uint8_t kNetWatch    = 39; // engine -> host: start reporting network changes
 
+constexpr uint8_t kCookieReq    = 40; // engine -> host: cookie/data-store request
+constexpr uint8_t kCookieResult = 41; // host -> engine: cookie/data-store result
+constexpr uint8_t kWebReq       = 42; // engine -> host: standalone ArkWeb command
+constexpr uint8_t kWebEvent     = 43; // host -> engine: standalone ArkWeb navigation/title/error event
+
 constexpr uint32_t kMediaPause = 1u << 1;
 
 // Input subkinds.
@@ -527,6 +532,9 @@ enum class BridgeEventKind {
     NotifRemove,
     PowerReq,
     NetWatch,
+    CookieReq,
+    WebReq,
+    FirstFrame,
     EngineQuit,
     EngineRestart,
 };
@@ -624,6 +632,17 @@ struct PowerReqData {
     std::string reason;
 };
 
+struct CookieReqData {
+    uint32_t reqId = 0;
+    uint8_t op = 0;
+    bool incognito = false;
+    uint32_t siteDataTypes = 0;
+    std::string url;
+    std::string headerOrName;
+    std::string domain;
+    std::string path;
+};
+
 struct BridgeEvent {
     BridgeEventKind kind = BridgeEventKind::WinAction;
     WinConfigData winCfg;
@@ -646,6 +665,10 @@ struct BridgeEvent {
     bool notifRemoveAll = false;
     std::string notifRemoveId;
     PowerReqData powerReq;
+    CookieReqData cookieReq;
+    uint8_t webOp = 0;
+    std::string webArg1;
+    std::string webArg2;
 };
 
 std::mutex gBridgeMu;
@@ -983,6 +1006,45 @@ void BridgeCallJs(napi_env env, napi_value, void *, void *data) {
     case BridgeEventKind::NetWatch:
         callBridgeMethod(env, cbObj, "onNetWatch", 0, nullptr);
         break;
+    case BridgeEventKind::CookieReq: {
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_value vReq = nullptr, vOp = nullptr, vInc = nullptr, vTypes = nullptr;
+        napi_value vUrl = nullptr, vHdr = nullptr, vDom = nullptr, vPath = nullptr;
+        napi_create_uint32(env, ev->cookieReq.reqId, &vReq);
+        napi_create_uint32(env, ev->cookieReq.op, &vOp);
+        napi_get_boolean(env, ev->cookieReq.incognito, &vInc);
+        napi_create_uint32(env, ev->cookieReq.siteDataTypes, &vTypes);
+        napi_create_string_utf8(env, ev->cookieReq.url.c_str(), ev->cookieReq.url.size(), &vUrl);
+        napi_create_string_utf8(env, ev->cookieReq.headerOrName.c_str(), ev->cookieReq.headerOrName.size(), &vHdr);
+        napi_create_string_utf8(env, ev->cookieReq.domain.c_str(), ev->cookieReq.domain.size(), &vDom);
+        napi_create_string_utf8(env, ev->cookieReq.path.c_str(), ev->cookieReq.path.size(), &vPath);
+        napi_set_named_property(env, obj, "reqId", vReq);
+        napi_set_named_property(env, obj, "op", vOp);
+        napi_set_named_property(env, obj, "incognito", vInc);
+        napi_set_named_property(env, obj, "siteDataTypes", vTypes);
+        napi_set_named_property(env, obj, "url", vUrl);
+        napi_set_named_property(env, obj, "headerOrName", vHdr);
+        napi_set_named_property(env, obj, "domain", vDom);
+        napi_set_named_property(env, obj, "path", vPath);
+        callBridgeMethod(env, cbObj, "onCookieReq", 1, &obj);
+        break;
+    }
+    case BridgeEventKind::WebReq: {
+        napi_value args[4] = {nullptr, nullptr, nullptr, nullptr};
+        napi_create_uint32(env, ev->winId, &args[0]);
+        napi_create_uint32(env, ev->webOp, &args[1]);
+        napi_create_string_utf8(env, ev->webArg1.c_str(), ev->webArg1.size(), &args[2]);
+        napi_create_string_utf8(env, ev->webArg2.c_str(), ev->webArg2.size(), &args[3]);
+        callBridgeMethod(env, cbObj, "onWebReq", 4, args);
+        break;
+    }
+    case BridgeEventKind::FirstFrame: {
+        napi_value arg = nullptr;
+        napi_create_uint32(env, ev->winId, &arg);
+        callBridgeMethod(env, cbObj, "onFirstFrame", 1, &arg);
+        break;
+    }
     case BridgeEventKind::EngineQuit:
         callBridgeMethod(env, cbObj, "onEngineQuit", 0, nullptr);
         break;
@@ -2260,6 +2322,12 @@ void WinSession::renderLoop() {
             damaged++;
         }
         frames++;
+        if (frames == 1 && winId >= 2) {
+            auto fev = std::make_unique<BridgeEvent>();
+            fev->kind = BridgeEventKind::FirstFrame;
+            fev->winId = winId;
+            postBridgeEvent(std::move(fev));
+        }
         unloggedFrames++;
         if (frames <= 3 || frames % 60 == 0) {
             OH_LOG_INFO(LOG_APP, "win=%{public}u frames=%{public}d damaged=%{public}d whole=%{public}d aborted=%{public}d",
@@ -2359,6 +2427,25 @@ std::vector<std::string> buildEngineEnv(const std::string &pkgRoot) {
     mkdir(cacheDir.c_str(), 0755);
     mkdir(tempDir.c_str(), 0755);
 
+    const std::string cfgDir = filesDir + "/.config";
+    mkdir(cfgDir.c_str(), 0755);
+    const std::string userDirsFile = cfgDir + "/user-dirs.dirs";
+    if (access("/storage/Users/currentUser", F_OK) == 0 && access(userDirsFile.c_str(), F_OK) != 0) {
+        int ufd = open(userDirsFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (ufd >= 0) {
+            static const char kUserDirs[] =
+                "XDG_DESKTOP_DIR=\"/storage/Users/currentUser/Desktop\"\n"
+                "XDG_DOWNLOAD_DIR=\"/storage/Users/currentUser/Download\"\n"
+                "XDG_DOCUMENTS_DIR=\"/storage/Users/currentUser/Documents\"\n"
+                "XDG_MUSIC_DIR=\"/storage/Users/currentUser/Music\"\n"
+                "XDG_PICTURES_DIR=\"/storage/Users/currentUser/Images\"\n"
+                "XDG_VIDEOS_DIR=\"/storage/Users/currentUser/Videos\"\n";
+            ssize_t ignored = write(ufd, kUserDirs, sizeof(kUserDirs) - 1);
+            (void)ignored;
+            close(ufd);
+        }
+    }
+
     std::string ldPath = libDir;
     const char *oldLd = getenv("LD_LIBRARY_PATH");
     if (oldLd != nullptr && oldLd[0] != '\0') {
@@ -2383,13 +2470,23 @@ std::vector<std::string> buildEngineEnv(const std::string &pkgRoot) {
         return false;
     };
 
+    bool hasMygoEnv = false;
+    bool isMygoDev = false;
     std::vector<std::string> env;
     if (environ != nullptr) {
         for (char **e = environ; *e != nullptr; ++e) {
+            if (strncmp(*e, "MYGO_ENV=", 9) == 0) {
+                hasMygoEnv = true;
+            } else if (strcmp(*e, "MYGO_DEV=1") == 0) {
+                isMygoDev = true;
+            }
             if (!overridden(*e)) {
                 env.emplace_back(*e);
             }
         }
+    }
+    if (!hasMygoEnv && !isMygoDev) {
+        env.emplace_back("MYGO_ENV=production");
     }
     env.push_back("LD_LIBRARY_PATH=" + ldPath);
     env.push_back("FONTCONFIG_FILE=" + fontsConf);
@@ -3553,6 +3650,40 @@ bool pumpEngineMessages() {
             postBridgeEvent(std::move(ev));
             break;
         }
+        case kCookieReq: {
+            if (payload.size() >= 12) {
+                auto ev = std::make_unique<BridgeEvent>();
+                ev->kind = BridgeEventKind::CookieReq;
+                memcpy(&ev->cookieReq.reqId, payload.data() + 0, 4);
+                ev->cookieReq.op = payload[4];
+                ev->cookieReq.incognito = payload[5] != 0;
+                memcpy(&ev->cookieReq.siteDataTypes, payload.data() + 8, 4);
+                size_t off = 12;
+                if (readStr(payload, off, &ev->cookieReq.url) &&
+                    readStr(payload, off, &ev->cookieReq.headerOrName) &&
+                    readStr(payload, off, &ev->cookieReq.domain) &&
+                    readStr(payload, off, &ev->cookieReq.path) &&
+                    off == payload.size()) {
+                    postBridgeEvent(std::move(ev));
+                }
+            }
+            break;
+        }
+        case kWebReq: {
+            if (payload.size() >= 8) {
+                auto ev = std::make_unique<BridgeEvent>();
+                ev->kind = BridgeEventKind::WebReq;
+                memcpy(&ev->winId, payload.data() + 0, 4);
+                ev->webOp = payload[4];
+                size_t off = 8;
+                if (readStr(payload, off, &ev->webArg1) &&
+                    readStr(payload, off, &ev->webArg2) &&
+                    off == payload.size()) {
+                    postBridgeEvent(std::move(ev));
+                }
+            }
+            break;
+        }
         default:
             break;
         }
@@ -4056,8 +4187,8 @@ napi_value UpdateEnvInfo(napi_env env, napi_callback_info info) {
 }
 
 napi_value BindWindow(napi_env env, napi_callback_info info) {
-    size_t argc = 7;
-    napi_value argv[7] = {};
+    size_t argc = 8;
+    napi_value argv[8] = {};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 7) {
         return nullptr;
@@ -4087,6 +4218,13 @@ napi_value BindWindow(napi_env env, napi_callback_info info) {
     if (napi_get_value_bool(env, argv[6], &dark) == napi_ok && winId == 1) {
         currentDark = dark;
     }
+    uint32_t bgARGB = dark ? 0xFF1C1C1Fu : 0xFFF4F4F6u;
+    if (argc >= 8 && argv[7] != nullptr) {
+        uint32_t parsedBg = 0;
+        if (napi_get_value_uint32(env, argv[7], &parsedBg) == napi_ok && parsedBg != 0) {
+            bgARGB = parsedBg;
+        }
+    }
     {
         std::lock_guard<std::mutex> lk(ws->mu);
         ws->scale = scale > 0 ? scale : 1.0;
@@ -4103,7 +4241,10 @@ napi_value BindWindow(napi_env env, napi_callback_info info) {
         return nullptr;
     }
 
-    ws->xcNode = nodeAPI->createNode(ARKUI_NODE_XCOMPONENT);
+    ws->xcNode = nodeAPI->createNode(ARKUI_NODE_XCOMPONENT_TEXTURE);
+    if (ws->xcNode == nullptr) {
+        ws->xcNode = nodeAPI->createNode(ARKUI_NODE_XCOMPONENT);
+    }
     if (ws->xcNode == nullptr) {
         return nullptr;
     }
@@ -4112,6 +4253,10 @@ napi_value BindWindow(napi_env env, napi_callback_info info) {
     ArkUI_AttributeItem pctItem = {fullPct, 1, nullptr, nullptr};
     nodeAPI->setAttribute(ws->xcNode, NODE_WIDTH_PERCENT, &pctItem);
     nodeAPI->setAttribute(ws->xcNode, NODE_HEIGHT_PERCENT, &pctItem);
+
+    ArkUI_NumberValue bgVal[] = {{.u32 = bgARGB}};
+    ArkUI_AttributeItem bgItem = {bgVal, 1, nullptr, nullptr};
+    nodeAPI->setAttribute(ws->xcNode, NODE_BACKGROUND_COLOR, &bgItem);
 
     ArkUI_NumberValue oneVal[] = {{.i32 = 1}};
     ArkUI_AttributeItem oneItem = {oneVal, 1, nullptr, nullptr};
@@ -4547,6 +4692,91 @@ napi_value NotifyNetState(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+napi_value ResolveCookie(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) {
+        return nullptr;
+    }
+    uint32_t reqId = 0;
+    napi_get_value_uint32(env, argv[0], &reqId);
+    std::string errStr = getNapiString(env, argv[1]);
+
+    uint32_t arrLen = 0;
+    if (napi_get_array_length(env, argv[2], &arrLen) != napi_ok) {
+        arrLen = 0;
+    }
+    if (arrLen > 4096) {
+        arrLen = 4096;
+    }
+
+    std::vector<uint8_t> wire(4, 0);
+    memcpy(wire.data(), &reqId, 4);
+    appendStr(wire, errStr);
+    appendU32(wire, arrLen);
+    for (uint32_t i = 0; i < arrLen; ++i) {
+        napi_value cObj = nullptr;
+        if (napi_get_element(env, argv[2], i, &cObj) != napi_ok || cObj == nullptr) {
+            uint8_t emptyHdr[12] = {0};
+            wire.insert(wire.end(), emptyHdr, emptyHdr + 12);
+            for (int k = 0; k < 5; ++k) {
+                appendStr(wire, "");
+            }
+            continue;
+        }
+        int64_t expUnix = static_cast<int64_t>(std::llround(getPropDouble(env, cObj, "expiresUnix", 0.0)));
+        uint8_t flags = 0;
+        if (getPropBool(env, cObj, "secure")) {
+            flags |= 1;
+        }
+        if (getPropBool(env, cObj, "httpOnly")) {
+            flags |= 2;
+        }
+        uint8_t hdr[12] = {0};
+        memcpy(hdr, &expUnix, 8);
+        hdr[8] = flags;
+        wire.insert(wire.end(), hdr, hdr + 12);
+        appendStr(wire, getPropString(env, cObj, "name"));
+        appendStr(wire, getPropString(env, cObj, "value"));
+        appendStr(wire, getPropString(env, cObj, "domain"));
+        appendStr(wire, getPropString(env, cObj, "path"));
+        appendStr(wire, getPropString(env, cObj, "sameSite"));
+    }
+    sendMessage(kCookieResult, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+    return nullptr;
+}
+
+napi_value NotifyWebEvent(napi_env env, napi_callback_info info) {
+    size_t argc = 7;
+    napi_value argv[7] = {};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 7) {
+        return nullptr;
+    }
+    uint32_t winId = 0, evCode = 0;
+    bool canBack = false, canFwd = false;
+    int32_t errCode = 0;
+    napi_get_value_uint32(env, argv[0], &winId);
+    napi_get_value_uint32(env, argv[1], &evCode);
+    napi_get_value_bool(env, argv[2], &canBack);
+    napi_get_value_bool(env, argv[3], &canFwd);
+    napi_get_value_int32(env, argv[4], &errCode);
+    std::string text = getNapiString(env, argv[5]);
+    std::string desc = getNapiString(env, argv[6]);
+
+    std::vector<uint8_t> wire(12, 0);
+    memcpy(wire.data() + 0, &winId, 4);
+    wire[4] = static_cast<uint8_t>(evCode);
+    wire[5] = canBack ? 1 : 0;
+    wire[6] = canFwd ? 1 : 0;
+    memcpy(wire.data() + 8, &errCode, 4);
+    appendStr(wire, text);
+    appendStr(wire, desc);
+    sendMessage(kWebEvent, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+    return nullptr;
+}
+
 napi_value SetDarkMode(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1] = {nullptr};
@@ -4592,6 +4822,8 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"notifyNotifClicked", nullptr, NotifyNotifClicked, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"notifyPowerState", nullptr, NotifyPowerState, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"notifyNetState", nullptr, NotifyNetState, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"resolveCookie", nullptr, ResolveCookie, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"notifyWebEvent", nullptr, NotifyWebEvent, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setDarkMode", nullptr, SetDarkMode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"crash", nullptr, Crash, nullptr, nullptr, nullptr, napi_default, nullptr},
     };

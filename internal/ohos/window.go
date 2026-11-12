@@ -4,20 +4,25 @@ package ohos
 
 import (
 	"math"
+	"net/url"
+	"strings"
 
 	"github.com/egoist/mygo/internal/platform"
 )
 
-// Window is a HarmonyOS window backed by an OHNativeWindow surface in the
-// host process: Window 1 is the UIAbility's main window, and subsequent
-// windows are freeform or modal subwindows on WindowStage.
+// Window is a HarmonyOS window backed by either an OHNativeWindow surface or
+// a standalone ArkWeb view in the host process: Window 1 is the UIAbility's
+// main window, and subsequent windows are freeform or modal subwindows on
+// WindowStage.
 type Window struct {
-	b        *Backend
-	id       uint32
-	parentID uint32
-	surface  *Surface
-	h        platform.WindowHandler
-	opts     platform.WindowOptions
+	b            *Backend
+	id           uint32
+	parentID     uint32
+	surface      *Surface
+	isWeb        bool
+	webIncognito bool
+	h            platform.WindowHandler
+	opts         platform.WindowOptions
 
 	title       string
 	visible     bool
@@ -30,6 +35,10 @@ type Window struct {
 	closed      bool
 	zoom        float64
 	ua          string
+	currentURL  string
+	loading     bool
+	canBack     bool
+	canForward  bool
 	muted       bool
 	bounds      platform.Rect
 	minSize     platform.Size
@@ -58,10 +67,23 @@ func newWindow(b *Backend, id uint32, scale float64, opts *platform.WindowOption
 			Maximizable: true,
 			Closable:    true,
 			HasShadow:   true,
+			Surface:     true,
 		},
 	}
 	if opts != nil {
 		w.opts = *opts
+		w.isWeb = !opts.Surface
+		if ds, ok := opts.DataStore.(*dataStore); ok && ds != nil && ds.ephemeral {
+			w.webIncognito = true
+		}
+		w.ua = strings.TrimSpace(opts.UserAgent)
+		if suf := strings.TrimSpace(opts.UserAgentSuffix); suf != "" {
+			if w.ua != "" {
+				w.ua += " " + suf
+			} else {
+				w.ua = suf
+			}
+		}
 		w.title = opts.Title
 		w.minSize = opts.MinSize
 		w.maxSize = opts.MaxSize
@@ -104,12 +126,14 @@ func newWindow(b *Backend, id uint32, scale float64, opts *platform.WindowOption
 		pxH = max(1, int(math.Round(float64(dipH)*scale)))
 	}
 
-	w.surface = &Surface{
-		w:      w,
-		width:  pxW,
-		height: pxH,
-		scale:  scale,
-		hz:     120,
+	if !w.isWeb {
+		w.surface = &Surface{
+			w:      w,
+			width:  pxW,
+			height: pxH,
+			scale:  scale,
+			hz:     120,
+		}
 	}
 	return w
 }
@@ -162,6 +186,15 @@ func (w *Window) styleFlags() uint32 {
 	if w.opts.Movable {
 		f |= winFlagMovable
 	}
+	if w.isWeb {
+		f |= winFlagWebView
+		if w.webIncognito {
+			f |= winFlagWebIncognito
+		}
+	}
+	if w.opts.Transparent {
+		f |= winFlagTransparent
+	}
 	return f
 }
 
@@ -213,8 +246,13 @@ func (w *Window) updateBoundsFromPixels(pxW, pxH int, scale float64) {
 	w.bounds.Height = int(math.Round(float64(pxH) / scale))
 }
 
-func (w *Window) Handle() uintptr           { return uintptr(w.id) }
-func (w *Window) Surface() platform.Surface { return w.surface }
+func (w *Window) Handle() uintptr { return uintptr(w.id) }
+func (w *Window) Surface() platform.Surface {
+	if w.surface == nil {
+		return nil
+	}
+	return w.surface
+}
 
 func (w *Window) SetTitle(title string) {
 	if w.title == title {
@@ -323,7 +361,9 @@ func (w *Window) Show() {
 	}
 	w.visible = true
 	w.minimized = false
-	w.surface.setHostHidden(false)
+	if w.surface != nil {
+		w.surface.setHostHidden(false)
+	}
 	w.sendAction(winActShow)
 }
 
@@ -333,7 +373,9 @@ func (w *Window) ShowInactive() {
 	}
 	w.visible = true
 	w.minimized = false
-	w.surface.setHostHidden(false)
+	if w.surface != nil {
+		w.surface.setHostHidden(false)
+	}
 	w.sendAction(winActShowInactive)
 }
 
@@ -342,7 +384,9 @@ func (w *Window) Hide() {
 		return
 	}
 	w.visible = false
-	w.surface.setHostHidden(true)
+	if w.surface != nil {
+		w.surface.setHostHidden(true)
+	}
 	w.sendAction(winActHide)
 }
 
@@ -401,7 +445,9 @@ func (w *Window) Restore() {
 	}
 	w.minimized = false
 	w.maximized = false
-	w.surface.setHostHidden(false)
+	if w.surface != nil {
+		w.surface.setHostHidden(false)
+	}
 	w.sendAction(winActRestore)
 }
 
@@ -514,34 +560,105 @@ func (w *Window) closeInternal(notifyHost bool) {
 	}
 }
 
-// The page half. A window showing a surface has no web view, so the web
-// page methods do nothing and report nothing.
+// The page half. Surface windows have no web view; standalone web windows
+// forward navigation and script requests to their ArkWeb instance in the host.
 
-func (w *Window) WebViewHandle() uintptr                        { return 0 }
-func (w *Window) LoadURL(string)                                {}
-func (w *Window) LoadHTML(string, string)                       {}
-func (w *Window) LoadFile(string, string)                       {}
-func (w *Window) Reload(bool)                                   {}
-func (w *Window) StopLoading()                                  {}
-func (w *Window) GoBack()                                       {}
-func (w *Window) GoForward()                                    {}
-func (w *Window) CanGoBack() bool                               { return false }
-func (w *Window) CanGoForward() bool                            { return false }
-func (w *Window) URL() string                                   { return "" }
-func (w *Window) IsLoading() bool                               { return false }
-func (w *Window) Eval(string)                                   {}
+func (w *Window) sendWebReq(op byte, arg1, arg2 string) {
+	if !w.isWeb || w.closed || w.b == nil {
+		return
+	}
+	w.b.send(kindWebReq, encodeWebReqMessage(w.id, op, arg1, arg2))
+}
+
+func (w *Window) WebViewHandle() uintptr {
+	if w.isWeb {
+		return uintptr(w.id)
+	}
+	return 0
+}
+
+func (w *Window) LoadURL(raw string) {
+	if !w.isWeb || w.closed {
+		return
+	}
+	w.currentURL = raw
+	w.loading = true
+	w.sendWebReq(webOpLoadURL, raw, "")
+}
+
+func (w *Window) LoadHTML(html, baseURL string) {
+	if !w.isWeb || w.closed {
+		return
+	}
+	if baseURL != "" {
+		w.currentURL = baseURL
+	}
+	w.loading = true
+	w.sendWebReq(webOpLoadHTML, html, baseURL)
+}
+
+func (w *Window) LoadFile(path, _ string) {
+	if !w.isWeb || w.closed || path == "" {
+		return
+	}
+	u := (&url.URL{Scheme: "file", Path: path}).String()
+	w.LoadURL(u)
+}
+
+func (w *Window) Reload(ignoreCache bool) {
+	if !w.isWeb || w.closed {
+		return
+	}
+	w.loading = true
+	arg := ""
+	if ignoreCache {
+		arg = "1"
+	}
+	w.sendWebReq(webOpReload, arg, "")
+}
+
+func (w *Window) StopLoading() {
+	if !w.isWeb || w.closed {
+		return
+	}
+	w.loading = false
+	w.sendWebReq(webOpStop, "", "")
+}
+
+func (w *Window) GoBack() {
+	w.sendWebReq(webOpBack, "", "")
+}
+
+func (w *Window) GoForward() {
+	w.sendWebReq(webOpForward, "", "")
+}
+
+func (w *Window) CanGoBack() bool    { return w.canBack }
+func (w *Window) CanGoForward() bool { return w.canForward }
+func (w *Window) URL() string        { return w.currentURL }
+func (w *Window) IsLoading() bool    { return w.loading }
+
+func (w *Window) Eval(js string) {
+	w.sendWebReq(webOpEval, js, "")
+}
+
 func (w *Window) SetUserScripts([]platform.UserScript)          {}
 func (w *Window) SetContentRules([]any)                         {}
 func (w *Window) CallAsyncFunction(string, func(string, error)) {}
 func (w *Window) SetZoom(f float64)                             { w.zoom = f }
 func (w *Window) Zoom() float64                                 { return w.zoom }
-func (w *Window) SetUserAgent(ua string)                        { w.ua = ua }
-func (w *Window) UserAgent() string                             { return w.ua }
-func (w *Window) ProcessID() int                                { return 0 }
-func (w *Window) GPUProcessID() int                             { return 0 }
-func (w *Window) IsAudible() bool                               { return false }
-func (w *Window) SetAudioMuted(m bool)                          { w.muted = m }
-func (w *Window) IsAudioMuted() bool                            { return w.muted }
+
+func (w *Window) SetUserAgent(ua string) {
+	w.ua = ua
+	w.sendWebReq(webOpSetUA, ua, "")
+}
+
+func (w *Window) UserAgent() string      { return w.ua }
+func (w *Window) ProcessID() int         { return 0 }
+func (w *Window) GPUProcessID() int      { return 0 }
+func (w *Window) IsAudible() bool        { return false }
+func (w *Window) SetAudioMuted(m bool)   { w.muted = m }
+func (w *Window) IsAudioMuted() bool     { return w.muted }
 func (w *Window) CaptureState(platform.CaptureKind) platform.CaptureState {
 	return platform.CaptureNone
 }

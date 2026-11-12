@@ -13,14 +13,14 @@ function isDarkMode(mode: ConfigurationConstant.ColorMode | undefined): boolean 
 
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
-    hilog.info(DOMAIN, TAG, 'onCreate');
+    hilog.info(DOMAIN, TAG, 'onCreate uri=%{public}s', want.uri ?? '');
     AppStorage.setOrCreate<boolean>('darkMode', isDarkMode(this.context.config?.colorMode));
     hostBridge.init(this.context);
     hostBridge.handleWant(want, false);
   }
 
   onNewWant(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
-    hilog.info(DOMAIN, TAG, 'onNewWant');
+    hilog.info(DOMAIN, TAG, 'onNewWant uri=%{public}s', want.uri ?? '');
     hostBridge.handleWant(want, true);
   }
 

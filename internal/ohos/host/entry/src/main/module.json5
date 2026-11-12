@@ -70,12 +70,28 @@
               "entity.system.browsable"
             ],
             "actions": [
-              "ohos.want.action.viewData"
+              "ohos.want.action.viewData",
+              "action.system.view"
             ],
             "uris": [
               {
                 "scheme": "mygo-music"
               },
+              {
+                "scheme": "mygo-music-dev"
+              }
+            ]
+          },
+          {
+            "entities": [
+              "entity.system.default",
+              "entity.system.browsable"
+            ],
+            "actions": [
+              "ohos.want.action.viewData",
+              "action.system.view"
+            ],
+            "uris": [
               {
                 "scheme": "file"
               }

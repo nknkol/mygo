@@ -145,7 +145,14 @@ func (b *Backend) onInput(payload []byte) {
 	if win == nil || win.closed {
 		return
 	}
+	if body[0] == inputWindow {
+		win.onWindowInput(body)
+		return
+	}
 	s := win.surface
+	if s == nil {
+		return
+	}
 
 	switch body[0] {
 	case inputMouse:
@@ -158,8 +165,6 @@ func (b *Backend) onInput(payload []byte) {
 		s.onZoom(body)
 	case inputKey:
 		s.onKey(body)
-	case inputWindow:
-		s.onWindow(body)
 	case inputIME:
 		s.onIME(body)
 	}
@@ -465,23 +470,23 @@ func (s *Surface) onKey(p []byte) {
 	}
 }
 
-func (s *Surface) onWindow(p []byte) {
-	if len(p) < 2 {
+func (w *Window) onWindowInput(p []byte) {
+	if len(p) < 2 || w == nil || w.closed {
 		return
 	}
 	op := p[1]
-	w := s.w
-	if w == nil || w.closed {
-		return
-	}
+	s := w.surface
 
 	switch op {
 	case winFocus:
-		if !w.focused || !s.focusDelivered {
-			wasFocused := w.focused && s.focusDelivered
+		needSurfaceFocus := s != nil && !s.focusDelivered
+		if !w.focused || needSurfaceFocus {
+			wasFocused := w.focused && (s == nil || s.focusDelivered)
 			w.focused = true
-			s.focusDelivered = true
-			s.send(platform.SurfaceEvent{Kind: platform.SurfaceFocus})
+			if s != nil {
+				s.focusDelivered = true
+				s.send(platform.SurfaceEvent{Kind: platform.SurfaceFocus})
+			}
 			if !wasFocused && w.h != nil {
 				w.h.Focused()
 			}
@@ -499,10 +504,12 @@ func (s *Surface) onWindow(p []byte) {
 	case winBlur:
 		if w.focused {
 			w.focused = false
-			s.touch.cancelFling()
-			s.touch.fingers = s.touch.fingers[:0]
-			s.down.clear()
-			s.send(platform.SurfaceEvent{Kind: platform.SurfaceBlur})
+			if s != nil {
+				s.touch.cancelFling()
+				s.touch.fingers = s.touch.fingers[:0]
+				s.down.clear()
+				s.send(platform.SurfaceEvent{Kind: platform.SurfaceBlur})
+			}
 			if w.h != nil {
 				w.h.Blurred()
 			}
@@ -524,24 +531,31 @@ func (s *Surface) onWindow(p []byte) {
 			}
 		}
 	case winShow, winRestore:
-		s.mu.Lock()
-		wasOccluded := s.hostHidden || w.minimized
-		s.hostHidden = false
-		s.mu.Unlock()
+		wasOccluded := w.minimized
+		if s != nil {
+			s.mu.Lock()
+			wasOccluded = s.hostHidden || w.minimized
+			s.hostHidden = false
+			s.mu.Unlock()
+		}
 		wasMin := w.minimized
 		w.minimized = false
-		if wasOccluded {
+		if wasOccluded && s != nil {
 			s.send(platform.SurfaceEvent{Kind: platform.SurfaceShown})
 		}
 		if wasMin && w.h != nil {
 			w.h.Restored()
 		}
 	case winHide, winMinimize:
-		s.mu.Lock()
-		wasHostHidden := s.hostHidden
-		wasVisible := !s.hostHidden && !w.minimized
-		s.hostHidden = true
-		s.mu.Unlock()
+		wasHostHidden := false
+		wasVisible := !w.minimized
+		if s != nil {
+			s.mu.Lock()
+			wasHostHidden = s.hostHidden
+			wasVisible = !s.hostHidden && !w.minimized
+			s.hostHidden = true
+			s.mu.Unlock()
+		}
 		if op == winHide && !w.visible && wasHostHidden {
 			return
 		}
@@ -550,7 +564,7 @@ func (s *Surface) onWindow(p []byte) {
 			becameMin = !w.minimized
 			w.minimized = true
 		}
-		if wasVisible {
+		if wasVisible && s != nil {
 			s.touch.cancelFling()
 			s.send(platform.SurfaceEvent{Kind: platform.SurfaceHidden})
 		}
@@ -563,7 +577,9 @@ func (s *Surface) onWindow(p []byte) {
 		prevTB := w.TitleBar()
 		w.minimized = false
 		w.fullscreen = false
-		s.setHostHidden(false)
+		if s != nil {
+			s.setHostHidden(false)
+		}
 		if !w.maximized {
 			w.maximized = true
 			if wasMin && w.h != nil {
@@ -598,7 +614,9 @@ func (s *Surface) onWindow(p []byte) {
 	case winEnterFullScreen:
 		prevTB := w.TitleBar()
 		w.minimized = false
-		s.setHostHidden(false)
+		if s != nil {
+			s.setHostHidden(false)
+		}
 		if !w.fullscreen {
 			w.fullscreen = true
 			if w.h != nil {

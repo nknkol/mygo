@@ -94,6 +94,9 @@ type Backend struct {
 
 	netWatching bool
 	netStatus   platform.NetworkStatus
+
+	nextCookieReq  uint32
+	pendingCookies map[uint32]pendingCookieCall
 }
 
 // New returns the backend from the arguments and environment the host started
@@ -150,6 +153,8 @@ func NewWithFD(fd int) *Backend {
 }
 
 func (b *Backend) Name() string { return "ohos/surface" }
+
+func (b *Backend) WebViewAvailable() bool { return true }
 
 func (b *Backend) Theme() platform.Theme { return themeBackend{b} }
 
@@ -268,7 +273,8 @@ func (b *Backend) popNextLocked() (event, bool) {
 			switch k {
 			case kindInput, kindPopupResult, kindEnvInfo,
 				kindClipChanged, kindClipData, kindDialogResult, kindShellResult, kindAppOpen,
-				kindMediaCmd, kindNotifResult, kindNotifClicked, kindPowerState, kindNetState:
+				kindMediaCmd, kindNotifResult, kindNotifClicked, kindPowerState, kindNetState,
+				kindCookieResult, kindWebEvent:
 				idx = i
 			case kindQuit, kindSurface:
 				i = len(b.events)
@@ -379,9 +385,6 @@ func (b *Backend) Quit() {
 }
 
 func (b *Backend) NewWindow(opts *platform.WindowOptions, h platform.WindowHandler) (platform.Window, error) {
-	if opts != nil && !opts.Surface {
-		return nil, platform.ErrUnsupported
-	}
 	b.mu.Lock()
 	b.nextWinID++
 	id := b.nextWinID
@@ -399,6 +402,9 @@ func (b *Backend) NewWindow(opts *platform.WindowOptions, h platform.WindowHandl
 	b.mu.Unlock()
 
 	b.send(kindWinCreate, winConfigMessage(w.wireConfig(w.parentID)))
+	if w.isWeb && w.ua != "" {
+		w.sendWebReq(webOpSetUA, w.ua, "")
+	}
 	return w, nil
 }
 
@@ -526,6 +532,10 @@ func (b *Backend) dispatch(ev event) {
 		b.onPowerState(ev.payload)
 	case kindNetState:
 		b.onNetState(ev.payload)
+	case kindCookieResult:
+		b.onCookieResult(ev.payload)
+	case kindWebEvent:
+		b.onWebEvent(ev.payload)
 	}
 }
 
@@ -546,7 +556,7 @@ func (b *Backend) onSurface(payload []byte) {
 	}
 
 	win := b.windowByID(winID)
-	if win == nil || win.closed {
+	if win == nil || win.closed || win.surface == nil {
 		return
 	}
 	s := win.surface
@@ -592,7 +602,7 @@ func (b *Backend) onFrame(payload []byte, fd int) {
 	size := int(binary.LittleEndian.Uint32(payload[24:]))
 
 	win := b.windowByID(winID)
-	if win == nil || win.closed {
+	if win == nil || win.closed || win.surface == nil {
 		syscall.Close(fd)
 		b.send(kindAbort, abortMessage(winID, seq))
 		return

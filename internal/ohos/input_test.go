@@ -953,9 +953,11 @@ func TestPopupMenuNestedLoopAndConcurrency(t *testing.T) {
 		}
 		reqID, winID, x, y, _, items, ok := decodePopupMenuMessage(payload)
 		if !ok || winID != 1 || x != 120 || y != 180 || len(items) != 4 ||
-			items[0].label != "Copy" || items[0].accel != "Ctrl+C" ||
-			items[1].kind != byte(platform.MenuItemSeparator) ||
-			!items[2].checked || len(items[3].items) != 1 || items[3].items[0].id != 31 {
+			items[0].kind != 0 || items[0].label != "Copy" || items[0].accel != "Ctrl+C" ||
+			items[1].kind != 1 ||
+			items[2].kind != 3 || !items[2].checked ||
+			items[3].kind != 2 || len(items[3].items) != 1 ||
+			items[3].items[0].kind != 4 || items[3].items[0].id != 31 {
 			doneHost <- os.ErrInvalid
 			return
 		}

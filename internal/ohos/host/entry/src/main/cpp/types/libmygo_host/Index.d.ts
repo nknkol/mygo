@@ -120,10 +120,33 @@ export interface HostPowerReq {
   reason: string;
 }
 
+export interface HostCookieReq {
+  reqId: number;
+  op: number;
+  incognito: boolean;
+  siteDataTypes: number;
+  url: string;
+  headerOrName: string;
+  domain: string;
+  path: string;
+}
+
+export interface HostCookie {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  expiresUnix: number;
+  secure: boolean;
+  httpOnly: boolean;
+  sameSite: string;
+}
+
 export interface HostBridgeCallbacks {
   onWinCreate: (cfg: HostWinConfig) => void;
   onWinConfig: (cfg: HostWinConfig) => void;
   onWinAction: (winId: number, action: number) => void;
+  onFirstFrame: (winId: number) => void;
   onPopupMenu: (reqId: number, winId: number, x: number, y: number, rtl: boolean, items: HostMenuItem[]) => void;
   onClipWrite: (data: HostClipWrite) => void;
   onClipRead: (reqId: number, formats: string[]) => void;
@@ -136,6 +159,8 @@ export interface HostBridgeCallbacks {
   onNotifRemove: (all: boolean, id: string) => void;
   onPowerReq: (req: HostPowerReq) => void;
   onNetWatch: () => void;
+  onCookieReq: (req: HostCookieReq) => void;
+  onWebReq: (winId: number, op: number, arg1: string, arg2: string) => void;
   onEngineQuit: () => void;
   onEngineRestart: () => void;
 }
@@ -159,7 +184,8 @@ export interface HostModule {
     arkWindowId: number,
     scale: number,
     refreshRate: number,
-    darkMode: boolean
+    darkMode: boolean,
+    bgARGB?: number
   ): void;
   unbindWindow(winId: number): void;
   notifyWindowEvent(winId: number, op: number): void;
@@ -176,6 +202,16 @@ export interface HostModule {
   notifyNotifClicked(id: string): void;
   notifyPowerState(onBattery: boolean, event: string): void;
   notifyNetState(online: boolean, metered: boolean): void;
+  resolveCookie(reqId: number, err: string, cookies: HostCookie[]): void;
+  notifyWebEvent(
+    winId: number,
+    ev: number,
+    canBack: boolean,
+    canForward: boolean,
+    errCode: number,
+    text: string,
+    desc: string
+  ): void;
   setDarkMode(dark: boolean): void;
   crash(): void;
 }
