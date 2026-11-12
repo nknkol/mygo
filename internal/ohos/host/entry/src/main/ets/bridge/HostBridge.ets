@@ -84,6 +84,7 @@ const WIN_ACT_CENTER: number = 13;
 const WIN_ACT_START_DRAG: number = 14;
 const WIN_ACT_CLOSE_ALLOW: number = 15;
 const WIN_ACT_CLOSE_DENY: number = 16;
+const WIN_ACT_QUIT_DENY: number = 19;
 
 const WIN_OP_FOCUS: number = 1;
 const WIN_OP_BLUR: number = 2;
@@ -97,6 +98,7 @@ const WIN_OP_ENTER_FULLSCREEN: number = 11;
 const WIN_OP_LEAVE_FULLSCREEN: number = 12;
 const WIN_OP_CLOSE_REQUEST: number = 13;
 const WIN_OP_CLOSED: number = 14;
+const WIN_OP_QUIT_REQUEST: number = 17;
 
 const DLG_FLAG_OPEN_FILES: number = 1 << 0;
 const DLG_FLAG_OPEN_DIRS: number = 1 << 1;
@@ -186,6 +188,7 @@ const SCHEME_OP_FAIL: number = 4;
 const TRAY_OP_UPSERT: number = 1;
 const TRAY_OP_DESTROY: number = 2;
 const TRAY_FLAG_HAS_IMAGE: number = 1 << 0;
+const TRAY_FLAG_TEMPLATE_IMG: number = 1 << 1;
 const TRAY_FLAG_HAS_MENU: number = 1 << 2;
 const TRAY_EV_CLICK: number = 1;
 const TRAY_EV_MENU_ITEM: number = 3;
@@ -270,6 +273,7 @@ class ManagedWindow {
   pendingShowAction: number = 0;
   showTimerId: number = -1;
   closingFromEngine: boolean = false;
+  hiddenToStatusBar: boolean = false;
   lastStatus: window.WindowStatusType = window.WindowStatusType.FLOATING;
   cfg: HostWinConfig | undefined = undefined;
   pendingActions: number[] = [];
@@ -425,10 +429,16 @@ class HostBridgeManager {
   private trayChain: Promise<void> = Promise.resolve();
   private activeTrayId: number = 0;
   private trayAdded: boolean = false;
+  private trayRequested: boolean = false;
+  private trayUnavailable: boolean = false;
+  private lastTrayUpdate: HostTrayUpdate | undefined = undefined;
   private trayListenersAttached: boolean = false;
-  private trayIconPm: image.PixelMap | undefined = undefined;
+  private trayWhitePm: image.PixelMap | undefined = undefined;
+  private trayBlackPm: image.PixelMap | undefined = undefined;
   private trayMenus: statusBarManager.StatusBarGroupMenu[] = [];
   private trayTooltip: string = '';
+  private quitting: boolean = false;
+  private quitFallbackTimer: number = -1;
   private trayIconClickHandler: (ev: emitter.EventData) => void = (_ev: emitter.EventData): void => {
     if (this.activeTrayId > 0) {
       host.notifyTrayEvent(this.activeTrayId, TRAY_EV_CLICK, 0);
@@ -438,10 +448,23 @@ class HostBridgeManager {
     if (this.activeTrayId <= 0) {
       return;
     }
+    let codeStr: string = '';
     const dataObj: Record<string, Object> | undefined = ev.data as Record<string, Object> | undefined;
     const rawCode: Object | undefined = dataObj !== undefined ? dataObj['menuCode'] : undefined;
     if (typeof rawCode === 'string' && rawCode.length > 0) {
-      const parsed: number = Number.parseInt(rawCode, 10);
+      codeStr = rawCode;
+    } else if (typeof rawCode === 'number') {
+      codeStr = rawCode.toString();
+    } else {
+      try {
+        const m: RegExpMatchArray | null = JSON.stringify(ev).match(/"menuCode"\s*:\s*"([^"]+)"/);
+        if (m !== null && m.length > 1) {
+          codeStr = m[1];
+        }
+      } catch (_) {}
+    }
+    if (codeStr.length > 0) {
+      const parsed: number = Number.parseInt(codeStr, 10);
       if (!Number.isNaN(parsed) && parsed !== 0) {
         host.notifyTrayEvent(this.activeTrayId, TRAY_EV_MENU_ITEM, parsed);
       }
@@ -561,11 +584,34 @@ class HostBridgeManager {
   }
 
   onAppForeground(): void {
+    const mainMw: ManagedWindow | undefined = this.windows.get(1);
+    if (mainMw !== undefined) {
+      mainMw.hiddenToStatusBar = false;
+    }
     host.notifyWindowEvent(1, WIN_OP_SHOW);
+    if (this.trayRequested && !this.trayAdded && !this.trayUnavailable && this.lastTrayUpdate !== undefined) {
+      this.handleTrayUpdate(this.lastTrayUpdate);
+    }
   }
 
   onAppBackground(): void {
     host.notifyWindowEvent(1, WIN_OP_HIDE);
+  }
+
+  onPrepareToTerminate(): boolean {
+    if (this.quitting) {
+      return false;
+    }
+    host.notifyWindowEvent(1, WIN_OP_QUIT_REQUEST);
+    if (this.quitFallbackTimer < 0) {
+      this.quitFallbackTimer = setTimeout((): void => {
+        this.quitFallbackTimer = -1;
+        if (!this.quitting) {
+          this.handleEngineQuit();
+        }
+      }, 4000);
+    }
+    return true;
   }
 
   handleWant(want: Want, isNewWant: boolean): void {
@@ -588,12 +634,8 @@ class HostBridgeManager {
     if (isNewWant) {
       host.notifyAppOpen(APP_OPEN_ACTIVATE, []);
       const mainMw: ManagedWindow | undefined = this.windows.get(1);
-      if (mainMw !== undefined && mainMw.win !== undefined) {
-        try {
-          mainMw.win.showWindow().then((): void => {
-            this.focusManagedWindow(mainMw);
-          }).catch((): void => {});
-        } catch (_) {}
+      if (mainMw !== undefined) {
+        this.showManagedWindowNow(mainMw, WIN_ACT_SHOW);
       }
     }
   }
@@ -1915,6 +1957,13 @@ class HostBridgeManager {
   }
 
   private handleWinAction(winId: number, action: number): void {
+    if (action === WIN_ACT_QUIT_DENY) {
+      if (this.quitFallbackTimer >= 0) {
+        clearTimeout(this.quitFallbackTimer);
+        this.quitFallbackTimer = -1;
+      }
+      return;
+    }
     const mw: ManagedWindow | undefined = this.windows.get(winId);
     if (mw === undefined) {
       return;
@@ -1972,6 +2021,33 @@ class HostBridgeManager {
     if (w === undefined) {
       return;
     }
+    if (mw.winId === 1 && mw.hiddenToStatusBar && this.context !== undefined) {
+      mw.hiddenToStatusBar = false;
+      try {
+        this.context.showAbility().then((): void => {
+          this.reportWindowRect(mw);
+          if (action === WIN_ACT_SHOW) {
+            this.focusManagedWindow(mw);
+          }
+        }).catch((): void => {
+          try { w.showWindow().catch((): void => {}); } catch (_) {}
+        });
+        return;
+      } catch (_) {}
+    }
+    if (mw.lastStatus === window.WindowStatusType.MINIMIZE) {
+      try {
+        w.restore().then((): void => {
+          this.reportWindowRect(mw);
+          if (action === WIN_ACT_SHOW) {
+            this.focusManagedWindow(mw);
+          }
+        }).catch((): void => {
+          try { w.showWindow().catch((): void => {}); } catch (_) {}
+        });
+        return;
+      } catch (_) {}
+    }
     try {
       w.showWindow().then((): void => {
         this.reportWindowRect(mw);
@@ -2026,7 +2102,24 @@ class HostBridgeManager {
         break;
       case WIN_ACT_HIDE:
         this.clearSubWindowTimers(mw);
-        if (mw.winId >= 2) {
+        if (mw.winId === 1) {
+          if (this.trayAdded && this.context !== undefined) {
+            mw.hiddenToStatusBar = true;
+            try {
+              this.context.hideAbility().catch((): void => {
+                mw.hiddenToStatusBar = false;
+                try { w.minimize().catch((): void => {}); } catch (_) {}
+              });
+            } catch (_) {
+              mw.hiddenToStatusBar = false;
+              try { w.minimize().catch((): void => {}); } catch (_) {}
+            }
+          } else {
+            try {
+              w.minimize().catch((): void => {});
+            } catch (_) {}
+          }
+        } else {
           try {
             w.minimize().catch((): void => {});
           } catch (_) {}
@@ -2062,8 +2155,22 @@ class HostBridgeManager {
           w.maximize(window.MaximizePresentation.EXIT_IMMERSIVE).catch((): void => {});
         } catch (_) {}
         break;
-      case WIN_ACT_UNMAXIMIZE:
       case WIN_ACT_RESTORE:
+        if (mw.winId === 1 && mw.hiddenToStatusBar) {
+          this.showManagedWindowNow(mw, WIN_ACT_SHOW);
+          break;
+        }
+        if (mw.lastStatus === window.WindowStatusType.MINIMIZE) {
+          try {
+            w.restore().catch((): void => {});
+          } catch (_) {}
+          break;
+        }
+        try {
+          w.recover().catch((): void => {});
+        } catch (_) {}
+        break;
+      case WIN_ACT_UNMAXIMIZE:
       case WIN_ACT_EXIT_FULLSCREEN:
         try {
           w.recover().catch((): void => {});
@@ -2178,7 +2285,7 @@ class HostBridgeManager {
 
     try {
       w.on('windowWillClose', (): Promise<boolean> => {
-        if (mw.closingFromEngine) {
+        if (mw.closingFromEngine || this.quitting) {
           return Promise.resolve(false);
         }
         return new Promise<boolean>((resolve: (prevent: boolean) => void): void => {
@@ -2270,6 +2377,20 @@ class HostBridgeManager {
   }
 
   private handleEngineQuit(): void {
+    this.quitting = true;
+    if (this.quitFallbackTimer >= 0) {
+      clearTimeout(this.quitFallbackTimer);
+      this.quitFallbackTimer = -1;
+    }
+    this.windows.forEach((mw: ManagedWindow): void => {
+      mw.closingFromEngine = true;
+      if (mw.willCloseResolve !== undefined) {
+        const resolve: (prevent: boolean) => void = mw.willCloseResolve;
+        mw.willCloseResolve = undefined;
+        resolve(false);
+      }
+    });
+    this.teardownTray();
     if (this.context !== undefined) {
       try {
         this.context.terminateSelf().catch((): void => {});
@@ -3594,12 +3715,90 @@ class HostBridgeManager {
     }
   }
 
-  private handleTrayUpdate(tray: HostTrayUpdate): void {
-    this.trayChain = this.trayChain.then((): Promise<void> => {
-      return this.applyTrayUpdateAsync(tray);
-    }).catch((err: BusinessError): void => {
-      hilog.error(DOMAIN, TAG, 'applyTrayUpdateAsync failed: %{public}s', JSON.stringify(err));
+  private trayTitle: string = '';
+  private trayCapabilityChecked: boolean = false;
+  private pendingTrayUpdate: HostTrayUpdate | undefined = undefined;
+  private trayDebounceTimer: number = -1;
+  private maxTrayIconSide: number = 0;
+  private trayRawPng: ArrayBuffer = new ArrayBuffer(0);
+  private trayRawTemplate: boolean = false;
+
+  private delayMs(ms: number): Promise<void> {
+    return new Promise<void>((resolve: () => void): void => {
+      setTimeout((): void => {
+        resolve();
+      }, ms);
     });
+  }
+
+  private handleTrayUpdate(tray: HostTrayUpdate): void {
+    if (tray.op === TRAY_OP_DESTROY) {
+      if (this.trayDebounceTimer >= 0) {
+        clearTimeout(this.trayDebounceTimer);
+        this.trayDebounceTimer = -1;
+      }
+      this.pendingTrayUpdate = undefined;
+      this.trayChain = this.trayChain.then((): Promise<void> => {
+        return this.applyTrayUpdateAsync(tray);
+      }).catch((err: BusinessError): void => {
+        hilog.error(DOMAIN, TAG, 'applyTrayUpdateAsync destroy failed: %{public}s', JSON.stringify(err));
+      });
+      return;
+    }
+
+    if (this.pendingTrayUpdate === undefined || this.pendingTrayUpdate.trayId !== tray.trayId) {
+      this.pendingTrayUpdate = {
+        trayId: tray.trayId,
+        op: tray.op,
+        flags: tray.flags,
+        id: tray.id,
+        title: tray.title,
+        tooltip: tray.tooltip,
+        png: tray.png,
+        items: tray.items
+      };
+    } else {
+      const p: HostTrayUpdate = this.pendingTrayUpdate;
+      p.op = tray.op;
+      if (tray.id.length > 0) {
+        p.id = tray.id;
+      }
+      if (tray.title.length > 0) {
+        p.title = tray.title;
+      }
+      if (tray.tooltip.length > 0) {
+        p.tooltip = tray.tooltip;
+      }
+      if ((tray.flags & TRAY_FLAG_HAS_IMAGE) !== 0) {
+        p.flags = (p.flags & ~TRAY_FLAG_TEMPLATE_IMG) | TRAY_FLAG_HAS_IMAGE | (tray.flags & TRAY_FLAG_TEMPLATE_IMG);
+        p.png = tray.png;
+      }
+      if ((tray.flags & TRAY_FLAG_HAS_MENU) !== 0) {
+        p.flags |= TRAY_FLAG_HAS_MENU;
+        p.items = tray.items;
+      }
+    }
+
+    if (this.trayDebounceTimer >= 0) {
+      return;
+    }
+    this.trayDebounceTimer = setTimeout((): void => {
+      this.trayDebounceTimer = -1;
+      const merged: HostTrayUpdate | undefined = this.pendingTrayUpdate;
+      this.pendingTrayUpdate = undefined;
+      if (merged === undefined) {
+        return;
+      }
+      this.trayChain = this.trayChain.then((): Promise<void> => {
+        return this.applyTrayUpdateAsync(merged);
+      }).catch((err: BusinessError): void => {
+        hilog.error(DOMAIN, TAG, 'applyTrayUpdateAsync failed: %{public}s', JSON.stringify(err));
+      });
+    }, 30);
+  }
+
+  private clipTrayText(s: string): string {
+    return s.length > 128 ? s.substring(0, 128) : s;
   }
 
   private buildTrayGroupMenus(items: HostMenuItem[]): statusBarManager.StatusBarGroupMenu[] {
@@ -3610,7 +3809,8 @@ class HostBridgeManager {
     for (let i: number = 0; i < items.length; i++) {
       const it: HostMenuItem = items[i];
       if (it.kind === MENU_ITEM_SEPARATOR) {
-        if (curGroup.length > 0) {
+        // statusBarManager allows at most 3 groups; merge trailing groups into group 3.
+        if (curGroup.length > 0 && groups.length < 2) {
           groups.push(curGroup);
           curGroup = [];
         }
@@ -3619,7 +3819,7 @@ class HostBridgeManager {
       if (totalTop >= 20) {
         break;
       }
-      const titleText: string = it.label.length > 0 ? it.label : 'Item';
+      const titleText: string = this.clipTrayText(it.label.length > 0 ? it.label : 'Item');
       if (it.kind === MENU_ITEM_SUBMENU && it.items.length > 0) {
         const subs: statusBarManager.StatusBarSubMenuItem[] = [];
         for (let j: number = 0; j < it.items.length && subs.length < 20; j++) {
@@ -3627,18 +3827,18 @@ class HostBridgeManager {
           if (sub.kind === MENU_ITEM_SEPARATOR) {
             continue;
           }
-          const subCode: string = sub.id.toString();
+          const subCode: string = sub.enabled ? sub.id.toString() : ('noop_' + i.toString() + '_' + j.toString());
           const subEntry: statusBarManager.StatusBarSubMenuItem = {
-            subTitle: sub.label.length > 0 ? sub.label : 'Item',
+            subTitle: this.clipTrayText(sub.label.length > 0 ? sub.label : 'Item'),
             menuCode: subCode,
             menuAction: {
               abilityName: 'EntryAbility',
-              notifyOnly: sub.enabled
-            },
-            options: {
-              selected: sub.checked
+              notifyOnly: true
             }
           };
+          if (sub.checked) {
+            subEntry.options = { selected: true };
+          }
           subs.push(subEntry);
         }
         if (subs.length > 0) {
@@ -3653,18 +3853,18 @@ class HostBridgeManager {
         continue;
       }
 
-      const itemCode: string = it.id.toString();
+      const itemCode: string = it.enabled ? it.id.toString() : ('noop_' + i.toString());
       const entry: statusBarManager.StatusBarMenuItem = {
         title: titleText,
         menuCode: itemCode,
         menuAction: {
           abilityName: 'EntryAbility',
-          notifyOnly: it.enabled
-        },
-        options: {
-          selected: it.checked
+          notifyOnly: true
         }
       };
+      if (it.checked) {
+        entry.options = { selected: true };
+      }
       curGroup.push(entry);
       totalTop++;
     }
@@ -3675,41 +3875,173 @@ class HostBridgeManager {
     return groups;
   }
 
-  private async ensureTrayIconPixelMap(png: ArrayBuffer, replace: boolean): Promise<image.PixelMap> {
-    if (replace && png.byteLength > 0) {
-      let src: image.ImageSource | undefined = undefined;
-      try {
-        src = image.createImageSource(png);
-        const decoded: image.PixelMap = await src.createPixelMap();
-        if (this.trayIconPm !== undefined) {
-          try { await this.trayIconPm.release(); } catch (_) {}
-        }
-        this.trayIconPm = decoded;
-        return decoded;
-      } finally {
-        if (src !== undefined) {
-          try { await src.release(); } catch (_) {}
-        }
+  private releaseTrayIcons(): void {
+    const oldWhite: image.PixelMap | undefined = this.trayWhitePm;
+    const oldBlack: image.PixelMap | undefined = this.trayBlackPm;
+    this.trayWhitePm = undefined;
+    this.trayBlackPm = undefined;
+    if (oldWhite !== undefined) {
+      try { oldWhite.release().catch((): void => {}); } catch (_) {}
+    }
+    if (oldBlack !== undefined && oldBlack !== oldWhite) {
+      try { oldBlack.release().catch((): void => {}); } catch (_) {}
+    }
+  }
+
+  private async decodeScaledTrayIcon(buf: ArrayBuffer, side: number): Promise<image.PixelMap> {
+    let src: image.ImageSource | undefined = undefined;
+    try {
+      src = image.createImageSource(buf);
+      return await src.createPixelMap({
+        desiredSize: { width: side, height: side },
+        desiredPixelFormat: image.PixelMapFormat.RGBA_8888
+      });
+    } finally {
+      if (src !== undefined) {
+        try { await src.release(); } catch (_) {}
       }
     }
-    if (this.trayIconPm !== undefined) {
-      return this.trayIconPm;
+  }
+
+  private candidateTraySides(): number[] {
+    const ideal: number = Math.min(48, Math.max(24, Math.round(24 * this.currentScale())));
+    if (this.maxTrayIconSide > 0) {
+      return [this.maxTrayIconSide];
     }
-    const blank: ArrayBuffer = new ArrayBuffer(24 * 24 * 4);
-    const u8: Uint8Array = new Uint8Array(blank);
-    for (let i: number = 0; i < u8.length; i += 4) {
-      u8[i] = 180;
-      u8[i + 1] = 180;
-      u8[i + 2] = 180;
-      u8[i + 3] = 255;
+    const candidates: number[] = [ideal, 36, 32, 24, 16];
+    const uniq: number[] = [];
+    for (let i: number = 0; i < candidates.length; i++) {
+      const c: number = candidates[i];
+      if (c <= ideal && uniq.indexOf(c) < 0) {
+        uniq.push(c);
+      }
     }
-    const fallback: image.PixelMap = await image.createPixelMap(blank, {
-      size: { width: 24, height: 24 },
+    if (uniq.length === 0) {
+      uniq.push(24);
+    }
+    return uniq;
+  }
+
+  private async buildTrayIconsForSide(side: number): Promise<statusBarManager.StatusBarIcon> {
+    if (this.trayRawPng.byteLength > 0) {
+      if (this.trayRawTemplate) {
+        const decoded: image.PixelMap = await this.decodeScaledTrayIcon(this.trayRawPng, side);
+        const byteLen: number = side * side * 4;
+        const rawBuf: ArrayBuffer = new ArrayBuffer(byteLen);
+        await decoded.readPixelsToBuffer(rawBuf);
+        try { await decoded.release(); } catch (_) {}
+
+        const srcBytes: Uint8Array = new Uint8Array(rawBuf);
+        const whiteBuf: ArrayBuffer = new ArrayBuffer(byteLen);
+        const blackBuf: ArrayBuffer = new ArrayBuffer(byteLen);
+        const wBytes: Uint8Array = new Uint8Array(whiteBuf);
+        const bBytes: Uint8Array = new Uint8Array(blackBuf);
+        for (let i: number = 0; i < byteLen; i += 4) {
+          const a: number = srcBytes[i + 3];
+          wBytes[i] = 255;
+          wBytes[i + 1] = 255;
+          wBytes[i + 2] = 255;
+          wBytes[i + 3] = a;
+          bBytes[i] = 0;
+          bBytes[i + 1] = 0;
+          bBytes[i + 2] = 0;
+          bBytes[i + 3] = a;
+        }
+        const opts: image.InitializationOptions = {
+          size: { width: side, height: side },
+          pixelFormat: image.PixelMapFormat.RGBA_8888,
+          editable: false
+        };
+        const whitePm: image.PixelMap = await image.createPixelMap(whiteBuf, opts);
+        const blackPm: image.PixelMap = await image.createPixelMap(blackBuf, opts);
+        return { white: whitePm, black: blackPm };
+      }
+      const whitePm: image.PixelMap = await this.decodeScaledTrayIcon(this.trayRawPng, side);
+      const blackPm: image.PixelMap = await this.decodeScaledTrayIcon(this.trayRawPng, side);
+      return { white: whitePm, black: blackPm };
+    }
+
+    const byteLen: number = side * side * 4;
+    const whiteBuf: ArrayBuffer = new ArrayBuffer(byteLen);
+    const blackBuf: ArrayBuffer = new ArrayBuffer(byteLen);
+    const wBytes: Uint8Array = new Uint8Array(whiteBuf);
+    const bBytes: Uint8Array = new Uint8Array(blackBuf);
+    const center: number = (side - 1) / 2.0;
+    const outerR: number = side * 0.42;
+    const innerR: number = side * 0.22;
+    for (let y: number = 0; y < side; y++) {
+      for (let x: number = 0; x < side; x++) {
+        const dx: number = x - center;
+        const dy: number = y - center;
+        const dist: number = Math.sqrt(dx * dx + dy * dy);
+        const alpha: number = (dist <= outerR && dist >= innerR) ? 255 : 0;
+        const idx: number = (y * side + x) * 4;
+        wBytes[idx] = 255;
+        wBytes[idx + 1] = 255;
+        wBytes[idx + 2] = 255;
+        wBytes[idx + 3] = alpha;
+        bBytes[idx] = 0;
+        bBytes[idx + 1] = 0;
+        bBytes[idx + 2] = 0;
+        bBytes[idx + 3] = alpha;
+      }
+    }
+    const opts: image.InitializationOptions = {
+      size: { width: side, height: side },
       pixelFormat: image.PixelMapFormat.RGBA_8888,
-      editable: true
+      editable: false
+    };
+    const fbWhite: image.PixelMap = await image.createPixelMap(whiteBuf, opts);
+    const fbBlack: image.PixelMap = await image.createPixelMap(blackBuf, opts);
+    return { white: fbWhite, black: fbBlack };
+  }
+
+  private addToStatusBarAsync(ctx: common.UIAbilityContext, sbItem: statusBarManager.StatusBarItem): Promise<BusinessError | undefined> {
+    return new Promise<BusinessError | undefined>((resolve: (err: BusinessError | undefined) => void): void => {
+      try {
+        statusBarManager.addToStatusBar(ctx, sbItem, (err: BusinessError): void => {
+          if (err !== undefined && err !== null && err.code !== 0) {
+            resolve(err);
+          } else {
+            resolve(undefined);
+          }
+        });
+      } catch (e) {
+        resolve(e as BusinessError);
+      }
     });
-    this.trayIconPm = fallback;
-    return fallback;
+  }
+
+  private updateStatusBarIconAsync(ctx: common.UIAbilityContext, icons: statusBarManager.StatusBarIcon): Promise<BusinessError | undefined> {
+    return new Promise<BusinessError | undefined>((resolve: (err: BusinessError | undefined) => void): void => {
+      try {
+        statusBarManager.updateStatusBarIcon(ctx, icons, (err: BusinessError): void => {
+          if (err !== undefined && err !== null && err.code !== 0) {
+            resolve(err);
+          } else {
+            resolve(undefined);
+          }
+        });
+      } catch (e) {
+        resolve(e as BusinessError);
+      }
+    });
+  }
+
+  private updateStatusBarMenuAsync(ctx: common.UIAbilityContext, menus: statusBarManager.StatusBarGroupMenu[]): Promise<BusinessError | undefined> {
+    return new Promise<BusinessError | undefined>((resolve: (err: BusinessError | undefined) => void): void => {
+      try {
+        statusBarManager.updateStatusBarMenu(ctx, menus, (err: BusinessError): void => {
+          if (err !== undefined && err !== null && err.code !== 0) {
+            resolve(err);
+          } else {
+            resolve(undefined);
+          }
+        });
+      } catch (e) {
+        resolve(e as BusinessError);
+      }
+    });
   }
 
   private attachTrayListeners(): void {
@@ -3739,7 +4071,7 @@ class HostBridgeManager {
   }
 
   private async applyTrayUpdateAsync(tray: HostTrayUpdate): Promise<void> {
-    if (this.context === undefined) {
+    if (this.context === undefined || this.quitting) {
       return;
     }
     const ctx: common.UIAbilityContext = this.context;
@@ -3751,67 +4083,130 @@ class HostBridgeManager {
       return;
     }
 
-    if (tray.op !== TRAY_OP_UPSERT) {
+    if (tray.op !== TRAY_OP_UPSERT || this.trayUnavailable) {
       return;
     }
 
-    this.activeTrayId = tray.trayId;
-    const hasImg: boolean = (tray.flags & TRAY_FLAG_HAS_IMAGE) !== 0 && tray.png.byteLength > 0;
-    const hasMenu: boolean = (tray.flags & TRAY_FLAG_HAS_MENU) !== 0;
-    const pm: image.PixelMap = await this.ensureTrayIconPixelMap(tray.png, hasImg);
-    const icons: statusBarManager.StatusBarIcon = {
-      white: pm,
-      black: pm
-    };
+    if (!this.trayCapabilityChecked) {
+      this.trayCapabilityChecked = true;
+      try {
+        const supported: boolean = await statusBarManager.isStatusBarCapabilitySupported(ctx);
+        if (!supported) {
+          this.trayUnavailable = true;
+          return;
+        }
+      } catch (_) {}
+    }
 
+    this.trayRequested = true;
+    this.activeTrayId = tray.trayId;
+    if (tray.title.length > 0) {
+      this.trayTitle = this.clipTrayText(tray.title);
+    }
+    const hasImg: boolean = (tray.flags & TRAY_FLAG_HAS_IMAGE) !== 0 && tray.png.byteLength > 0;
+    const isTemplate: boolean = (tray.flags & TRAY_FLAG_TEMPLATE_IMG) !== 0;
+    const hasMenu: boolean = (tray.flags & TRAY_FLAG_HAS_MENU) !== 0;
+    if (hasImg) {
+      this.trayRawPng = tray.png;
+      this.trayRawTemplate = isTemplate;
+    }
     if (hasMenu) {
       this.trayMenus = this.buildTrayGroupMenus(tray.items);
     }
 
-    const rawTip: string = tray.tooltip.length > 0 ? tray.tooltip : tray.title;
-    const clippedTip: string = rawTip.length > 128 ? rawTip.substring(0, 128) : rawTip;
+    const rawTip: string = tray.tooltip.length > 0 ? tray.tooltip : (this.trayTooltip.length > 0 ? this.trayTooltip : this.trayTitle);
+    const clippedTip: string = this.clipTrayText(rawTip);
+    const retrySnapshot: HostTrayUpdate = {
+      trayId: tray.trayId,
+      op: TRAY_OP_UPSERT,
+      flags: 0,
+      id: tray.id,
+      title: this.trayTitle,
+      tooltip: clippedTip,
+      png: new ArrayBuffer(0),
+      items: []
+    };
+    this.lastTrayUpdate = retrySnapshot;
 
     this.attachTrayListeners();
 
     if (!this.trayAdded) {
-      const quickTitle: string = tray.title.length > 0 ? tray.title : this.bundleLabel;
-      const sbItem: statusBarManager.StatusBarItem = {
-        icons: icons,
-        quickOperation: {
-          title: quickTitle.length > 0 ? quickTitle : 'MyGo',
-          height: 1,
-          abilityName: ''
+      const quickTitle: string = this.trayTitle.length > 0 ? this.trayTitle : this.bundleLabel;
+      const sides: number[] = this.candidateTraySides();
+      for (let sIdx: number = 0; sIdx < sides.length; sIdx++) {
+        const side: number = sides[sIdx];
+        const icons: statusBarManager.StatusBarIcon = await this.buildTrayIconsForSide(side);
+        const sbItem: statusBarManager.StatusBarItem = {
+          icons: icons,
+          quickOperation: {
+            title: this.clipTrayText(quickTitle.length > 0 ? quickTitle : 'MyGo'),
+            height: 1,
+            abilityName: ''
+          }
+        };
+        if (this.trayMenus.length > 0) {
+          sbItem.statusBarGroupMenu = this.trayMenus;
         }
-      };
-      if (this.trayMenus.length > 0) {
-        sbItem.statusBarGroupMenu = this.trayMenus;
-      }
-      if (clippedTip.length > 0) {
-        sbItem.hoverTips = clippedTip;
-        this.trayTooltip = clippedTip;
-      }
-      try {
-        statusBarManager.addToStatusBar(ctx, sbItem);
-        this.trayAdded = true;
-      } catch (e) {
-        hilog.error(DOMAIN, TAG, 'addToStatusBar failed: %{public}s', JSON.stringify(e));
+        if (clippedTip.length > 0) {
+          sbItem.hoverTips = clippedTip;
+        }
+        const addErr: BusinessError | undefined = await this.addToStatusBarAsync(ctx, sbItem);
+        if (addErr === undefined) {
+          this.releaseTrayIcons();
+          this.trayWhitePm = icons.white;
+          this.trayBlackPm = icons.black;
+          this.maxTrayIconSide = side;
+          this.trayAdded = true;
+          if (clippedTip.length > 0) {
+            this.trayTooltip = clippedTip;
+          }
+          hilog.info(DOMAIN, TAG, 'addToStatusBar ok side=%{public}d groups=%{public}d', side, this.trayMenus.length);
+          return;
+        }
+        try { icons.white.release().catch((): void => {}); } catch (_) {}
+        if (icons.black !== icons.white) {
+          try { icons.black.release().catch((): void => {}); } catch (_) {}
+        }
+        hilog.error(DOMAIN, TAG, 'addToStatusBar err side=%{public}d code=%{public}d msg=%{public}s', side, addErr.code, addErr.message);
+        if (addErr.code !== 1010710001 && addErr.code !== 1010710003) {
+          return;
+        }
+        await this.delayMs(35);
       }
       return;
     }
 
     if (hasImg) {
-      try {
-        statusBarManager.updateStatusBarIcon(ctx, icons);
-      } catch (e) {
-        hilog.error(DOMAIN, TAG, 'updateStatusBarIcon failed: %{public}s', JSON.stringify(e));
+      const sides: number[] = this.candidateTraySides();
+      for (let sIdx: number = 0; sIdx < sides.length; sIdx++) {
+        const side: number = sides[sIdx];
+        const icons: statusBarManager.StatusBarIcon = await this.buildTrayIconsForSide(side);
+        const iconErr: BusinessError | undefined = await this.updateStatusBarIconAsync(ctx, icons);
+        if (iconErr === undefined) {
+          this.releaseTrayIcons();
+          this.trayWhitePm = icons.white;
+          this.trayBlackPm = icons.black;
+          this.maxTrayIconSide = side;
+          await this.delayMs(25);
+          break;
+        }
+        try { icons.white.release().catch((): void => {}); } catch (_) {}
+        if (icons.black !== icons.white) {
+          try { icons.black.release().catch((): void => {}); } catch (_) {}
+        }
+        hilog.error(DOMAIN, TAG, 'updateStatusBarIcon err side=%{public}d code=%{public}d msg=%{public}s', side, iconErr.code, iconErr.message);
+        if (iconErr.code !== 1010710001 && iconErr.code !== 1010710003) {
+          break;
+        }
+        await this.delayMs(35);
       }
     }
-    if (hasMenu) {
-      try {
-        statusBarManager.updateStatusBarMenu(ctx, this.trayMenus);
-      } catch (e) {
-        hilog.error(DOMAIN, TAG, 'updateStatusBarMenu failed: %{public}s', JSON.stringify(e));
+    if (hasMenu && this.trayMenus.length > 0) {
+      const menuErr: BusinessError | undefined = await this.updateStatusBarMenuAsync(ctx, this.trayMenus);
+      if (menuErr !== undefined) {
+        hilog.error(DOMAIN, TAG, 'updateStatusBarMenu err code=%{public}d msg=%{public}s', menuErr.code, menuErr.message);
       }
+      await this.delayMs(25);
     }
     if (clippedTip.length > 0 && clippedTip !== this.trayTooltip) {
       this.trayTooltip = clippedTip;
@@ -3822,6 +4217,11 @@ class HostBridgeManager {
   }
 
   private teardownTray(): void {
+    if (this.trayDebounceTimer >= 0) {
+      clearTimeout(this.trayDebounceTimer);
+      this.trayDebounceTimer = -1;
+    }
+    this.pendingTrayUpdate = undefined;
     this.detachTrayListeners();
     if (this.trayAdded && this.context !== undefined) {
       try {
@@ -3829,14 +4229,15 @@ class HostBridgeManager {
       } catch (_) {}
     }
     this.trayAdded = false;
+    this.trayRequested = false;
+    this.lastTrayUpdate = undefined;
     this.activeTrayId = 0;
     this.trayMenus = [];
+    this.trayTitle = '';
     this.trayTooltip = '';
-    if (this.trayIconPm !== undefined) {
-      const oldPm: image.PixelMap = this.trayIconPm;
-      this.trayIconPm = undefined;
-      try { oldPm.release().catch((): void => {}); } catch (_) {}
-    }
+    this.trayRawPng = new ArrayBuffer(0);
+    this.trayRawTemplate = false;
+    this.releaseTrayIcons();
   }
 }
 

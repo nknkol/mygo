@@ -667,6 +667,7 @@ func ohosModuleConfig(c *Config) map[string]any {
 	perms := []map[string]any{
 		{"name": "ohos.permission.INTERNET"},
 		{"name": "ohos.permission.GET_NETWORK_INFO"},
+		{"name": "ohos.permission.PREPARE_APP_TERMINATE"},
 		{
 			"name":   "ohos.permission.KEEP_BACKGROUND_RUNNING",
 			"reason": "$string:keep_background_reason",

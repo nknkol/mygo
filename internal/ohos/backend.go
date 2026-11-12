@@ -343,15 +343,29 @@ func (b *Backend) popNextLocked() (event, bool) {
 	b.events = b.events[:len(b.events)-1]
 
 	if wid, ok := surfaceWinID(ev); ok {
+		fresh := len(ev.payload) >= 21 && ev.payload[20] != 0
 		for idx < len(b.events) {
 			nwid, nok := surfaceWinID(b.events[idx])
 			if !nok || nwid != wid {
 				break
 			}
 			ev = b.events[idx]
+			if len(ev.payload) >= 21 && ev.payload[20] != 0 {
+				fresh = true
+			}
 			copy(b.events[idx:], b.events[idx+1:])
 			b.events[len(b.events)-1] = event{}
 			b.events = b.events[:len(b.events)-1]
+		}
+		if fresh {
+			if len(ev.payload) >= 21 {
+				ev.payload[20] = 1
+			} else if len(ev.payload) >= 16 {
+				buf := make([]byte, 21)
+				copy(buf, ev.payload)
+				buf[20] = 1
+				ev.payload = buf
+			}
 		}
 	} else if wid, btn, pk, ok := isMouseMove(ev); ok {
 		for idx < len(b.events) {
@@ -647,7 +661,8 @@ func (b *Backend) dispatch(ev event) {
 
 // onSurface takes the size the host reports for winID, in device pixels and DIPs.
 // Identical geometry updates the refresh rate without discarding swapchain
-// damage history or firing a redundant SurfaceResize.
+// damage history or firing a redundant SurfaceResize, unless fresh is set to
+// mark a newly created OHNativeWindow swapchain (e.g. after showAbility).
 func (b *Backend) onSurface(payload []byte) {
 	if len(payload) < 16 {
 		return
@@ -660,6 +675,7 @@ func (b *Backend) onSurface(payload []byte) {
 	if len(payload) >= 20 {
 		hz = float64(binary.LittleEndian.Uint32(payload[16:])) / 1000
 	}
+	fresh := len(payload) >= 21 && payload[20] != 0
 
 	win := b.windowByID(winID)
 	if win == nil || win.closed || win.surface == nil {
@@ -670,7 +686,10 @@ func (b *Backend) onSurface(payload []byte) {
 	if hz > 0 {
 		s.hz = hz
 	}
-	same := s.width == w && s.height == h && math.Abs(s.scale-scale) < 1e-6
+	if fresh {
+		s.waiting = false
+	}
+	same := !fresh && s.width == w && s.height == h && math.Abs(s.scale-scale) < 1e-6
 	if !same {
 		s.width, s.height, s.scale = w, h, scale
 		s.history = s.history[:0]

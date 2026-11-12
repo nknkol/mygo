@@ -20,7 +20,7 @@ import (
 // Messages are u8 kind | u32 len | payload. Window-scoped messages carry
 // u32 winID at offset 0 (1 = main Ability window, 2+ = subwindows).
 const (
-	kindSurface = 1 // {u32 winID, u32 width, u32 height, u32 scale×1000[, u32 milliHz]}
+	kindSurface = 1 // {u32 winID, u32 width, u32 height, u32 scale×1000[, u32 milliHz[, u8 fresh]]}
 	kindFrame   = 2 // {u32 winID, u32 seq, u32 id, u32 width, u32 height, u32 stride, u32 size} + fd
 	kindInput   = 3 // {u32 winID, u8 subkind, u8 op, ...}
 	kindQuit    = 4 // {}
@@ -260,6 +260,7 @@ const (
 	winClosed          = 14
 	winRect            = 15 // {u32 winID, u8 inputWindow, u8 winRect, u16 pad, i32 x, i32 y, i32 w, i32 h}
 	winTitleBar        = 16 // {u32 winID, u8 inputWindow, u8 winTitleBar, u16 pad, i32 height, i32 left, i32 right}
+	winQuitRequest     = 17 // {u32 winID, u8 inputWindow, u8 winQuitRequest, u16 pad}: OS/Dock/Tray quit request
 )
 
 // IME operations (inputIME).
@@ -329,6 +330,7 @@ const (
 	winActCloseDeny       byte = 16
 	winActEnableWebLayer  byte = 17
 	winActFocusSurface    byte = 18
+	winActQuitDeny        byte = 19
 )
 
 // rect is a rectangle in the content's own coordinates, origin top left, as

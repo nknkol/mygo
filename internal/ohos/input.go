@@ -136,6 +136,17 @@ func (b *Backend) onInput(payload []byte) {
 		b.setSystemDark(body[1] == winThemeDark)
 		return
 	}
+	if body[0] == inputWindow && body[1] == winQuitRequest {
+		b.mu.Lock()
+		app := b.app
+		b.mu.Unlock()
+		if app == nil || app.QuitRequested() {
+			b.Quit()
+		} else {
+			b.send(kindWinAction, winActionMessage(1, winActQuitDeny))
+		}
+		return
+	}
 
 	if body[0] != inputWindow {
 		b.noteUserActivity()
@@ -183,6 +194,12 @@ func (s *Surface) recordPointer(x, y float64) {
 }
 
 func (s *Surface) send(ev platform.SurfaceEvent) bool {
+	switch ev.Kind {
+	case platform.PointerMove, platform.PointerDown, platform.PointerUp, platform.PointerScroll, platform.PointerZoom:
+		s.pointerIn = true
+	case platform.PointerLeave:
+		s.pointerIn = false
+	}
 	if ev.Kind == platform.PointerDown || ev.Kind == platform.SurfaceBlur {
 		s.clientComposition.Reset()
 	}
@@ -529,17 +546,26 @@ func (w *Window) onWindowInput(p []byte) {
 					}
 				}
 			}
+			if w.opts.Flyout != nil && w.opts.Flyout.Focusable && !w.dismissing && !w.hasModalChild() {
+				w.dismissing = true
+				allow := w.h == nil || w.h.ShouldClose()
+				w.dismissing = false
+				if allow {
+					w.Close()
+				}
+			}
 		}
 	case winShow, winRestore:
-		wasOccluded := w.minimized
+		w.visible = true
+		wasMin := w.minimized
+		w.minimized = false
+		wasOccluded := wasMin
 		if s != nil {
 			s.mu.Lock()
-			wasOccluded = s.hostHidden || w.minimized
+			wasOccluded = s.hostHidden || wasMin
 			s.hostHidden = false
 			s.mu.Unlock()
 		}
-		wasMin := w.minimized
-		w.minimized = false
 		if wasOccluded && s != nil {
 			s.send(platform.SurfaceEvent{Kind: platform.SurfaceShown})
 		}
@@ -566,6 +592,9 @@ func (w *Window) onWindowInput(p []byte) {
 		}
 		if wasVisible && s != nil {
 			s.touch.cancelFling()
+			if s.pointerIn {
+				s.send(platform.SurfaceEvent{Kind: platform.PointerLeave})
+			}
 			s.send(platform.SurfaceEvent{Kind: platform.SurfaceHidden})
 		}
 		if becameMin && w.h != nil {

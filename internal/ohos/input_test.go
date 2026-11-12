@@ -397,6 +397,16 @@ type testAppHandler struct {
 	notifClicks     []string
 	powerEvents     []string
 	netChanges      []platform.NetworkStatus
+	quitRequested   func() bool
+	quitCalls       int
+}
+
+func (h *testAppHandler) QuitRequested() bool {
+	h.quitCalls++
+	if h.quitRequested != nil {
+		return h.quitRequested()
+	}
+	return true
 }
 
 func (h *testAppHandler) Ready() {
@@ -1050,5 +1060,211 @@ func TestAppEnvPreInitDisplaysAndCursorPoint(t *testing.T) {
 	if app.displaysChanged != 1 || app.localeChanged != 1 || len(b.Screen().Displays()) != 2 {
 		t.Fatalf("after onEnvInfo: displaysChanged=%d localeChanged=%d count=%d",
 			app.displaysChanged, app.localeChanged, len(b.Screen().Displays()))
+	}
+}
+
+// Fresh surface notifications re-emit SurfaceResize and reset swapchain damage history even when geometry matches, and coalescing preserves the fresh flag.
+func TestFreshSurfaceReexposeAndCoalescing(t *testing.T) {
+	b, s, hostConn, h := newTestSurface(t)
+
+	// Populate swapchain buffer seq + damage history and leave waiting=true.
+	f, err := os.CreateTemp(t.TempDir(), "fresh-*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer f.Close()
+	_ = f.Truncate(64)
+	dupFD, _ := syscall.Dup(int(f.Fd()))
+	pix := make([]byte, 64)
+	h.take = func(ev platform.SurfaceEvent) bool {
+		if ev.Kind == platform.SurfaceFrame {
+			s.PresentPixels(pix, 16, 4, 4)
+		}
+		return false
+	}
+	b.onFrame(makeFramePayload(1, 1, 100, 4, 4, 16, 64), dupFD)
+	_, _, _, _ = hostConn.read() // drain kindPresent
+	s.RequestFrame()
+	_, _, _, _ = hostConn.read() // drain kindRequest
+	h.take = nil
+	h.events = nil
+	h.resized = 0
+
+	if !s.waiting || len(s.history) == 0 || s.buffers[100].lastSeq == 0 {
+		t.Fatalf("precondition failed: waiting=%v history=%d lastSeq=%d", s.waiting, len(s.history), s.buffers[100].lastSeq)
+	}
+
+	// Enqueue fresh kindSurface(1600x1000@2x) followed by non-fresh kindSurface(1600x1000@2x) before Step().
+	freshMsg := make([]byte, 21)
+	binary.LittleEndian.PutUint32(freshMsg[0:], 1)
+	binary.LittleEndian.PutUint32(freshMsg[4:], 1600)
+	binary.LittleEndian.PutUint32(freshMsg[8:], 1000)
+	binary.LittleEndian.PutUint32(freshMsg[12:], 2000)
+	binary.LittleEndian.PutUint32(freshMsg[16:], 60000)
+	freshMsg[20] = 1
+
+	staleMsg := bytes.Clone(freshMsg)
+	staleMsg[20] = 0
+
+	b.mu.Lock()
+	b.events = append(b.events,
+		event{kind: kindSurface, payload: freshMsg, fd: -1},
+		event{kind: kindSurface, payload: staleMsg, fd: -1},
+	)
+	b.mu.Unlock()
+	b.Step()
+
+	if s.waiting || len(s.history) != 0 || s.buffers[100].lastSeq != 0 {
+		t.Fatalf("after fresh re-expose: waiting=%v history=%d lastSeq=%d, want false, 0, 0",
+			s.waiting, len(s.history), s.buffers[100].lastSeq)
+	}
+	if h.resized != 1 || len(h.events) != 1 || h.events[0].Kind != platform.SurfaceResize {
+		t.Fatalf("fresh same-geometry surface did not emit single SurfaceResize: resized=%d events=%+v", h.resized, h.events)
+	}
+}
+
+// Hiding a hovered window clears hover before SurfaceHidden, Show restores visibility, and winQuitRequest honors AppHandler.QuitRequested.
+func TestHidePointerLeaveShowAndQuitRequest(t *testing.T) {
+	b, s, hostConn, h := newTestSurface(t)
+	app := &testAppHandler{}
+	b.app = app
+
+	s.w.Show()
+	_, _, _, _ = hostConn.read() // drain winActShow
+	b.onInput(encodeMouseInput(1, mouseMove, 255, 0, 0, 100, 40, 30, 0))
+	h.events = nil
+
+	// Hide while hovered emits PointerLeave then SurfaceHidden once; echoed winHide is a no-op.
+	s.w.Hide()
+	kind, payload, _, err := hostConn.read()
+	if err != nil || kind != kindWinAction || payload[4] != winActHide {
+		t.Fatalf("Hide msg = (%d, %v, %v), want winActHide", kind, payload, err)
+	}
+	b.onInput(encodeWindowInput(1, winHide))
+	if s.w.IsVisible() || len(h.events) != 2 ||
+		h.events[0].Kind != platform.PointerLeave || h.events[1].Kind != platform.SurfaceHidden {
+		t.Fatalf("after Hide+winHide: vis=%v events=%+v", s.w.IsVisible(), h.events)
+	}
+
+	// Show restores visibility and emits SurfaceShown once even if host echoes winShow.
+	h.events = nil
+	s.w.Show()
+	_, _, _, _ = hostConn.read() // drain winActShow
+	b.onInput(encodeWindowInput(1, winShow))
+	if !s.w.IsVisible() || s.Occluded() || len(h.events) != 1 || h.events[0].Kind != platform.SurfaceShown {
+		t.Fatalf("after Show+winShow: vis=%v occluded=%v events=%+v", s.w.IsVisible(), s.Occluded(), h.events)
+	}
+
+	// QuitRequested veto sends winActQuitDeny without quitting; allowing sends kindQuit.
+	allowQuit := false
+	app.quitRequested = func() bool { return allowQuit }
+	b.onInput(encodeWindowInput(1, winQuitRequest))
+	kind, payload, _, err = hostConn.read()
+	if err != nil || kind != kindWinAction || payload[4] != winActQuitDeny || app.quitCalls != 1 || b.quit {
+		t.Fatalf("vetoed quit: kind=%d payload=%v calls=%d quit=%v", kind, payload, app.quitCalls, b.quit)
+	}
+
+	allowQuit = true
+	b.onInput(encodeWindowInput(1, winQuitRequest))
+	kind, _, _, err = hostConn.read()
+	if err != nil || kind != kindQuit || app.quitCalls != 2 || !b.quit {
+		t.Fatalf("allowed quit: kind=%d err=%v calls=%d quit=%v", kind, err, app.quitCalls, b.quit)
+	}
+}
+
+// PlaceFlyout positions window-anchored and tray-anchored flyouts inside display work areas, and blurring a focusable flyout closes it unless a modal child is open.
+func TestFlyoutPlacementAndAutoDismissOnBlur(t *testing.T) {
+	t.Setenv("MYGO_OHOS_DISPLAYS", "0:0,0,1920,1080:0,0,1920,1040:1000:0:3:Primary")
+	b, s, hostConn, _ := newTestSurface(t)
+	s.w.bounds = platform.Rect{X: 200, Y: 100, Width: 400, Height: 300}
+
+	fh := &testWindowHandler{}
+	initFlyout := platform.Flyout{
+		Anchor:    platform.Rect{X: 20, Y: 30, Width: 80, Height: 24},
+		Side:      platform.SideBottom,
+		Align:     platform.AlignStart,
+		Gap:       6,
+		Focusable: true,
+	}
+	pfw, err := b.NewWindow(&platform.WindowOptions{
+		Surface: true,
+		Parent:  s.w,
+		Width:   240,
+		Height:  160,
+		Flyout:  &initFlyout,
+	}, fh)
+	if err != nil {
+		t.Fatalf("NewWindow(flyout): %v", err)
+	}
+	fw := pfw.(*Window)
+	kind, payload, _, err := hostConn.read()
+	if err != nil || kind != kindWinCreate {
+		t.Fatalf("flyout create = (%d, %v)", kind, err)
+	}
+	cfg, ok := decodeWinConfigMessage(payload)
+	if !ok || cfg.flags&winFlagFrameless == 0 || cfg.flags&winFlagAlwaysOnTop == 0 || cfg.flags&winFlagResizable != 0 ||
+		fw.Bounds() != (platform.Rect{X: 220, Y: 160, Width: 240, Height: 160}) {
+		t.Fatalf("initial flyout cfg=%+v bounds=%+v", cfg, fw.Bounds())
+	}
+
+	// PlaceFlyout with updated size repositions once and deduplicates identical calls.
+	fw.Show()
+	_, _, _, _ = hostConn.read() // drain winActShow
+	fw.PlaceFlyout(initFlyout, platform.Size{Width: 260, Height: 180})
+	kind, payload, _, err = hostConn.read()
+	if err != nil || kind != kindWinConfig || fw.Bounds() != (platform.Rect{X: 220, Y: 160, Width: 260, Height: 180}) {
+		t.Fatalf("PlaceFlyout msg=(%d, %v) bounds=%+v", kind, payload, fw.Bounds())
+	}
+	fw.PlaceFlyout(initFlyout, platform.Size{Width: 260, Height: 180}) // duplicate -> no wire message
+
+	// Tray-anchored flyout without tray bounds centers inside primary display work area.
+	tray, err := b.NewTray(&testTrayHandler{})
+	if err != nil {
+		t.Fatalf("NewTray: %v", err)
+	}
+	tf := platform.Flyout{Tray: tray, Focusable: true}
+	ptw, err := b.NewWindow(&platform.WindowOptions{
+		Surface: true,
+		Width:   300,
+		Height:  200,
+		Flyout:  &tf,
+	}, &testWindowHandler{})
+	if err != nil {
+		t.Fatalf("NewWindow(tray flyout): %v", err)
+	}
+	_, _, _, _ = hostConn.read() // drain winCreate
+	wantCentered := platform.Centered(platform.Size{Width: 300, Height: 200}, platform.Rect{X: 0, Y: 0, Width: 1920, Height: 1040})
+	if ptw.Bounds() != wantCentered {
+		t.Fatalf("tray flyout bounds = %+v, want %+v", ptw.Bounds(), wantCentered)
+	}
+
+	// Open modal child prevents auto-dismiss on blur; closing the modal child allows blur to close the flyout.
+	mw, err := b.NewWindow(&platform.WindowOptions{
+		Surface: true,
+		Parent:  fw,
+		Modal:   true,
+		Width:   200,
+		Height:  120,
+	}, &testWindowHandler{})
+	if err != nil {
+		t.Fatalf("NewWindow(modal): %v", err)
+	}
+	_, _, _, _ = hostConn.read() // drain modal winCreate
+	mw.Show()
+	_, _, _, _ = hostConn.read() // drain modal winActShow
+
+	b.onInput(encodeWindowInput(fw.id, winFocus))
+	b.onInput(encodeWindowInput(fw.id, winBlur))
+	if fw.closed {
+		t.Fatal("flyout closed on blur while modal child was open")
+	}
+
+	mw.Close()
+	_, _, _, _ = hostConn.read() // drain modal winActClose
+	b.onInput(encodeWindowInput(fw.id, winFocus))
+	b.onInput(encodeWindowInput(fw.id, winBlur))
+	kind, payload, _, err = hostConn.read()
+	if err != nil || kind != kindWinAction || payload[4] != winActClose || !fw.closed || fh.closed != 1 {
+		t.Fatalf("after modal closed + blur: kind=%d payload=%v err=%v closed=%v fh.closed=%d", kind, payload, err, fw.closed, fh.closed)
 	}
 }

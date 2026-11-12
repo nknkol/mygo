@@ -151,6 +151,7 @@ constexpr uint8_t kAccessEvent     = 63; // host -> engine: accessibility enable
 
 constexpr uint8_t kWinActEnableWebLayer = 17;
 constexpr uint8_t kWinActFocusSurface   = 18;
+constexpr uint8_t kWinActQuitDeny       = 19;
 
 constexpr uint32_t kMediaPause = 1u << 1;
 
@@ -206,6 +207,7 @@ constexpr uint8_t kWinCloseRequest    = 13;
 constexpr uint8_t kWinClosed          = 14;
 constexpr uint8_t kWinRect            = 15;
 constexpr uint8_t kWinTitleBar        = 16;
+constexpr uint8_t kWinQuitRequest     = 17;
 
 // IME ops.
 constexpr uint8_t kImeCommit            = 1;
@@ -479,6 +481,8 @@ struct WinSession {
     ArkUI_ContextHandle uiContext = nullptr;
     ArkUI_NodeContentHandle nodeContent = nullptr;
     ArkUI_NodeHandle xcNode = nullptr;
+    bool xcIsTexture = false;
+    uint32_t bgARGB = 0xFFF4F4F6u;
     OH_ArkUI_SurfaceHolder *surfaceHolder = nullptr;
     OH_ArkUI_SurfaceCallback *surfaceCallback = nullptr;
     ArkUI_AccessibilityProvider *accessProvider = nullptr;
@@ -1333,13 +1337,14 @@ void BridgeCallJs(napi_env env, napi_value, void *, void *data) {
         const auto &tu = ev->trayUpdate;
         napi_value obj = nullptr;
         napi_create_object(env, &obj);
-        napi_value vTid = nullptr, vOp = nullptr, vHi = nullptr, vTi = nullptr, vHm = nullptr;
+        uint32_t flags = (tu.hasImage ? 1u : 0u) |
+                         (tu.templateImg ? 2u : 0u) |
+                         (tu.hasMenu ? 4u : 0u);
+        napi_value vTid = nullptr, vOp = nullptr, vFlags = nullptr;
         napi_value vId = nullptr, vTitle = nullptr, vTip = nullptr, vPng = nullptr;
         napi_create_uint32(env, tu.trayId, &vTid);
         napi_create_uint32(env, tu.op, &vOp);
-        napi_get_boolean(env, tu.hasImage, &vHi);
-        napi_get_boolean(env, tu.templateImg, &vTi);
-        napi_get_boolean(env, tu.hasMenu, &vHm);
+        napi_create_uint32(env, flags, &vFlags);
         napi_create_string_utf8(env, tu.id.c_str(), tu.id.size(), &vId);
         napi_create_string_utf8(env, tu.title.c_str(), tu.title.size(), &vTitle);
         napi_create_string_utf8(env, tu.tooltip.c_str(), tu.tooltip.size(), &vTip);
@@ -1351,14 +1356,12 @@ void BridgeCallJs(napi_env env, napi_value, void *, void *data) {
         napi_value vMenu = makeJsMenuItems(env, tu.menuItems);
         napi_set_named_property(env, obj, "trayId", vTid);
         napi_set_named_property(env, obj, "op", vOp);
-        napi_set_named_property(env, obj, "hasImage", vHi);
-        napi_set_named_property(env, obj, "templateImg", vTi);
-        napi_set_named_property(env, obj, "hasMenu", vHm);
+        napi_set_named_property(env, obj, "flags", vFlags);
         napi_set_named_property(env, obj, "id", vId);
         napi_set_named_property(env, obj, "title", vTitle);
         napi_set_named_property(env, obj, "tooltip", vTip);
         napi_set_named_property(env, obj, "png", vPng);
-        napi_set_named_property(env, obj, "menuItems", vMenu);
+        napi_set_named_property(env, obj, "items", vMenu);
         callBridgeMethod(env, cbObj, "onTrayUpdate", 1, &obj);
         break;
     }
@@ -1451,15 +1454,18 @@ bool sendMessage(uint8_t kind, const void *payload, uint32_t len, int fd) {
     }
 }
 
-bool sendSurface(uint32_t winId, int32_t w, int32_t h, double scale, double hz) {
-    uint32_t p[5] = {
+bool sendSurface(uint32_t winId, int32_t w, int32_t h, double scale, double hz, bool fresh = false) {
+    uint32_t hdr[5] = {
         winId,
         static_cast<uint32_t>(w),
         static_cast<uint32_t>(h),
         static_cast<uint32_t>(std::lround(scale * 1000.0)),
         static_cast<uint32_t>(std::lround(hz * 1000.0)),
     };
-    return sendMessage(kSurface, p, sizeof(p), -1);
+    uint8_t wire[21] = {0};
+    memcpy(wire, hdr, sizeof(hdr));
+    wire[20] = fresh ? 1 : 0;
+    return sendMessage(kSurface, wire, sizeof(wire), -1);
 }
 
 bool sendFrame(uint32_t winId, uint32_t seq, uint32_t id, int32_t w, int32_t h,
@@ -1696,10 +1702,18 @@ void applyCursorOnUI(void *userData) {
     }
 }
 
+void unmountWindowXComponent(const std::shared_ptr<WinSession> &ws, bool eraseTree);
+bool mountWindowXComponent(const std::shared_ptr<WinSession> &ws, bool layered);
+
 void enableWebLayerOnUI(void *userData) {
     uint32_t winId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(userData));
     auto ws = findSession(winId);
     if (!ws || ws->xcNode == nullptr || nodeAPI == nullptr) {
+        return;
+    }
+    if (!ws->xcIsTexture && ws->nodeContent != nullptr) {
+        unmountWindowXComponent(ws, false);
+        mountWindowXComponent(ws, true);
         return;
     }
     ArkUI_NumberValue bgVal[] = {{.u32 = 0x00000000u}};
@@ -4061,15 +4075,14 @@ void WinSession::renderLoop() {
     }
 
     OH_NativeWindow_NativeWindowHandleOpt(win, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_RGBA_8888);
-    int32_t rc = OH_NativeWindow_NativeWindowHandleOpt(win, SET_BUFFER_GEOMETRY, w, h);
     uint64_t usage = 0;
     OH_NativeWindow_NativeWindowHandleOpt(win, GET_USAGE, &usage);
     usage &= ~static_cast<uint64_t>(NATIVEBUFFER_USAGE_CPU_READ_OFTEN);
     usage |= NATIVEBUFFER_USAGE_CPU_READ | NATIVEBUFFER_USAGE_CPU_WRITE | NATIVEBUFFER_USAGE_MEM_DMA;
     OH_NativeWindow_NativeWindowHandleOpt(win, SET_USAGE, usage);
-    OH_LOG_INFO(LOG_APP, "win=%{public}u surface %{public}dx%{public}d rc=%{public}d scale=%{public}.2f hz=%{public}.0f",
-                winId, w, h, rc, sc, refresh);
-    sendSurface(winId, w, h, sc, refresh);
+    OH_LOG_INFO(LOG_APP, "win=%{public}u surface %{public}dx%{public}d scale=%{public}.2f hz=%{public}.0f",
+                winId, w, h, sc, refresh);
+    sendSurface(winId, w, h, sc, refresh, true);
 
     uint32_t seq = 0;
     int frames = 0, damaged = 0, whole = 0, aborted = 0;
@@ -4105,9 +4118,8 @@ void WinSession::renderLoop() {
                 sc = scale;
                 refresh = hz;
                 lk.unlock();
-                rc = OH_NativeWindow_NativeWindowHandleOpt(win, SET_BUFFER_GEOMETRY, w, h);
-                OH_LOG_INFO(LOG_APP, "win=%{public}u resize %{public}dx%{public}d rc=%{public}d", winId, w, h, rc);
-                sendSurface(winId, w, h, sc, refresh);
+                OH_LOG_INFO(LOG_APP, "win=%{public}u resize %{public}dx%{public}d", winId, w, h);
+                sendSurface(winId, w, h, sc, refresh, false);
                 lk.lock();
                 forceResendSurface = false;
                 if (stopRender) {
@@ -4118,7 +4130,7 @@ void WinSession::renderLoop() {
                 sc = scale;
                 refresh = hz;
                 lk.unlock();
-                sendSurface(winId, w, h, sc, refresh);
+                sendSurface(winId, w, h, sc, refresh, false);
                 lk.lock();
                 if (stopRender) {
                     break;
@@ -4145,8 +4157,7 @@ void WinSession::renderLoop() {
                 sc = scale;
                 refresh = hz;
                 lk.unlock();
-                OH_NativeWindow_NativeWindowHandleOpt(win, SET_BUFFER_GEOMETRY, w, h);
-                sendSurface(winId, w, h, sc, refresh);
+                sendSurface(winId, w, h, sc, refresh, false);
                 lk.lock();
                 if (stopRender) {
                     break;
@@ -4155,9 +4166,17 @@ void WinSession::renderLoop() {
             reply = BufReply::None;
         }
 
+        if (w > 0 && h > 0) {
+            int32_t gw = 0, gh = 0;
+            if (OH_NativeWindow_NativeWindowHandleOpt(win, GET_BUFFER_GEOMETRY, &gh, &gw) != 0 ||
+                gw != w || gh != h) {
+                OH_NativeWindow_NativeWindowHandleOpt(win, SET_BUFFER_GEOMETRY, w, h);
+            }
+        }
+
         OHNativeWindowBuffer *buf = nullptr;
         int fence = -1;
-        rc = OH_NativeWindow_NativeWindowRequestBuffer(win, &buf, &fence);
+        int32_t rc = OH_NativeWindow_NativeWindowRequestBuffer(win, &buf, &fence);
         if (rc != 0 || buf == nullptr) {
             OH_LOG_ERROR(LOG_APP, "win=%{public}u RequestBuffer failed rc=%{public}d", winId, rc);
             usleep(16000);
@@ -6070,17 +6089,16 @@ void OnSurfaceHide(OH_ArkUI_SurfaceHolder *holder) {
     }
 }
 
-void teardownWindowNode(uint32_t winId, bool eraseSession) {
-    auto ws = findSession(winId);
+void unmountWindowXComponent(const std::shared_ptr<WinSession> &ws, bool eraseTree) {
     if (!ws) {
         return;
     }
-    if (attachedImeWinId == winId) {
+    if (attachedImeWinId == ws->winId) {
         detachIME();
     }
     stopWinRenderThread(ws);
     disposeActiveDragAction(ws.get());
-    detachWindowAccessibility(ws.get(), eraseSession);
+    detachWindowAccessibility(ws.get(), eraseTree);
 
     if (ws->xcNode != nullptr) {
         gNodeToWinId.erase(ws->xcNode);
@@ -6116,6 +6134,98 @@ void teardownWindowNode(uint32_t winId, bool eraseSession) {
         nodeAPI->disposeNode(ws->xcNode);
         ws->xcNode = nullptr;
     }
+    ws->xcIsTexture = false;
+}
+
+bool mountWindowXComponent(const std::shared_ptr<WinSession> &ws, bool layered) {
+    if (!ws || ws->nodeContent == nullptr || nodeAPI == nullptr) {
+        return false;
+    }
+    if (layered) {
+        ws->xcNode = nodeAPI->createNode(ARKUI_NODE_XCOMPONENT_TEXTURE);
+        ws->xcIsTexture = (ws->xcNode != nullptr);
+    }
+    if (ws->xcNode == nullptr) {
+        ws->xcNode = nodeAPI->createNode(ARKUI_NODE_XCOMPONENT);
+        ws->xcIsTexture = false;
+    }
+    if (ws->xcNode == nullptr) {
+        return false;
+    }
+
+    ArkUI_NumberValue fullPct[] = {{.f32 = 1.0f}};
+    ArkUI_AttributeItem pctItem = {fullPct, 1, nullptr, nullptr};
+    nodeAPI->setAttribute(ws->xcNode, NODE_WIDTH_PERCENT, &pctItem);
+    nodeAPI->setAttribute(ws->xcNode, NODE_HEIGHT_PERCENT, &pctItem);
+
+    ArkUI_NumberValue fitVal[] = {{.i32 = ARKUI_RENDER_FIT_RESIZE_FILL}};
+    ArkUI_AttributeItem fitItem = {fitVal, 1, nullptr, nullptr};
+    nodeAPI->setAttribute(ws->xcNode, NODE_RENDER_FIT, &fitItem);
+
+    ArkUI_NumberValue bgVal[] = {{.u32 = layered ? 0x00000000u : ws->bgARGB}};
+    ArkUI_AttributeItem bgItem = {bgVal, 1, nullptr, nullptr};
+    nodeAPI->setAttribute(ws->xcNode, NODE_BACKGROUND_COLOR, &bgItem);
+
+    ArkUI_NumberValue oneVal[] = {{.i32 = 1}};
+    ArkUI_AttributeItem oneItem = {oneVal, 1, nullptr, nullptr};
+    nodeAPI->setAttribute(ws->xcNode, NODE_FOCUSABLE, &oneItem);
+    nodeAPI->setAttribute(ws->xcNode, NODE_DEFAULT_FOCUS, &oneItem);
+    nodeAPI->setAttribute(ws->xcNode, NODE_FOCUS_ON_TOUCH, &oneItem);
+    OH_ArkUI_XComponent_SetNeedSoftKeyboard(ws->xcNode, true);
+
+    ws->surfaceHolder = OH_ArkUI_SurfaceHolder_Create(ws->xcNode);
+    ws->surfaceCallback = OH_ArkUI_SurfaceCallback_Create();
+    if (ws->surfaceHolder == nullptr || ws->surfaceCallback == nullptr) {
+        unmountWindowXComponent(ws, false);
+        return false;
+    }
+
+    ArkUI_XComponentSurfaceConfig *cfg = OH_ArkUI_XComponentSurfaceConfig_Create();
+    if (cfg != nullptr) {
+        OH_ArkUI_XComponentSurfaceConfig_SetIsOpaque(cfg, !layered);
+        OH_ArkUI_SurfaceHolder_SetSurfaceConfig(ws->surfaceHolder, cfg);
+        OH_ArkUI_XComponentSurfaceConfig_Dispose(cfg);
+    }
+
+    gHolderToWinId[ws->surfaceHolder] = ws->winId;
+    gNodeToWinId[ws->xcNode] = ws->winId;
+
+    OH_ArkUI_SurfaceCallback_SetSurfaceCreatedEvent(ws->surfaceCallback, OnSurfaceCreated);
+    OH_ArkUI_SurfaceCallback_SetSurfaceChangedEvent(ws->surfaceCallback, OnSurfaceChanged);
+    OH_ArkUI_SurfaceCallback_SetSurfaceDestroyedEvent(ws->surfaceCallback, OnSurfaceDestroyed);
+    OH_ArkUI_SurfaceCallback_SetSurfaceShowEvent(ws->surfaceCallback, OnSurfaceShow);
+    OH_ArkUI_SurfaceCallback_SetSurfaceHideEvent(ws->surfaceCallback, OnSurfaceHide);
+    OH_ArkUI_SurfaceHolder_AddSurfaceCallback(ws->surfaceHolder, ws->surfaceCallback);
+
+    nodeAPI->addNodeEventReceiver(ws->xcNode, OnNodeEvent);
+    OH_ArkUI_AllowNodeAllDropDataTypes(ws->xcNode);
+    OH_ArkUI_SetDragEventStrictReportWithNode(ws->xcNode, true);
+    static const ArkUI_NodeEventType kEvents[] = {
+        NODE_TOUCH_EVENT, NODE_ON_MOUSE, NODE_ON_HOVER_EVENT,
+        NODE_ON_AXIS, NODE_ON_COASTING_AXIS_EVENT, NODE_ON_KEY_EVENT,
+        NODE_ON_FOCUS, NODE_ON_BLUR,
+        NODE_ON_DRAG_ENTER, NODE_ON_DRAG_MOVE, NODE_ON_DRAG_LEAVE, NODE_ON_DROP,
+    };
+    for (ArkUI_NodeEventType ev : kEvents) {
+        nodeAPI->registerNodeEvent(ws->xcNode, ev, static_cast<int32_t>(ev), nullptr);
+    }
+    attachWindowAccessibility(ws.get());
+
+    OH_ArkUI_NodeContent_AddNode(ws->nodeContent, ws->xcNode);
+    if (ws->uiContext != nullptr) {
+        OH_ArkUI_FocusSetKeyProcessingMode(ws->uiContext, ARKUI_KEY_PROCESSING_MODE_FOCUS_ANCESTOR_EVENT);
+        OH_ArkUI_FocusActivate(ws->uiContext, false, true);
+    }
+    OH_ArkUI_FocusRequest(ws->xcNode);
+    return true;
+}
+
+void teardownWindowNode(uint32_t winId, bool eraseSession) {
+    auto ws = findSession(winId);
+    if (!ws) {
+        return;
+    }
+    unmountWindowXComponent(ws, eraseSession);
     ws->nodeContent = nullptr;
     ws->uiContext = nullptr;
 
@@ -6123,7 +6233,7 @@ void teardownWindowNode(uint32_t winId, bool eraseSession) {
         std::lock_guard<std::mutex> lk(gWinMu);
         gWindows.erase(winId);
     }
-    if (winId == 1) {
+    if (winId == 1 && eraseSession) {
         destroyIME();
         if (pointerHidden) {
             OH_Input_SetPointerVisible(true);
@@ -6412,6 +6522,7 @@ napi_value BindWindow(napi_env env, napi_callback_info info) {
             bgARGB = parsedBg;
         }
     }
+    ws->bgARGB = bgARGB;
     {
         std::lock_guard<std::mutex> lk(ws->mu);
         ws->scale = scale > 0 ? scale : 1.0;
@@ -6428,75 +6539,12 @@ napi_value BindWindow(napi_env env, napi_callback_info info) {
         return nullptr;
     }
 
-    ws->xcNode = nodeAPI->createNode(ARKUI_NODE_XCOMPONENT_TEXTURE);
-    if (ws->xcNode == nullptr) {
-        ws->xcNode = nodeAPI->createNode(ARKUI_NODE_XCOMPONENT);
-    }
-    if (ws->xcNode == nullptr) {
-        return nullptr;
-    }
-
-    ArkUI_NumberValue fullPct[] = {{.f32 = 1.0f}};
-    ArkUI_AttributeItem pctItem = {fullPct, 1, nullptr, nullptr};
-    nodeAPI->setAttribute(ws->xcNode, NODE_WIDTH_PERCENT, &pctItem);
-    nodeAPI->setAttribute(ws->xcNode, NODE_HEIGHT_PERCENT, &pctItem);
-
     const bool layered = ws->webLayerEnabled.load(std::memory_order_relaxed);
-    ArkUI_NumberValue bgVal[] = {{.u32 = layered ? 0x00000000u : bgARGB}};
-    ArkUI_AttributeItem bgItem = {bgVal, 1, nullptr, nullptr};
-    nodeAPI->setAttribute(ws->xcNode, NODE_BACKGROUND_COLOR, &bgItem);
-
-    ArkUI_NumberValue oneVal[] = {{.i32 = 1}};
-    ArkUI_AttributeItem oneItem = {oneVal, 1, nullptr, nullptr};
-    nodeAPI->setAttribute(ws->xcNode, NODE_FOCUSABLE, &oneItem);
-    nodeAPI->setAttribute(ws->xcNode, NODE_DEFAULT_FOCUS, &oneItem);
-    nodeAPI->setAttribute(ws->xcNode, NODE_FOCUS_ON_TOUCH, &oneItem);
-    OH_ArkUI_XComponent_SetNeedSoftKeyboard(ws->xcNode, true);
-
-    ws->surfaceHolder = OH_ArkUI_SurfaceHolder_Create(ws->xcNode);
-    ws->surfaceCallback = OH_ArkUI_SurfaceCallback_Create();
-    if (ws->surfaceHolder == nullptr || ws->surfaceCallback == nullptr) {
+    if (!mountWindowXComponent(ws, layered)) {
         teardownWindowNode(winId, winId != 1);
         return nullptr;
     }
 
-    ArkUI_XComponentSurfaceConfig *cfg = OH_ArkUI_XComponentSurfaceConfig_Create();
-    if (cfg != nullptr) {
-        OH_ArkUI_XComponentSurfaceConfig_SetIsOpaque(cfg, !layered);
-        OH_ArkUI_SurfaceHolder_SetSurfaceConfig(ws->surfaceHolder, cfg);
-        OH_ArkUI_XComponentSurfaceConfig_Dispose(cfg);
-    }
-
-    gHolderToWinId[ws->surfaceHolder] = winId;
-    gNodeToWinId[ws->xcNode] = winId;
-
-    OH_ArkUI_SurfaceCallback_SetSurfaceCreatedEvent(ws->surfaceCallback, OnSurfaceCreated);
-    OH_ArkUI_SurfaceCallback_SetSurfaceChangedEvent(ws->surfaceCallback, OnSurfaceChanged);
-    OH_ArkUI_SurfaceCallback_SetSurfaceDestroyedEvent(ws->surfaceCallback, OnSurfaceDestroyed);
-    OH_ArkUI_SurfaceCallback_SetSurfaceShowEvent(ws->surfaceCallback, OnSurfaceShow);
-    OH_ArkUI_SurfaceCallback_SetSurfaceHideEvent(ws->surfaceCallback, OnSurfaceHide);
-    OH_ArkUI_SurfaceHolder_AddSurfaceCallback(ws->surfaceHolder, ws->surfaceCallback);
-
-    nodeAPI->addNodeEventReceiver(ws->xcNode, OnNodeEvent);
-    OH_ArkUI_AllowNodeAllDropDataTypes(ws->xcNode);
-    OH_ArkUI_SetDragEventStrictReportWithNode(ws->xcNode, true);
-    static const ArkUI_NodeEventType kEvents[] = {
-        NODE_TOUCH_EVENT, NODE_ON_MOUSE, NODE_ON_HOVER_EVENT,
-        NODE_ON_AXIS, NODE_ON_COASTING_AXIS_EVENT, NODE_ON_KEY_EVENT,
-        NODE_ON_FOCUS, NODE_ON_BLUR,
-        NODE_ON_DRAG_ENTER, NODE_ON_DRAG_MOVE, NODE_ON_DRAG_LEAVE, NODE_ON_DROP,
-    };
-    for (ArkUI_NodeEventType ev : kEvents) {
-        nodeAPI->registerNodeEvent(ws->xcNode, ev, static_cast<int32_t>(ev), nullptr);
-    }
-    attachWindowAccessibility(ws.get());
-
-    OH_ArkUI_NodeContent_AddNode(ws->nodeContent, ws->xcNode);
-    if (ws->uiContext != nullptr) {
-        OH_ArkUI_FocusSetKeyProcessingMode(ws->uiContext, ARKUI_KEY_PROCESSING_MODE_FOCUS_ANCESTOR_EVENT);
-        OH_ArkUI_FocusActivate(ws->uiContext, false, true);
-    }
-    OH_ArkUI_FocusRequest(ws->xcNode);
     if (ws->uiContext != nullptr) {
         OH_ArkUI_PostUITask(ws->uiContext,
                             reinterpret_cast<void *>(static_cast<uintptr_t>(winId)),
@@ -6530,7 +6578,7 @@ napi_value NotifyWindowEvent(napi_env env, napi_callback_info info) {
     int32_t op = 0;
     napi_get_value_uint32(env, argv[0], &winId);
     napi_get_value_int32(env, argv[1], &op);
-    if (op >= kWinFocus && op <= kWinClosed) {
+    if ((op >= kWinFocus && op <= kWinClosed) || op == kWinQuitRequest) {
         if (op == kWinBlur || op == kWinHide || op == kWinMinimize || op == kWinClosed) {
             if (auto ws = findSession(winId)) {
                 ws->metaLeftDown = false;

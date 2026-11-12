@@ -67,6 +67,14 @@ export default class EntryAbility extends UIAbility {
     hostBridge.onAppBackground();
   }
 
+  onPrepareToTerminate(): boolean {
+    return hostBridge.onPrepareToTerminate();
+  }
+
+  async onPrepareToTerminateAsync(): Promise<boolean> {
+    return hostBridge.onPrepareToTerminate();
+  }
+
   onDestroy(): void {
     hilog.info(DOMAIN, TAG, 'onDestroy');
   }

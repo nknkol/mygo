@@ -62,6 +62,7 @@ type Surface struct {
 	touch             touchGesture
 	pinch             float64
 	lastX, lastY      float64
+	pointerIn         bool
 	layered           bool
 	placed            []platform.WebViewPlacement
 	glCtx             uintptr

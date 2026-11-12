@@ -1232,179 +1232,337 @@ function buildMenuLevel(uiCtx: UIContext, items: HostMenuItem[], prefix: string)
   return level;
 }
 
-@Builder
-function buildMenuItemRow(ent: MenuEntryModel, hasCheckable: boolean, darkMode: boolean): void {
-  Row() {
-    if (hasCheckable) {
-      Row() {
-        Text(ent.checked ? (ent.isRadio ? '•' : '✓') : '')
-          .fontSize(ent.isRadio ? 15 : 13)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(
-            ent.enabled
-              ? (darkMode ? '#F1F3F5' : '#182431')
-              : (darkMode ? '#66FFFFFF' : '#66182431')
-          )
+function disposeDeferred(fn: () => void): void {
+  setTimeout((): void => {
+    try {
+      fn();
+    } catch (_) {}
+  }, 0);
+}
+
+@Component
+struct MygoPopupMenuLevel3 {
+  menuLevel: MenuLevelModel = new MenuLevelModel();
+  isDark: boolean = false;
+  menuDir: Direction = Direction.Auto;
+  onMenuSelect: (chosenId: number) => void = (_chosenId: number): void => {};
+
+  @Builder
+  buildItemRow(ent: MenuEntryModel): void {
+    Row() {
+      if (this.menuLevel.hasCheckable) {
+        Row() {
+          Text(ent.checked ? (ent.isRadio ? '•' : '✓') : '')
+            .fontSize(ent.isRadio ? 15 : 13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(
+              ent.enabled
+                ? (this.isDark ? '#F1F3F5' : '#182431')
+                : (this.isDark ? '#66FFFFFF' : '#66182431')
+            )
+        }
+        .width(18)
+        .height('100%')
+        .alignItems(VerticalAlign.Center)
+        .justifyContent(FlexAlign.Start)
       }
-      .width(18)
-      .height('100%')
-      .alignItems(VerticalAlign.Center)
-      .justifyContent(FlexAlign.Start)
-    }
-    Text(ent.label)
-      .fontSize(13)
-      .fontWeight(FontWeight.Normal)
-      .fontColor(
-        ent.enabled
-          ? (darkMode ? '#F1F3F5' : '#182431')
-          : (darkMode ? '#66FFFFFF' : '#66182431')
-      )
-      .maxLines(1)
-      .textOverflow({ overflow: TextOverflow.Ellipsis })
-      .layoutWeight(1)
-    if (ent.labelInfo.length > 0) {
-      Text(ent.labelInfo)
-        .fontSize(12)
-        .fontWeight(FontWeight.Normal)
-        .fontColor(darkMode ? '#8CFFFFFF' : '#8C182431')
-        .margin({ left: 16 })
-    }
-    if (ent.hasSubmenu) {
-      Text('›')
-        .fontSize(16)
+      Text(ent.label)
+        .fontSize(13)
         .fontWeight(FontWeight.Normal)
         .fontColor(
           ent.enabled
-            ? (darkMode ? '#A6FFFFFF' : '#99182431')
-            : (darkMode ? '#4DFFFFFF' : '#4D182431')
+            ? (this.isDark ? '#F1F3F5' : '#182431')
+            : (this.isDark ? '#66FFFFFF' : '#66182431')
         )
-        .margin({ left: 12 })
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+      if (ent.labelInfo.length > 0) {
+        Text(ent.labelInfo)
+          .fontSize(12)
+          .fontWeight(FontWeight.Normal)
+          .fontColor(this.isDark ? '#8CFFFFFF' : '#8C182431')
+          .margin({ left: 16 })
+      }
     }
+    .width('100%')
+    .height(30)
+    .padding({ left: 10, right: 10 })
+    .alignItems(VerticalAlign.Center)
   }
-  .width('100%')
-  .height(30)
-  .padding({ left: 10, right: 10 })
-  .alignItems(VerticalAlign.Center)
-}
 
-@Builder
-function buildLevel3SubMenu(level: MenuLevelModel, ctx: PopupMenuContext): void {
-  Menu() {
-    ForEach(level.sections, (sec3: MenuSectionModel) => {
-      MenuItemGroup() {
-        ForEach(sec3.entries, (ent3: MenuEntryModel) => {
-          MenuItem((): void => {
-            buildMenuItemRow(ent3, level.hasCheckable, ctx.darkMode);
-          })
-          .enabled(ent3.enabled)
-          .onClick((): void => {
-            if (ent3.enabled && ent3.itemId !== 0) {
-              ctx.onSelect(ent3.itemId);
-            }
-          })
-        }, (ent3: MenuEntryModel): string => ent3.key)
-      }
-    }, (sec3: MenuSectionModel): string => sec3.key)
-  }
-  .width(level.widthVp)
-  .radius(8)
-  .padding(4)
-  .menuItemGroupDivider({
-    strokeWidth: LengthMetrics.px(1),
-    color: ctx.darkMode ? '#24FFFFFF' : '#1A000000',
-    startMargin: LengthMetrics.vp(8),
-    endMargin: LengthMetrics.vp(8),
-    mode: DividerMode.EMBEDDED_IN_MENU
-  })
-  .direction(ctx.direction)
-}
-
-@Builder
-function buildLevel2SubMenu(level: MenuLevelModel, ctx: PopupMenuContext): void {
-  Menu() {
-    ForEach(level.sections, (sec2: MenuSectionModel) => {
-      MenuItemGroup() {
-        ForEach(sec2.entries, (ent2: MenuEntryModel) => {
-          if (ent2.hasSubmenu && ent2.subLevel !== undefined) {
+  build() {
+    Menu() {
+      ForEach(this.menuLevel.sections, (sec3: MenuSectionModel) => {
+        MenuItemGroup() {
+          ForEach(sec3.entries, (ent3: MenuEntryModel) => {
             MenuItem((): void => {
-              buildMenuItemRow(ent2, level.hasCheckable, ctx.darkMode);
+              this.buildItemRow(ent3);
             })
-            .enabled(ent2.enabled)
-            .subMenuBuilder((): void => {
-              if (ent2.subLevel !== undefined) {
-                buildLevel3SubMenu(ent2.subLevel, ctx);
-              }
-            })
-          } else {
-            MenuItem((): void => {
-              buildMenuItemRow(ent2, level.hasCheckable, ctx.darkMode);
-            })
-            .enabled(ent2.enabled)
+            .enabled(ent3.enabled)
             .onClick((): void => {
-              if (ent2.enabled && ent2.itemId !== 0) {
-                ctx.onSelect(ent2.itemId);
+              if (ent3.enabled && ent3.itemId !== 0) {
+                this.onMenuSelect(ent3.itemId);
               }
             })
-          }
-        }, (ent2: MenuEntryModel): string => ent2.key)
-      }
-    }, (sec2: MenuSectionModel): string => sec2.key)
+          }, (ent3: MenuEntryModel): string => ent3.key)
+        }
+      }, (sec3: MenuSectionModel): string => sec3.key)
+    }
+    .width(this.menuLevel.widthVp)
+    .radius(8)
+    .padding(4)
+    .menuItemGroupDivider({
+      strokeWidth: LengthMetrics.px(1),
+      color: this.isDark ? '#24FFFFFF' : '#1A000000',
+      startMargin: LengthMetrics.vp(8),
+      endMargin: LengthMetrics.vp(8),
+      mode: DividerMode.EMBEDDED_IN_MENU
+    })
+    .direction(this.menuDir)
   }
-  .width(level.widthVp)
-  .radius(8)
-  .padding(4)
-  .menuItemGroupDivider({
-    strokeWidth: LengthMetrics.px(1),
-    color: ctx.darkMode ? '#24FFFFFF' : '#1A000000',
-    startMargin: LengthMetrics.vp(8),
-    endMargin: LengthMetrics.vp(8),
-    mode: DividerMode.EMBEDDED_IN_MENU
-  })
-  .direction(ctx.direction)
+}
+
+@Component
+struct MygoPopupMenuLevel2 {
+  menuLevel: MenuLevelModel = new MenuLevelModel();
+  isDark: boolean = false;
+  menuDir: Direction = Direction.Auto;
+  onMenuSelect: (chosenId: number) => void = (_chosenId: number): void => {};
+
+  @Builder
+  buildItemRow(ent: MenuEntryModel): void {
+    Row() {
+      if (this.menuLevel.hasCheckable) {
+        Row() {
+          Text(ent.checked ? (ent.isRadio ? '•' : '✓') : '')
+            .fontSize(ent.isRadio ? 15 : 13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(
+              ent.enabled
+                ? (this.isDark ? '#F1F3F5' : '#182431')
+                : (this.isDark ? '#66FFFFFF' : '#66182431')
+            )
+        }
+        .width(18)
+        .height('100%')
+        .alignItems(VerticalAlign.Center)
+        .justifyContent(FlexAlign.Start)
+      }
+      Text(ent.label)
+        .fontSize(13)
+        .fontWeight(FontWeight.Normal)
+        .fontColor(
+          ent.enabled
+            ? (this.isDark ? '#F1F3F5' : '#182431')
+            : (this.isDark ? '#66FFFFFF' : '#66182431')
+        )
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+      if (ent.labelInfo.length > 0) {
+        Text(ent.labelInfo)
+          .fontSize(12)
+          .fontWeight(FontWeight.Normal)
+          .fontColor(this.isDark ? '#8CFFFFFF' : '#8C182431')
+          .margin({ left: 16 })
+      }
+      if (ent.hasSubmenu) {
+        Text('›')
+          .fontSize(16)
+          .fontWeight(FontWeight.Normal)
+          .fontColor(
+            ent.enabled
+              ? (this.isDark ? '#A6FFFFFF' : '#99182431')
+              : (this.isDark ? '#4DFFFFFF' : '#4D182431')
+          )
+          .margin({ left: 12 })
+      }
+    }
+    .width('100%')
+    .height(30)
+    .padding({ left: 10, right: 10 })
+    .alignItems(VerticalAlign.Center)
+  }
+
+  @Builder
+  buildSub3(sub: MenuLevelModel): void {
+    MygoPopupMenuLevel3({
+      menuLevel: sub,
+      isDark: this.isDark,
+      menuDir: this.menuDir,
+      onMenuSelect: this.onMenuSelect
+    })
+  }
+
+  build() {
+    Menu() {
+      ForEach(this.menuLevel.sections, (sec2: MenuSectionModel) => {
+        MenuItemGroup() {
+          ForEach(sec2.entries, (ent2: MenuEntryModel) => {
+            if (ent2.hasSubmenu && ent2.subLevel !== undefined) {
+              MenuItem((): void => {
+                this.buildItemRow(ent2);
+              })
+              .enabled(ent2.enabled)
+              .subMenuBuilder((): void => {
+                if (ent2.subLevel !== undefined) {
+                  this.buildSub3(ent2.subLevel);
+                }
+              })
+            } else {
+              MenuItem((): void => {
+                this.buildItemRow(ent2);
+              })
+              .enabled(ent2.enabled)
+              .onClick((): void => {
+                if (ent2.enabled && ent2.itemId !== 0) {
+                  this.onMenuSelect(ent2.itemId);
+                }
+              })
+            }
+          }, (ent2: MenuEntryModel): string => ent2.key)
+        }
+      }, (sec2: MenuSectionModel): string => sec2.key)
+    }
+    .width(this.menuLevel.widthVp)
+    .radius(8)
+    .padding(4)
+    .menuItemGroupDivider({
+      strokeWidth: LengthMetrics.px(1),
+      color: this.isDark ? '#24FFFFFF' : '#1A000000',
+      startMargin: LengthMetrics.vp(8),
+      endMargin: LengthMetrics.vp(8),
+      mode: DividerMode.EMBEDDED_IN_MENU
+    })
+    .direction(this.menuDir)
+  }
+}
+
+@Component
+struct MygoPopupMenuLevel1 {
+  menuLevel: MenuLevelModel = new MenuLevelModel();
+  isDark: boolean = false;
+  menuDir: Direction = Direction.Auto;
+  onMenuSelect: (chosenId: number) => void = (_chosenId: number): void => {};
+
+  @Builder
+  buildItemRow(ent: MenuEntryModel): void {
+    Row() {
+      if (this.menuLevel.hasCheckable) {
+        Row() {
+          Text(ent.checked ? (ent.isRadio ? '•' : '✓') : '')
+            .fontSize(ent.isRadio ? 15 : 13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(
+              ent.enabled
+                ? (this.isDark ? '#F1F3F5' : '#182431')
+                : (this.isDark ? '#66FFFFFF' : '#66182431')
+            )
+        }
+        .width(18)
+        .height('100%')
+        .alignItems(VerticalAlign.Center)
+        .justifyContent(FlexAlign.Start)
+      }
+      Text(ent.label)
+        .fontSize(13)
+        .fontWeight(FontWeight.Normal)
+        .fontColor(
+          ent.enabled
+            ? (this.isDark ? '#F1F3F5' : '#182431')
+            : (this.isDark ? '#66FFFFFF' : '#66182431')
+        )
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+      if (ent.labelInfo.length > 0) {
+        Text(ent.labelInfo)
+          .fontSize(12)
+          .fontWeight(FontWeight.Normal)
+          .fontColor(this.isDark ? '#8CFFFFFF' : '#8C182431')
+          .margin({ left: 16 })
+      }
+      if (ent.hasSubmenu) {
+        Text('›')
+          .fontSize(16)
+          .fontWeight(FontWeight.Normal)
+          .fontColor(
+            ent.enabled
+              ? (this.isDark ? '#A6FFFFFF' : '#99182431')
+              : (this.isDark ? '#4DFFFFFF' : '#4D182431')
+          )
+          .margin({ left: 12 })
+      }
+    }
+    .width('100%')
+    .height(30)
+    .padding({ left: 10, right: 10 })
+    .alignItems(VerticalAlign.Center)
+  }
+
+  @Builder
+  buildSub2(sub: MenuLevelModel): void {
+    MygoPopupMenuLevel2({
+      menuLevel: sub,
+      isDark: this.isDark,
+      menuDir: this.menuDir,
+      onMenuSelect: this.onMenuSelect
+    })
+  }
+
+  build() {
+    Menu() {
+      ForEach(this.menuLevel.sections, (sec1: MenuSectionModel) => {
+        MenuItemGroup() {
+          ForEach(sec1.entries, (ent1: MenuEntryModel) => {
+            if (ent1.hasSubmenu && ent1.subLevel !== undefined) {
+              MenuItem((): void => {
+                this.buildItemRow(ent1);
+              })
+              .enabled(ent1.enabled)
+              .subMenuBuilder((): void => {
+                if (ent1.subLevel !== undefined) {
+                  this.buildSub2(ent1.subLevel);
+                }
+              })
+            } else {
+              MenuItem((): void => {
+                this.buildItemRow(ent1);
+              })
+              .enabled(ent1.enabled)
+              .onClick((): void => {
+                if (ent1.enabled && ent1.itemId !== 0) {
+                  this.onMenuSelect(ent1.itemId);
+                }
+              })
+            }
+          }, (ent1: MenuEntryModel): string => ent1.key)
+        }
+      }, (sec1: MenuSectionModel): string => sec1.key)
+    }
+    .width(this.menuLevel.widthVp)
+    .radius(8)
+    .padding(4)
+    .menuItemGroupDivider({
+      strokeWidth: LengthMetrics.px(1),
+      color: this.isDark ? '#24FFFFFF' : '#1A000000',
+      startMargin: LengthMetrics.vp(8),
+      endMargin: LengthMetrics.vp(8),
+      mode: DividerMode.EMBEDDED_IN_MENU
+    })
+    .direction(this.menuDir)
+  }
 }
 
 @Builder
 function buildPopupMenuRoot(ctx: PopupMenuContext): void {
-  Menu() {
-    ForEach(ctx.root.sections, (sec1: MenuSectionModel) => {
-      MenuItemGroup() {
-        ForEach(sec1.entries, (ent1: MenuEntryModel) => {
-          if (ent1.hasSubmenu && ent1.subLevel !== undefined) {
-            MenuItem((): void => {
-              buildMenuItemRow(ent1, ctx.root.hasCheckable, ctx.darkMode);
-            })
-            .enabled(ent1.enabled)
-            .subMenuBuilder((): void => {
-              if (ent1.subLevel !== undefined) {
-                buildLevel2SubMenu(ent1.subLevel, ctx);
-              }
-            })
-          } else {
-            MenuItem((): void => {
-              buildMenuItemRow(ent1, ctx.root.hasCheckable, ctx.darkMode);
-            })
-            .enabled(ent1.enabled)
-            .onClick((): void => {
-              if (ent1.enabled && ent1.itemId !== 0) {
-                ctx.onSelect(ent1.itemId);
-              }
-            })
-          }
-        }, (ent1: MenuEntryModel): string => ent1.key)
-      }
-    }, (sec1: MenuSectionModel): string => sec1.key)
-  }
-  .width(ctx.root.widthVp)
-  .radius(8)
-  .padding(4)
-  .menuItemGroupDivider({
-    strokeWidth: LengthMetrics.px(1),
-    color: ctx.darkMode ? '#24FFFFFF' : '#1A000000',
-    startMargin: LengthMetrics.vp(8),
-    endMargin: LengthMetrics.vp(8),
-    mode: DividerMode.EMBEDDED_IN_MENU
+  MygoPopupMenuLevel1({
+    menuLevel: ctx.root,
+    isDark: ctx.darkMode,
+    menuDir: ctx.direction,
+    onMenuSelect: ctx.onSelect
   })
-  .direction(ctx.direction)
 }
 
 @Builder
@@ -1726,9 +1884,13 @@ struct Index {
     }
     if (node !== undefined) {
       this.getUIContext().getPromptAction().closeMenu(node).then((): void => {
-        node.dispose();
+        disposeDeferred((): void => {
+          node.dispose();
+        });
       }).catch((): void => {
-        node.dispose();
+        disposeDeferred((): void => {
+          node.dispose();
+        });
       });
     }
   }
@@ -1745,9 +1907,13 @@ struct Index {
     }
     if (node !== undefined) {
       this.getUIContext().getPromptAction().closeCustomDialog(node).then((): void => {
-        node.dispose();
+        disposeDeferred((): void => {
+          node.dispose();
+        });
       }).catch((): void => {
-        node.dispose();
+        disposeDeferred((): void => {
+          node.dispose();
+        });
       });
     }
   }
@@ -1770,12 +1936,18 @@ struct Index {
         if (curNode !== undefined) {
           if (closeExplicitly) {
             uiCtx.getPromptAction().closeCustomDialog(curNode).then((): void => {
-              curNode.dispose();
+              disposeDeferred((): void => {
+                curNode.dispose();
+              });
             }).catch((): void => {
-              curNode.dispose();
+              disposeDeferred((): void => {
+                curNode.dispose();
+              });
             });
           } else {
-            curNode.dispose();
+            disposeDeferred((): void => {
+              curNode.dispose();
+            });
           }
         }
       }
@@ -1809,7 +1981,8 @@ struct Index {
     const contentNode: ComponentContent<MessageBoxContext> = new ComponentContent<MessageBoxContext>(
       uiCtx,
       wrapBuilder<[MessageBoxContext]>(buildMessageBoxDialog),
-      ctx
+      ctx,
+      { nestingBuilderSupported: true }
     );
     this.activeMsgReqId = box.reqId;
     this.activeMsgCancelId = box.cancelId;
@@ -1851,12 +2024,18 @@ struct Index {
         if (curNode !== undefined) {
           if (closeExplicitly) {
             uiCtx.getPromptAction().closeMenu(curNode).then((): void => {
-              curNode.dispose();
+              disposeDeferred((): void => {
+                curNode.dispose();
+              });
             }).catch((): void => {
-              curNode.dispose();
+              disposeDeferred((): void => {
+                curNode.dispose();
+              });
             });
           } else {
-            curNode.dispose();
+            disposeDeferred((): void => {
+              curNode.dispose();
+            });
           }
         }
       }
@@ -1874,7 +2053,8 @@ struct Index {
     const contentNode: ComponentContent<PopupMenuContext> = new ComponentContent<PopupMenuContext>(
       uiCtx,
       wrapBuilder<[PopupMenuContext]>(buildPopupMenuRoot),
-      ctx
+      ctx,
+      { nestingBuilderSupported: true }
     );
     this.activeMenuReqId = reqId;
     this.activeMenuNode = contentNode;

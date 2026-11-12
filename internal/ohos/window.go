@@ -54,6 +54,10 @@ type Window struct {
 	hasBg        bool
 	rawTitleBar  platform.TitleBar
 	hasTitleBar  bool
+	flyout       platform.Flyout
+	flyoutSize   platform.Size
+	flyoutPlaced bool
+	dismissing   bool
 }
 
 func newWindow(b *Backend, id uint32, scale float64, opts *platform.WindowOptions, h platform.WindowHandler) *Window {
@@ -114,6 +118,24 @@ func newWindow(b *Backend, id uint32, scale float64, opts *platform.WindowOption
 			Y:      opts.Y,
 			Width:  opts.Width,
 			Height: opts.Height,
+		}
+		if opts.Flyout != nil {
+			w.opts.Frameless = true
+			w.opts.Resizable = false
+			w.opts.Minimizable = false
+			w.opts.Maximizable = false
+			w.opts.Center = false
+			w.alwaysOnTop = true
+			sz := platform.Size{
+				Width:  max(opts.Width, 1),
+				Height: max(opts.Height, 1),
+			}
+			w.flyout = *opts.Flyout
+			w.flyoutSize = sz
+			if r, ok := w.resolveFlyoutBounds(*opts.Flyout, sz); ok {
+				w.bounds = r
+				w.flyoutPlaced = true
+			}
 		}
 	}
 
@@ -366,15 +388,45 @@ func (w *Window) SetAlwaysOnTop(v bool) {
 
 func (w *Window) IsAlwaysOnTop() bool { return w.alwaysOnTop }
 
+func (w *Window) showSurface() {
+	s := w.surface
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	wasHidden := s.hostHidden
+	s.hostHidden = false
+	s.mu.Unlock()
+	if wasHidden {
+		s.send(platform.SurfaceEvent{Kind: platform.SurfaceShown})
+	}
+}
+
+func (w *Window) hideSurface() {
+	s := w.surface
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	wasHidden := s.hostHidden
+	s.hostHidden = true
+	s.mu.Unlock()
+	if !wasHidden {
+		s.touch.cancelFling()
+		if s.pointerIn {
+			s.send(platform.SurfaceEvent{Kind: platform.PointerLeave})
+		}
+		s.send(platform.SurfaceEvent{Kind: platform.SurfaceHidden})
+	}
+}
+
 func (w *Window) Show() {
 	if w.closed {
 		return
 	}
 	w.visible = true
 	w.minimized = false
-	if w.surface != nil {
-		w.surface.setHostHidden(false)
-	}
+	w.showSurface()
 	w.sendAction(winActShow)
 }
 
@@ -384,9 +436,7 @@ func (w *Window) ShowInactive() {
 	}
 	w.visible = true
 	w.minimized = false
-	if w.surface != nil {
-		w.surface.setHostHidden(false)
-	}
+	w.showSurface()
 	w.sendAction(winActShowInactive)
 }
 
@@ -395,9 +445,7 @@ func (w *Window) Hide() {
 		return
 	}
 	w.visible = false
-	if w.surface != nil {
-		w.surface.setHostHidden(true)
-	}
+	w.hideSurface()
 	w.sendAction(winActHide)
 }
 
@@ -458,11 +506,10 @@ func (w *Window) Restore() {
 	if w.closed {
 		return
 	}
+	w.visible = true
 	w.minimized = false
 	w.maximized = false
-	if w.surface != nil {
-		w.surface.setHostHidden(false)
-	}
+	w.showSurface()
 	w.sendAction(winActRestore)
 }
 
@@ -551,7 +598,76 @@ func (w *Window) TitleBarDoubleClicked() {
 	}
 }
 
-func (w *Window) PlaceFlyout(platform.Flyout, platform.Size) {}
+func (w *Window) hasModalChild() bool {
+	if w.b == nil {
+		return false
+	}
+	w.b.mu.Lock()
+	defer w.b.mu.Unlock()
+	for _, x := range w.b.windows {
+		if !x.closed && x.visible && x.parentID == w.id && x.opts.Modal {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Window) resolveFlyoutBounds(f platform.Flyout, size platform.Size) (platform.Rect, bool) {
+	size.Width = max(size.Width, 1)
+	size.Height = max(size.Height, 1)
+	var displays []platform.Display
+	if w.b != nil {
+		displays = w.b.Screen().Displays()
+	}
+	if f.Tray != nil {
+		if tb := f.Tray.Bounds(); tb.Width > 0 && tb.Height > 0 {
+			work := platform.WorkAreaFor(tb, displays)
+			if work.Width <= 0 || work.Height <= 0 {
+				work = platform.Rect{X: -100000, Y: -100000, Width: 200000, Height: 200000}
+			}
+			r, _, _ := f.Place(tb, size, work)
+			return r, true
+		}
+		work := platform.PrimaryWorkArea(displays)
+		if work.Width <= 0 || work.Height <= 0 {
+			return platform.Rect{Width: size.Width, Height: size.Height}, true
+		}
+		return platform.Centered(size, work), true
+	}
+	if w.parentID == 0 || w.b == nil {
+		return platform.Rect{}, false
+	}
+	pw := w.b.windowByID(w.parentID)
+	if pw == nil || pw.closed {
+		return platform.Rect{}, false
+	}
+	anchor := f.Anchor
+	anchor.X += pw.bounds.X
+	anchor.Y += pw.bounds.Y
+	work := platform.WorkAreaFor(anchor, displays)
+	if work.Width <= 0 || work.Height <= 0 {
+		work = platform.Rect{X: -100000, Y: -100000, Width: 200000, Height: 200000}
+	}
+	r, _, _ := f.Place(anchor, size, work)
+	return r, true
+}
+
+func (w *Window) PlaceFlyout(f platform.Flyout, size platform.Size) {
+	if w.closed || w.opts.Flyout == nil {
+		return
+	}
+	r, ok := w.resolveFlyoutBounds(f, size)
+	if !ok {
+		return
+	}
+	same := w.flyoutPlaced && f == w.flyout && size == w.flyoutSize && r == w.bounds
+	w.flyout = f
+	w.flyoutSize = size
+	w.flyoutPlaced = true
+	if !same {
+		w.SetBounds(r)
+	}
+}
 
 // Close destroys the window without asking ShouldClose.
 func (w *Window) Close() {
