@@ -1414,3 +1414,63 @@ func TestThemeSourceOverrideAndWindowButtonsTheme(t *testing.T) {
 		t.Fatalf("SetWindowButtonsTheme(light): kind=%d ok=%v cfg=%+v", kind, ok, cfg)
 	}
 }
+
+// Switching pointer devices between mouse, touch, and pen resets the click counter so synthesized or mixed presses never combine into a false double-click.
+func TestMixedPointerClicksResetDoubleClick(t *testing.T) {
+	b, _, _, h := newTestSurface(t)
+
+	// Mouse press followed immediately by a touch press at the same spot stays at Clicks=1.
+	b.onInput(encodeMouseInput(1, mouseDown, 0, 0, 0, 100, 80, 120, 0))
+	b.onInput(encodeMouseInput(1, mouseUp, 0, 0, 0, 110, 80, 120, 0))
+	b.onInput(encodeTouchInput(1, touchDown, true, 0, 115, []touchPoint{{id: 0, x: 80, y: 120, pressure: 0.5}}))
+	b.onInput(encodeTouchInput(1, touchUp, false, 0, 140, []touchPoint{{id: 0, x: 80, y: 120, pressure: 0.5}}))
+	// Switching to pen also starts fresh at Clicks=1, while a second pen press counts Clicks=2.
+	b.onInput(encodeMouseInput(1, mouseDown, 0, 1, 0, 160, 80, 120, 0.6))
+	b.onInput(encodeMouseInput(1, mouseUp, 0, 1, 0, 180, 80, 120, 0))
+	b.onInput(encodeMouseInput(1, mouseDown, 0, 1, 0, 220, 81, 121, 0.6))
+	b.onInput(encodeMouseInput(1, mouseUp, 0, 1, 0, 240, 81, 121, 0))
+
+	var downs []platform.SurfaceEvent
+	for _, ev := range h.events {
+		if ev.Kind == platform.PointerDown {
+			downs = append(downs, ev)
+		}
+	}
+	if len(downs) != 4 {
+		t.Fatalf("got %d PointerDown events, want 4: %+v", len(downs), downs)
+	}
+	if downs[0].Clicks != 1 || downs[1].Clicks != 1 || downs[2].Clicks != 1 || downs[3].Clicks != 2 {
+		t.Fatalf("clicks = [%d %d %d %d], want [1 1 1 2]", downs[0].Clicks, downs[1].Clicks, downs[2].Clicks, downs[3].Clicks)
+	}
+}
+
+// Consecutive precise touchpad scrolls queued ahead of a waiting frame sum into a single scroll event while discrete wheel notches stay separate.
+func TestPreciseScrollCoalescesAheadOfFrame(t *testing.T) {
+	b, _, _, h := newTestSurface(t)
+
+	b.mu.Lock()
+	b.events = append(b.events,
+		event{kind: kindFrame, payload: makeFramePayload(1, 1, 400, 8, 8, 32, 256), fd: -1},
+		event{kind: kindInput, payload: encodeScrollInput(1, scrollPrecise, 0, 100, 200, 1.5, 10.0)},
+		event{kind: kindInput, payload: encodeScrollInput(1, scrollPrecise, 0, 102, 204, 2.5, 14.0)},
+		event{kind: kindInput, payload: encodeScrollInput(1, 0, 0, 102, 204, 0, -1.0)},
+		event{kind: kindInput, payload: encodeScrollInput(1, 0, 0, 102, 204, 0, -1.0)},
+	)
+	b.mu.Unlock()
+
+	b.Step() // coalesced precise scroll
+	b.Step() // first discrete wheel notch
+	b.Step() // second discrete wheel notch
+	b.Step() // aborted fd=-1 frame
+
+	if len(h.events) != 3 {
+		t.Fatalf("got %d scroll events, want 3: %+v", len(h.events), h.events)
+	}
+	if !h.events[0].Precise || math.Abs(h.events[0].DX-4.0) > 1e-5 || math.Abs(h.events[0].DY-24.0) > 1e-5 ||
+		math.Abs(h.events[0].X-102) > 1e-5 || math.Abs(h.events[0].Y-204) > 1e-5 {
+		t.Fatalf("coalesced precise scroll = %+v, want X=102 Y=204 DX=4 DY=24", h.events[0])
+	}
+	if h.events[1].Precise || h.events[1].DY != -1 || h.events[2].Precise || h.events[2].DY != -1 {
+		t.Fatalf("discrete wheel events = %+v %+v, want two separate DY=-1 notches", h.events[1], h.events[2])
+	}
+}

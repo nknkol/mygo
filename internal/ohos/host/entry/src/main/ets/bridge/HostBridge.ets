@@ -1975,10 +1975,16 @@ class HostBridgeManager {
       const hideBtns: boolean = (cfg.flags & WIN_FLAG_HIDE_WIN_BUTTONS) !== 0;
       try {
         w.setWindowDecorVisible(!hiddenTB && !frameless);
-        if (hiddenTB && cfg.titleBarHeight > 0) {
-          w.setWindowDecorHeight(cfg.titleBarHeight);
-        }
       } catch (_) {}
+      try {
+        w.setWindowTitleMoveEnabled(!hiddenTB && !frameless);
+      } catch (_) {}
+      if (hiddenTB && cfg.titleBarHeight > 0) {
+        const dh: number = Math.max(37, Math.min(112, Math.round(cfg.titleBarHeight)));
+        try {
+          w.setWindowDecorHeight(dh);
+        } catch (_) {}
+      }
 
       try {
         if (hideBtns || frameless) {

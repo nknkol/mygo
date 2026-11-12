@@ -60,6 +60,8 @@ type Surface struct {
 	held              platform.HeldKeys
 	down              pressedKeys
 	clicks            platform.ClickCounter
+	lastClickPtr      platform.PointerKind
+	hasClickPtr       bool
 	touch             touchGesture
 	pinch             float64
 	lastX, lastY      float64

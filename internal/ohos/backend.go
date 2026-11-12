@@ -340,6 +340,17 @@ func isMouseMove(ev event) (winID uint32, button, pointer byte, ok bool) {
 	return binary.LittleEndian.Uint32(ev.payload[0:]), ev.payload[6], ev.payload[7], true
 }
 
+func isPreciseScroll(ev event) (winID uint32, flags byte, mods uint32, ok bool) {
+	if ev.kind != kindInput || len(ev.payload) < 28 || ev.payload[4] != inputScroll {
+		return 0, 0, 0, false
+	}
+	fl := ev.payload[5]
+	if fl&scrollPrecise == 0 {
+		return 0, 0, 0, false
+	}
+	return binary.LittleEndian.Uint32(ev.payload[0:]), fl, binary.LittleEndian.Uint32(ev.payload[8:]), true
+}
+
 func surfaceWinID(ev event) (uint32, bool) {
 	if ev.kind != kindSurface || len(ev.payload) < 16 {
 		return 0, false
@@ -410,6 +421,31 @@ func (b *Backend) popNextLocked() (event, bool) {
 				break
 			}
 			ev = b.events[idx]
+			copy(b.events[idx:], b.events[idx+1:])
+			b.events[len(b.events)-1] = event{}
+			b.events = b.events[:len(b.events)-1]
+		}
+	} else if wid, fl, mods, ok := isPreciseScroll(ev); ok {
+		var copied bool
+		dx := getF32(ev.payload[20:])
+		dy := getF32(ev.payload[24:])
+		for idx < len(b.events) {
+			nwid, nfl, nmods, nok := isPreciseScroll(b.events[idx])
+			if !nok || nwid != wid || nfl != fl || nmods != mods {
+				break
+			}
+			if !copied {
+				buf := make([]byte, len(ev.payload))
+				copy(buf, ev.payload)
+				ev.payload = buf
+				copied = true
+			}
+			nev := b.events[idx]
+			copy(ev.payload[12:20], nev.payload[12:20])
+			dx += getF32(nev.payload[20:])
+			dy += getF32(nev.payload[24:])
+			putF32(ev.payload[20:], dx)
+			putF32(ev.payload[24:], dy)
 			copy(b.events[idx:], b.events[idx+1:])
 			b.events[len(b.events)-1] = event{}
 			b.events = b.events[:len(b.events)-1]

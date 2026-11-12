@@ -214,6 +214,15 @@ func (s *Surface) send(ev platform.SurfaceEvent) bool {
 
 const windowDragThreshold = 6.0
 
+func (s *Surface) countClick(pk platform.PointerKind, button int, x, y float64, timeMs uint32, dc platform.DoubleClick) int {
+	if !s.hasClickPtr || s.lastClickPtr != pk {
+		s.clicks = platform.ClickCounter{}
+		s.lastClickPtr = pk
+		s.hasClickPtr = true
+	}
+	return s.clicks.Press(button, x, y, timeMs, dc)
+}
+
 func (s *Surface) checkWindowDragMove(x, y float64, mods platform.Modifiers) bool {
 	if !s.dragPending || !s.pressDown {
 		return false
@@ -285,7 +294,7 @@ func (s *Surface) onMouse(p []byte) {
 				s.pressY = y
 				s.dragPending = false
 			}
-			clicks := s.clicks.Press(int(button), x, y, timeMs, platform.DefaultDoubleClick)
+			clicks := s.countClick(pk, int(button), x, y, timeMs, platform.DefaultDoubleClick)
 			s.send(platform.SurfaceEvent{
 				Kind:     platform.PointerDown,
 				X:        x,
@@ -392,7 +401,7 @@ func (s *Surface) onTouch(p []byte) {
 			}
 			dc := platform.DefaultDoubleClick
 			dc.DX, dc.DY = max(dc.DX, touchSlop), max(dc.DY, touchSlop)
-			ev.Clicks = s.clicks.Press(ev.Button, ev.X, ev.Y, timeMs, dc)
+			ev.Clicks = s.countClick(platform.PointerTouch, ev.Button, ev.X, ev.Y, timeMs, dc)
 		case platform.PointerMove:
 			if s.checkWindowDragMove(ev.X, ev.Y, mods) {
 				return

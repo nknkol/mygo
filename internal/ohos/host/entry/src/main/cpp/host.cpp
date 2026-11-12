@@ -513,6 +513,7 @@ struct WinSession {
     OH_NativeVSync *vsync = nullptr;
     sem_t vsyncSem{};
     bool vsyncInited = false;
+    std::atomic<int64_t> lastVsyncNs{0};
     int32_t curW = 0;
     int32_t curH = 0;
     int32_t targetW = 0;
@@ -524,7 +525,6 @@ struct WinSession {
     BufReply reply = BufReply::None;
     uint32_t replySeq = 0;
     uint32_t replyRectCount = 0;
-    std::vector<Region::Rect> replyRects;
     uint32_t requestedFps = 0;
     bool fpsDirty = true;
 
@@ -3819,7 +3819,13 @@ void OnNodeEvent(ArkUI_NodeEvent *event) {
         if (ev == nullptr) {
             return;
         }
+        int32_t source = OH_ArkUI_UIInputEvent_GetSourceType(ev);
         int32_t tool = OH_ArkUI_UIInputEvent_GetToolType(ev);
+        if (source == UI_INPUT_EVENT_SOURCE_TYPE_MOUSE ||
+            tool == UI_INPUT_EVENT_TOOL_TYPE_MOUSE ||
+            tool == UI_INPUT_EVENT_TOOL_TYPE_TOUCHPAD) {
+            return;
+        }
         int32_t act = OH_ArkUI_UIInputEvent_GetAction(ev);
         uint32_t mods = extractMods(ws.get(), ev);
         uint32_t ms = eventMs(ev);
@@ -4002,6 +4008,7 @@ void OnNodeEvent(ArkUI_NodeEvent *event) {
 void OnVsyncCallback(long long, void *data) {
     auto *ws = static_cast<WinSession *>(data);
     if (ws != nullptr && ws->vsyncInited) {
+        ws->lastVsyncNs.store(monoNs(), std::memory_order_relaxed);
         sem_post(&ws->vsyncSem);
     }
 }
@@ -4091,6 +4098,7 @@ void WinSession::renderLoop() {
     int frames = 0, damaged = 0, whole = 0, aborted = 0;
     int unloggedFrames = 0;
     int64_t lastFlushNs = 0;
+    int64_t frameAnchorNs = 0;
     LatencyRing drawRing, inRing, intervalRing;
 
     for (;;) {
@@ -4146,8 +4154,13 @@ void WinSession::renderLoop() {
         }
 
         const int64_t vsyncPeriodNs = static_cast<int64_t>(1e9 / std::max(60.0, refresh));
-        if (lastFlushNs != 0 && (monoNs() - lastFlushNs) < vsyncPeriodNs) {
+        if (frameAnchorNs != 0 && (monoNs() - frameAnchorNs) < (vsyncPeriodNs * 9) / 10) {
+            lastVsyncNs.store(0, std::memory_order_relaxed);
             waitVsync();
+            int64_t vsNs = lastVsyncNs.load(std::memory_order_relaxed);
+            frameAnchorNs = vsNs > 0 ? vsNs : monoNs();
+        } else {
+            frameAnchorNs = monoNs();
         }
 
         {
@@ -4227,7 +4240,6 @@ void WinSession::renderLoop() {
 
         BufReply gotReply = BufReply::None;
         uint32_t rectCount = 0;
-        std::vector<Region::Rect> localRects;
         bool timedOut = false;
         {
             std::unique_lock<std::mutex> lk(mu);
@@ -4240,7 +4252,6 @@ void WinSession::renderLoop() {
             } else {
                 gotReply = reply;
                 rectCount = replyRectCount;
-                localRects.swap(replyRects);
                 reply = BufReply::None;
             }
         }
@@ -4272,10 +4283,6 @@ void WinSession::renderLoop() {
         }
 
         Region region = {nullptr, 0};
-        if (!localRects.empty()) {
-            region.rects = localRects.data();
-            region.rectNumber = static_cast<int32_t>(localRects.size());
-        }
         rc = OH_NativeWindow_NativeWindowFlushBuffer(win, buf, -1, region);
         if (rc != 0) {
             OH_LOG_ERROR(LOG_APP, "win=%{public}u FlushBuffer failed rc=%{public}d", winId, rc);
@@ -5417,24 +5424,11 @@ bool pumpEngineMessages() {
                 memcpy(&rects, payload.data() + 8, 4);
                 auto ws = findSession(wid > 0 ? wid : 1);
                 if (ws) {
-                    std::vector<Region::Rect> parsedRects;
-                    if (rects > 0 && rects <= 256 &&
-                        payload.size() >= 12 + static_cast<size_t>(rects) * 16) {
-                        parsedRects.resize(rects);
-                        for (uint32_t i = 0; i < rects; ++i) {
-                            const uint8_t *rp = payload.data() + 12 + static_cast<size_t>(i) * 16;
-                            memcpy(&parsedRects[i].x, rp + 0, 4);
-                            memcpy(&parsedRects[i].y, rp + 4, 4);
-                            memcpy(&parsedRects[i].w, rp + 8, 4);
-                            memcpy(&parsedRects[i].h, rp + 12, 4);
-                        }
-                    }
                     {
                         std::lock_guard<std::mutex> lk(ws->mu);
                         ws->reply = BufReply::Present;
                         ws->replySeq = seq;
                         ws->replyRectCount = rects;
-                        ws->replyRects.swap(parsedRects);
                     }
                     ws->cv.notify_all();
                 }
