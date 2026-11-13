@@ -248,7 +248,7 @@ func TestWheelConsecutiveNotchesKeepMomentum(t *testing.T) {
 	}
 }
 
-// Continuous touchpad scrolling places flowing rows and text between device pixels without height breathing and settles back onto whole pixels at rest.
+// Touchpad scrolling moves flowing rows and glyphs continuously from the very first fractional frame without height breathing, jump on start, settle twitch, or dropping subpixel glyphs to transforms.
 func TestScrollSubpixelMotionAndSettle(t *testing.T) {
 	var s ScrollState
 	rowColor := RGB(40, 120, 220)
@@ -264,12 +264,6 @@ func TestScrollSubpixelMotionAndSettle(t *testing.T) {
 	tt.SetScale(1.9)
 	tt.Move(100, 100)
 
-	// A single isolated scroll in tests stays crisp and leaves no pending frame.
-	tt.Scroll(100, 100, 0, 10)
-	if tt.FramePending() {
-		t.Fatal("single scroll left a frame pending")
-	}
-
 	findRow := func() (y, h float32, ok bool) {
 		for _, op := range tt.rt.scene.Ops {
 			if op.Color == rowColor.scene() && op.Rect.H > 30 && op.Rect.H < 45 {
@@ -279,52 +273,71 @@ func TestScrollSubpixelMotionAndSettle(t *testing.T) {
 		return 0, 0, false
 	}
 
-	// A continuous stream of fractional touchpad deltas moves between pixels with constant pixel height.
-	var sawFractionalRect, sawFractionalGlyph bool
-	var wantH float32
-	for i := range 6 {
-		tt.Scroll(100, 100, 0, 0.25)
-		y, h, ok := findRow()
-		if !ok {
-			t.Fatal("row fill not found in scene")
-		}
-		if i == 0 {
-			wantH = h
-		} else if h != wantH {
-			t.Fatalf("row pixel height breathed during scroll: got %v, want constant %v", h, wantH)
-		}
-		if math.Abs(float64(y-float32(math.Round(float64(y))))) > 0.05 {
-			sawFractionalRect = true
-		}
-		for _, g := range tt.rt.scene.Glyphs {
-			if _, ty, ok := g.Transform.Translation(); ok && math.Abs(float64(ty)) > 0.05 {
-				sawFractionalGlyph = true
-			}
-		}
-		tt.Advance(8 * time.Millisecond)
+	y0, wantH, ok := findRow()
+	if !ok {
+		t.Fatal("initial row fill not found in scene")
 	}
-	if !sawFractionalRect {
-		t.Fatal("expected fractional subpixel row Y positions during active touchpad stream")
+	if len(tt.rt.scene.Glyphs) == 0 {
+		t.Fatal("expected text glyphs in scene")
 	}
-	if len(tt.rt.scene.Glyphs) > 0 && !sawFractionalGlyph {
-		t.Fatal("expected fractional subpixel glyph translation during active touchpad stream")
+	g0Y := tt.rt.scene.Glyphs[0].Y
+
+	// Frame 1 of scrolling moves both row and glyph by the exact fractional device-pixel delta (-0.05 * 1.9 = -0.095px) without any mode-switch jump.
+	tt.Scroll(100, 100, 0, 0.05)
+	if tt.FramePending() {
+		t.Fatal("precise scroll left an artificial settle timer pending")
+	}
+	y1, h1, ok := findRow()
+	if !ok {
+		t.Fatal("row fill not found on first scroll frame")
+	}
+	if h1 != wantH {
+		t.Fatalf("row height changed on scroll start: got %v, want %v", h1, wantH)
+	}
+	if got, want := y1-y0, float32(-0.05*1.9); math.Abs(float64(got-want)) > 1e-3 {
+		t.Fatalf("first-frame row delta = %v, want %v (y0=%v, y1=%v)", got, want, y0, y1)
+	}
+	g1 := tt.rt.scene.Glyphs[0]
+	if got, want := g1.Y-g0Y, float32(-0.05*1.9); math.Abs(float64(got-want)) > 1e-3 {
+		t.Fatalf("first-frame glyph Y delta = %v, want %v (g0=%v, g1=%v)", got, want, g0Y, g1.Y)
+	}
+	if g1.Transform.Set {
+		t.Fatalf("untransformed scroll glyph unexpectedly set Transform %+v", g1.Transform)
 	}
 
-	// Once the touchpad stream stops for 100 ms, rows and glyphs settle onto whole pixels.
-	tt.Advance(120 * time.Millisecond)
-	y, _, ok := findRow()
-	if !ok {
-		t.Fatal("row fill not found after settle")
-	}
-	if math.Abs(float64(y-float32(math.Round(float64(y))))) > 1e-3 {
-		t.Fatalf("row Y did not settle onto a whole pixel: got %v", y)
-	}
-	for _, g := range tt.rt.scene.Glyphs {
-		if g.Transform.Set {
-			t.Fatalf("glyph kept subpixel transform %+v at rest", g.Transform)
+	// Intermittent scrolling with >100 ms pauses never twitches while stationary and keeps pixel height constant.
+	for range 5 {
+		tt.Advance(150 * time.Millisecond)
+		yBeforePauseEnd, _, _ := findRow()
+		if yBeforePauseEnd != y1 {
+			t.Fatalf("row twitched during stationary pause: got %v, want %v", yBeforePauseEnd, y1)
+		}
+		tt.Scroll(100, 100, 0, 0.23)
+		var h float32
+		y1, h, ok = findRow()
+		if !ok || h != wantH {
+			t.Fatalf("intermittent scroll row ok=%v h=%v, want h=%v", ok, h, wantH)
 		}
 	}
-	if tt.FramePending() {
-		t.Fatal("settled scroll left a frame pending")
+}
+
+// A live window whose first VSync frame after a mouse wheel notch carries a timestamp at or before the input event still steps smoothly on the first frame instead of stalling for one refresh.
+func TestWheelFirstFrameLeadIn(t *testing.T) {
+	var s ScrollState
+	tt := coreNewTester(func(c *context) {
+		coreScroll(c).Fill().TrackScroll(&s).Children(func() {
+			coreBox(c).Height(2000).Shrink(0)
+		})
+	}, 200, 200)
+	tt.Move(100, 100)
+	wheelAt := tt.rt.now()
+	tt.Wheel(100, 100, 0, 90)
+	// Simulate a live VSync callback whose start timestamp predates the wheel event by 2 ms.
+	savedClock := tt.rt.clock
+	tt.rt.clock = nil
+	defer func() { tt.rt.clock = savedClock }()
+	tt.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame, Paced: true, Time: wheelAt.Add(-2 * time.Millisecond)})
+	if s.Y <= 0 {
+		t.Fatalf("first VSync frame with predated timestamp stalled at %v, want > 0", s.Y)
 	}
 }

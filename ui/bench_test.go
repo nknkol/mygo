@@ -266,7 +266,7 @@ func BenchmarkDiffScrollSidebarWarm(b *testing.B) { benchDiffScroll(b, false, 80
 func benchDiffScroll(b *testing.B, diff bool, lo, hi int) {
 	tt, d := diffSceneTester(diff)
 	s := &sidebarScroller{tt: tt, d: d, lo: lo, hi: hi}
-	for range 100 {
+	for range 150 {
 		s.step()
 	}
 	b.ReportAllocs()
@@ -292,7 +292,7 @@ func TestDiffFrameAllocs(t *testing.T) {
 	both := testing.AllocsPerRun(100, s.step)
 	tt, d = diffSceneTester(false)
 	s = &sidebarScroller{tt: tt, d: d, lo: 80, hi: 120}
-	for range 100 {
+	for range 150 {
 		s.step()
 	}
 	warm := testing.AllocsPerRun(100, s.step)

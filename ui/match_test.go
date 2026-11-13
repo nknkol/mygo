@@ -940,9 +940,12 @@ func TestMorphTakesOverWhereItIs(t *testing.T) {
 			case 1:
 				coreText(c, "Daily deals").Key("big").Absolute().Left(100).Top(100).FontSize(24).
 					TextColor(RGB(0, 0, 255)).Transition(tr).ContentTransition(morph)
-			default:
+			case 2:
 				keep("news", coreText(c, "Daily news")).Key("news").Absolute().Left(200).Top(40).FontSize(16).
 					TextColor(RGB(0, 160, 0)).Transition(tr).ContentTransition(morph)
+			default:
+				coreText(c, "Daily news").Key("plain").Absolute().Left(200).Top(40).FontSize(16).
+					TextColor(RGB(0, 160, 0))
 			}
 		})
 	}, 400, 300)
@@ -961,8 +964,11 @@ func TestMorphTakesOverWhereItIs(t *testing.T) {
 	if r := keyed(tt, "news").st.crec; r.oldTL != nil {
 		t.Error("once there, the title still morphs")
 	}
-	if n := glyphsPainted(tt); n != 9 {
-		t.Errorf("once there, %d glyphs paint", n)
+	got := glyphsPainted(tt)
+	view = 3
+	tt.Frame()
+	if want := glyphsPainted(tt); got != want {
+		t.Errorf("once there, %d glyphs paint, want %d", got, want)
 	}
 }
 

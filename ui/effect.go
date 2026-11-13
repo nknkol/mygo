@@ -192,12 +192,7 @@ func layerPaint(e *node, dx, dy float32, lifting *node, view Rect) func(cp *Pain
 // layerOp paints the top left w×h pixels of cv where they were drawn from,
 // at x0, y0 pixels, with opacity and blurred by blur pixels.
 func (p *Painter) layerOp(cv *Canvas, x0, y0 float32, w, h int, opacity, blur float32) {
-	s := p.scale
-	area := Rect{X: x0 / s, Y: y0 / s, W: float32(w) / s, H: float32(h) / s}
-	rect := p.snap(area)
-	if p.transform.Set {
-		rect = scene.Rect{X: x0, Y: y0, W: float32(w), H: float32(h)}
-	}
+	rect := scene.Rect{X: x0, Y: y0, W: float32(w), H: float32(h)}
 	p.add(scene.Op{Kind: scene.OpImage, Rect: rect, Image: cv.img, Src: scene.Rect{W: float32(w), H: float32(h)}, Opacity: opacity, Blur: blur})
 }
 

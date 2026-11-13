@@ -280,20 +280,19 @@ func (p *Painter) drawIcon(s *SVG, r Rect, c Color, rotate float32) {
 		return
 	}
 	x, y := d.X-float32((cw-w)/2), d.Y-float32((ch-h)/2)
-	ix, iy := round(x), round(y)
 	start := int32(len(p.s.Glyphs))
 	c = c.Alpha(p.opacity)
 	p.s.Glyphs = append(p.s.Glyphs, scene.Glyph{
-		X: ix, Y: iy, W: float32(gi.W), H: float32(gi.H),
-		U: gi.X, V: gi.Y, UW: gi.W, VH: gi.H,
-		Transform: glyphShift(scene.Affine{}, x-ix, y-iy),
-		Color:     c.scene(), Wide: p.glyphWide(c),
+		X: x, Y: y, W: float32(cw), H: float32(ch),
+		U: gi.X + 1, V: gi.Y + 1, UW: uint16(cw), VH: uint16(ch),
+		Color: c.scene(), Wide: p.glyphWide(c),
 	})
 	p.add(scene.Op{Kind: scene.OpGlyphs, Start: start, End: start + 1})
 }
 
 // rasterizeIcon draws the mask of the icon job: the coverage of its SVG,
-// whatever its colors.
+// whatever its colors, framed by a 1-texel transparent border so hardware
+// bilinear filtering glides smoothly across subpixel scroll positions.
 func (rt *engine) rasterizeIcon() (int, int, []byte) {
 	j := &rt.svgs.job
 	img := rt.canvasFor(j.cw, j.ch)
@@ -302,15 +301,23 @@ func (rt *engine) rasterizeIcon() (int, int, []byte) {
 	} else {
 		j.s.doc.Draw(img, color.NRGBA{A: 255}, false)
 	}
-	n := j.cw * j.ch
+	pw, ph := j.cw+2, j.ch+2
+	n := pw * ph
 	if cap(rt.svgs.mask) < n {
 		rt.svgs.mask = make([]byte, n)
 	}
 	mask := rt.svgs.mask[:n]
-	for i := range mask {
-		mask[i] = img.Pix[i*4+3]
+	clear(mask[:pw])
+	clear(mask[(ph-1)*pw:])
+	for y := 0; y < j.ch; y++ {
+		dst := mask[(y+1)*pw:]
+		dst[0], dst[pw-1] = 0, 0
+		src := img.Pix[y*img.Stride:]
+		for x := 0; x < j.cw; x++ {
+			dst[x+1] = src[x*4+3]
+		}
 	}
-	return j.cw, j.ch, mask
+	return pw, ph, mask
 }
 
 // drawSVG paints an SVG in its own colors, with current for currentColor,

@@ -4,7 +4,6 @@ import (
 	"image"
 	"math"
 	"strconv"
-	"strings"
 )
 
 // JoinsGlyphs reports whether glyphs of a run whose edges share pixels
@@ -62,66 +61,86 @@ func (s *System) GlyphRun(f *Font, ids []uint32, xs []float32, scale float32, sh
 	if len(ids) == 0 || len(ids) != len(xs) {
 		return GlyphImage{}
 	}
-	// The glyphs, as placed alone, which the key names.
+	s.mu.Lock()
+	fontShade := f.shadeFor(shade)
+	subpixel := opaque && s.subpixel
+	origin := math.Floor(float64(xs[0]))
+	var scratch [128]byte
+	key := strconv.AppendUint(scratch[:0], uint64(uint32(scale*256+0.5)), 10)
+	key = append(key, byte('0'+fontShade))
+	if subpixel {
+		key = append(key, 's')
+	}
+	for i, id := range ids {
+		q, _, carry := s.place(f, scale, subpixel, xs[i])
+		key = append(key, ' ')
+		key = strconv.AppendUint(key, uint64(id), 10)
+		key = append(key, '@')
+		key = strconv.AppendInt(key, int64(int(math.Floor(float64(xs[i]))-origin+float64(carry))), 10)
+		key = append(key, '+')
+		key = strconv.AppendInt(key, int64(q), 10)
+	}
+	if byFont := s.runs[f]; byFont != nil {
+		if e, ok := byFont[string(key)]; ok {
+			e.used = s.frame
+			s.mu.Unlock()
+			return e.GlyphImage
+		}
+	}
+	if out := s.outRuns[f]; out != nil {
+		if _, ok := out[string(key)]; ok {
+			s.mu.Unlock()
+			return GlyphImage{}
+		}
+	}
+	s.mu.Unlock()
+
+	// The glyphs, as placed alone, which addGlyphs joins.
 	gs := make([]GlyphImage, len(ids))
 	for i, id := range ids {
 		gs[i] = s.Glyph(f, id, scale, xs[i], shade, opaque)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	shade = f.shadeFor(shade)
-	subpixel := opaque && s.subpixel
-	origin := math.Floor(float64(xs[0]))
-	var key strings.Builder
-	key.WriteString(strconv.FormatUint(uint64(uint32(scale*256+0.5)), 10))
-	key.WriteByte(byte('0' + shade))
-	if subpixel {
-		key.WriteByte('s')
+	if byFont := s.runs[f]; byFont != nil {
+		if e, ok := byFont[string(key)]; ok {
+			e.used = s.frame
+			return e.GlyphImage
+		}
 	}
-	for i, id := range ids {
-		q, _, carry := s.place(f, scale, subpixel, xs[i])
-		key.WriteByte(' ')
-		key.WriteString(strconv.FormatUint(uint64(id), 10))
-		key.WriteByte('@')
-		key.WriteString(strconv.Itoa(int(math.Floor(float64(xs[i])) - origin + float64(carry))))
-		key.WriteByte('+')
-		key.WriteString(strconv.Itoa(q))
-	}
-	rk := runKey{f, key.String()}
-	if e, ok := s.runs[rk]; ok {
-		e.used = s.frame
-		return e.GlyphImage
-	}
-	if _, out := s.outRuns[rk]; out {
-		return GlyphImage{}
+	k := string(key)
+	if out := s.outRuns[f]; out != nil {
+		if _, ok := out[k]; ok {
+			return GlyphImage{}
+		}
 	}
 	b := s.addGlyphs(gs, xs, origin)
-	if b.w <= 0 || b.h <= 0 || b.w > 4096 || b.h > 2048 {
+	if b.w <= 0 || b.h <= 0 || b.w > 4094 || b.h > 2048 {
 		return GlyphImage{}
 	}
 	inColor := b.subpixel
-	x, y, ok := s.alloc(inColor, b.w, b.h)
+	x, y, ok := s.putGlyph(inColor, b)
 	if !ok {
 		if s.outRuns == nil {
-			s.outRuns = map[runKey]struct{}{}
+			s.outRuns = map[*Font]map[string]struct{}{}
 		}
-		s.outRuns[rk] = struct{}{}
+		out := s.outRuns[f]
+		if out == nil {
+			out = map[string]struct{}{}
+			s.outRuns[f] = out
+		}
+		out[k] = struct{}{}
 		return GlyphImage{}
-	}
-	if inColor {
-		s.ColorAtlas.Put(x, y, b.w, b.h, b.pix, 4*b.w)
-	} else {
-		s.MaskAtlas.Put(x, y, b.w, b.h, b.pix, b.w)
 	}
 	g := GlyphImage{OK: true, Subpixel: b.subpixel, Thin: f.thin,
 		X: uint16(x), Y: uint16(y), W: uint16(b.w), H: uint16(b.h), Left: float32(b.left), Top: float32(b.top)}
-	s.runs[rk] = &atlasEntry{g, s.frame}
+	byFont := s.runs[f]
+	if byFont == nil {
+		byFont = map[string]*atlasEntry{}
+		s.runs[f] = byFont
+	}
+	byFont[k] = &atlasEntry{g, s.frame}
 	return g
-}
-
-type runKey struct {
-	font *Font
-	key  string
 }
 
 // addGlyphs adds the coverage of glyphs placed alone, their pens at xs,

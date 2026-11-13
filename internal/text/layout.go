@@ -436,8 +436,8 @@ type System struct {
 
 	glyphs map[glyphKey]*atlasEntry
 	places map[placeKey]placement
-	// runs holds joined glyphs (GlyphRun).
-	runs  map[runKey]*atlasEntry
+	// runs holds joined glyphs (GlyphRun), keyed by font and placement key.
+	runs  map[*Font]map[string]*atlasEntry
 	masks map[uint64]*atlasEntry
 	// transient holds the masks drawn for the frame being painted alone,
 	// recent the frame each of them was last drawn in, and transientUses
@@ -447,6 +447,9 @@ type System struct {
 	transientUses uint64
 	// MaskAtlas holds coverage masks, ColorAtlas color glyphs.
 	MaskAtlas, ColorAtlas *scene.Atlas
+	// padBuf holds a glyph bitmap with a 1-texel transparent top/left border
+	// while Put uploads it into an atlas.
+	padBuf []byte
 	// full tells which atlases (mask, color) left out something the frame
 	// draws, and want how many pixels that needed; failed counts failed
 	// allocations.
@@ -460,7 +463,7 @@ type System struct {
 	// last could have room: a glyph a frame draws a thousand times counts
 	// once in want, which sizes the atlas, and is rasterized once.
 	outGlyphs map[glyphKey]struct{}
-	outRuns   map[runKey]struct{}
+	outRuns   map[*Font]map[string]struct{}
 	outMasks  map[uint64]struct{}
 	// subpixel tells that the system's settings ask for subpixel
 	// antialiasing (TextParams).
@@ -515,7 +518,7 @@ func newSystem() *System {
 		marks:     map[markKey]float32{},
 		glyphs:    map[glyphKey]*atlasEntry{},
 		places:    map[placeKey]placement{},
-		runs:      map[runKey]*atlasEntry{},
+		runs:      map[*Font]map[string]*atlasEntry{},
 		masks:     map[uint64]*atlasEntry{},
 		transient: map[uint64]GlyphImage{},
 		recent:    map[uint64]uint64{},

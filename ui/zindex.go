@@ -157,16 +157,15 @@ func (p *Painter) paintByZ(e *node) {
 	m := p.rt.matches
 	content := m != nil && e.parent == nil
 	dividers := e.flags&flagDividers != 0 && !e.grid
-	savedSubX, savedSubY := p.subpixelX, p.subpixelY
-	scrollSubX, scrollSubY := p.scrollMotion(e)
-	flowSubX, flowSubY := savedSubX || scrollSubX, savedSubY || scrollSubY
+	savedScroll := p.saveScroll()
+	flowScroll := p.flowScroll(e)
 	for i := base; i < end; i++ {
 		// Read again each time: painting c may grow the slice.
 		c := z.order[i]
 		if dividers && (c.zIndex > 0 || c.zIndex == 0 && c.aboveFlow() && c.leaving == 0) {
-			p.subpixelX, p.subpixelY = flowSubX, flowSubY
+			p.restoreScroll(flowScroll)
 			p.dividers(e)
-			p.subpixelX, p.subpixelY = savedSubX, savedSubY
+			p.restoreScroll(savedScroll)
 			dividers = false
 		}
 		if content && c == e.c.overlay {
@@ -174,17 +173,17 @@ func (p *Painter) paintByZ(e *node) {
 			content = false
 		}
 		if p.paintable(c) {
-			if !c.aboveFlow() {
-				p.subpixelX, p.subpixelY = flowSubX, flowSubY
+			if (c.flags&flagAbsolute == 0 || c.leaving == 1) && !c.stuck() {
+				p.restoreScroll(flowScroll)
 			}
 			p.element(c)
-			p.subpixelX, p.subpixelY = savedSubX, savedSubY
+			p.restoreScroll(savedScroll)
 		}
 	}
 	if dividers {
-		p.subpixelX, p.subpixelY = flowSubX, flowSubY
+		p.restoreScroll(flowScroll)
 		p.dividers(e)
-		p.subpixelX, p.subpixelY = savedSubX, savedSubY
+		p.restoreScroll(savedScroll)
 	}
 	if content {
 		m.paint(p, nil)

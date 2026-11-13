@@ -6,10 +6,10 @@ import (
 	"time"
 )
 
-// wheelAnimation is how the notches of a mouse wheel scroll: along a short
-// critically-damped spring, keeping the content's velocity as consecutive
-// notches arrive rather than restarting from a step in speed.
-var wheelAnimation = Animation{Spring: SpringOptions{Duration: 220 * time.Millisecond}}
+// wheelAnimation is how the notches of a mouse wheel scroll: along a
+// critically-damped spring tuned so consecutive notches bridge into a steady
+// glide and each notch tapers smoothly to rest without subpixel jitter.
+var wheelAnimation = Animation{Spring: SpringOptions{Duration: 380 * time.Millisecond, Precision: 0.05}}
 
 // wheelGlide is the notches of a wheel on their way through a scroll
 // container: x and y go from 0 to as far as all of them scroll, and done
@@ -21,6 +21,7 @@ type wheelGlide struct {
 	x, y         channel
 	doneX, doneY float64
 	reveal       bool
+	fresh        bool
 }
 
 // ahead returns how far the notches of the glide have yet to scroll s,
@@ -62,7 +63,7 @@ func (rt *engine) wheelScroll(s *state, dx, dy float32) {
 	g := s.wheel
 	if g == nil || g.reveal {
 		// The user takes over from ScrollIntoView too.
-		g = &wheelGlide{x: channel{at: now}, y: channel{at: now}}
+		g = &wheelGlide{x: channel{at: now}, y: channel{at: now}, fresh: true}
 		s.wheel = g
 		if !slices.Contains(rt.wheeling, s.id) {
 			rt.wheeling = append(rt.wheeling, s.id)
@@ -117,6 +118,19 @@ func (rt *engine) glideWheels(now time.Time) {
 			continue
 		}
 		g := s.wheel
+		if g.fresh {
+			g.fresh = false
+			if rt.clock == nil {
+				step := rt.refreshStep()
+				if now.Sub(g.x.at) < step/2 {
+					lead := now.Add(-step)
+					g.x.at, g.y.at = lead, lead
+				}
+			} else if now.Before(g.x.at) {
+				lead := now.Add(-rt.refreshStep())
+				g.x.at, g.y.at = lead, lead
+			}
+		}
 		g.x.advance(now)
 		g.y.advance(now)
 		dx, dy := g.x.value-g.doneX, g.y.value-g.doneY

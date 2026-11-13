@@ -600,11 +600,13 @@ func (b *Builder) Build(s *scene.Scene, image func(*scene.Image) uintptr) *scene
 					boost = scene.ThinBoost
 				}
 				aw, ah := float32(a.W), float32(a.H)
+				m := op.Transform.Mul(g.Transform)
+				gx, gy, ix0, iy0, ix1, iy1 := glyphQuad(g, m.Set)
 				in := Instance{
-					Rect:   [4]float32{float32(math.Round(float64(g.X))), float32(math.Round(float64(g.Y))), float32(g.UW), float32(g.VH)},
+					Rect:   [4]float32{ix0, iy0, ix1 - ix0, iy1 - iy0},
 					Radii:  s.Text.GammaRatios,
 					Inner:  [4]float32{contrast, boost},
-					UV:     [4]float32{float32(g.U) / aw, float32(g.V) / ah, float32(g.U+g.UW) / aw, float32(g.V+g.VH) / ah},
+					UV:     [4]float32{(float32(g.U) + ix0 - gx) / aw, (float32(g.V) + iy0 - gy) / ah, (float32(g.U) + ix1 - gx) / aw, (float32(g.V) + iy1 - gy) / ah},
 					Color:  straight(g.Color),
 					Params: [4]float32{kind, 0, 0, 1},
 				}
@@ -615,7 +617,7 @@ func (b *Builder) Build(s *scene.Scene, image func(*scene.Image) uintptr) *scene
 					in.Color, in.Color2, in.Grad = c1, c2, op.Gradient
 					in.Params[2], in.Params[3] = float32(op.Paint), opacity(op.Opacity)
 				}
-				b.add(in, 0, op.Transform.Mul(g.Transform))
+				b.add(in, 0, m)
 			}
 		case scene.OpEffect:
 			if !op.Rect.Empty() && int(op.Start) < len(s.Effects) && s.Effects[op.Start].Effect != nil {

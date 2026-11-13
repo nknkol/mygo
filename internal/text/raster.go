@@ -196,6 +196,7 @@ func (s *System) makeRoom(color bool, want int, size image.Point, grow bool) {
 			keep = append(keep, e)
 		}
 	}
+	nMasks := len(keep)
 	for k, e := range s.glyphs {
 		if !e.OK || e.inColor() != color {
 			continue // blank glyphs take no room
@@ -206,20 +207,30 @@ func (s *System) makeRoom(color bool, want int, size image.Point, grow bool) {
 		}
 		keep = append(keep, e)
 	}
-	for k, e := range s.runs {
-		if e.inColor() != color {
-			continue
+	for f, byFont := range s.runs {
+		for k, e := range byFont {
+			if e.inColor() != color {
+				continue
+			}
+			if e.used != s.frame {
+				delete(byFont, k)
+				continue
+			}
+			keep = append(keep, e)
 		}
-		if e.used != s.frame {
-			delete(s.runs, k)
-			continue
+		if len(byFont) == 0 {
+			delete(s.runs, f)
 		}
-		keep = append(keep, e)
 	}
 	rects := make([]image.Rectangle, len(keep))
 	for i, e := range keep {
-		rects[i] = image.Rect(int(e.X), int(e.Y), int(e.X)+int(e.W), int(e.Y)+int(e.H))
-		need += (int(e.W) + 1) * (int(e.H) + 1)
+		if i < nMasks {
+			rects[i] = image.Rect(int(e.X), int(e.Y), int(e.X)+int(e.W), int(e.Y)+int(e.H))
+			need += (int(e.W) + 1) * (int(e.H) + 1)
+		} else {
+			rects[i] = image.Rect(int(e.X)-1, int(e.Y)-1, int(e.X)+int(e.W), int(e.Y)+int(e.H))
+			need += (int(e.W) + 2) * (int(e.H) + 2)
+		}
 	}
 	// Shelves waste room: keep the atlas at most half full.
 	if grow {
@@ -235,9 +246,14 @@ func (s *System) makeRoom(color bool, want int, size image.Point, grow bool) {
 				delete(s.glyphs, k)
 			}
 		}
-		for k, e := range s.runs {
-			if e.inColor() == color {
-				delete(s.runs, k)
+		for f, byFont := range s.runs {
+			for k, e := range byFont {
+				if e.inColor() == color {
+					delete(byFont, k)
+				}
+			}
+			if len(byFont) == 0 {
+				delete(s.runs, f)
 			}
 		}
 		if !color {
@@ -246,7 +262,11 @@ func (s *System) makeRoom(color bool, want int, size image.Point, grow bool) {
 		return
 	}
 	for i, e := range keep {
-		e.X, e.Y = uint16(pos[i].X), uint16(pos[i].Y)
+		if i < nMasks {
+			e.X, e.Y = uint16(pos[i].X), uint16(pos[i].Y)
+		} else {
+			e.X, e.Y = uint16(pos[i].X+1), uint16(pos[i].Y+1)
+		}
 	}
 }
 
@@ -374,14 +394,9 @@ func (s *System) rasterize(f *Font, id uint32, scale, dx float32, shade Shade, s
 		return GlyphImage{}
 	}
 	inColor := b.color || b.subpixel
-	x, y, ok := s.alloc(inColor, b.w, b.h)
+	x, y, ok := s.putGlyph(inColor, b)
 	if !ok {
 		return GlyphImage{}
-	}
-	if inColor {
-		s.ColorAtlas.Put(x, y, b.w, b.h, b.pix, 4*b.w)
-	} else {
-		s.MaskAtlas.Put(x, y, b.w, b.h, b.pix, b.w)
 	}
 	return GlyphImage{OK: true, Colored: b.color, Subpixel: b.subpixel, Thin: f.thin && !b.color,
 		X: uint16(x), Y: uint16(y), W: uint16(b.w), H: uint16(b.h), Left: float32(b.left), Top: float32(b.top)}
@@ -398,11 +413,10 @@ func (s *System) rasterizeStroke(f *Font, id uint32, scale, dx float32, shade Sh
 	if b.w > 2048 || b.h > 2048 {
 		return GlyphImage{}
 	}
-	x, y, ok := s.alloc(false, b.w, b.h)
+	x, y, ok := s.putGlyph(false, b)
 	if !ok {
 		return GlyphImage{}
 	}
-	s.MaskAtlas.Put(x, y, b.w, b.h, b.pix, b.w)
 	return GlyphImage{OK: true, X: uint16(x), Y: uint16(y), W: uint16(b.w), H: uint16(b.h), Left: float32(b.left), Top: float32(b.top)}
 }
 
@@ -417,12 +431,43 @@ func (s *System) rasterizeShadow(f *Font, id uint32, scale, dx float32, shade Sh
 	if b.w > 2048 || b.h > 2048 {
 		return GlyphImage{}
 	}
-	x, y, ok := s.alloc(false, b.w, b.h)
+	x, y, ok := s.putGlyph(false, b)
 	if !ok {
 		return GlyphImage{}
 	}
-	s.MaskAtlas.Put(x, y, b.w, b.h, b.pix, b.w)
 	return GlyphImage{OK: true, X: uint16(x), Y: uint16(y), W: uint16(b.w), H: uint16(b.h), Left: float32(b.left), Top: float32(b.top)}
+}
+
+// putGlyph places b in the color or mask atlas with a 1-texel transparent
+// border on its top and left (Atlas.Put adds 1-texel transparent padding on
+// its right and bottom), so hardware bilinear filtering at fractional device
+// pixel coordinates never bleeds across neighboring glyphs or clamps to an
+// ink edge.
+func (s *System) putGlyph(color bool, b bitmap) (int, int, bool) {
+	pw, ph := b.w+1, b.h+1
+	x, y, ok := s.alloc(color, pw, ph)
+	if !ok {
+		return 0, 0, false
+	}
+	a, bpp := s.MaskAtlas, 1
+	if color {
+		a, bpp = s.ColorAtlas, 4
+	}
+	stride := pw * bpp
+	need := stride * ph
+	if cap(s.padBuf) < need {
+		s.padBuf = make([]byte, need)
+	}
+	buf := s.padBuf[:need]
+	clear(buf[:stride])
+	srcRow := b.w * bpp
+	for j := 0; j < b.h; j++ {
+		dst := buf[(j+1)*stride:]
+		clear(dst[:bpp])
+		copy(dst[bpp:bpp+srcRow], b.pix[j*srcRow:][:srcRow])
+	}
+	a.Put(x, y, pw, ph, buf, stride)
+	return x + 1, y + 1, true
 }
 
 // TextParams returns how renderers correct the coverage of glyphs, as

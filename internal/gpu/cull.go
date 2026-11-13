@@ -226,7 +226,8 @@ func glyphsVisible(s *scene.Scene, op *scene.Op, sc Scissor) Scissor {
 	for _, g := range s.Glyphs[op.Start:op.End] {
 		m := op.Transform.Mul(g.Transform)
 		margin = max(margin, cullMargin(m))
-		r := m.Bounds(scene.Rect{X: float32(math.Round(float64(g.X))), Y: float32(math.Round(float64(g.Y))), W: float32(g.UW), H: float32(g.VH)})
+		_, _, ix0, iy0, ix1, iy1 := glyphQuad(g, m.Set)
+		r := m.Bounds(scene.Rect{X: ix0, Y: iy0, W: ix1 - ix0, H: iy1 - iy0})
 		if first {
 			u, first = r, false
 			continue
@@ -294,4 +295,29 @@ func (b *Builder) occluderOf(s *scene.Scene, op *scene.Op, cur *clip) Scissor {
 		int32(math.Floor(float64(cur.rect.X + cur.rect.W))), int32(math.Floor(float64(cur.rect.Y + cur.rect.H))),
 	}
 	return core.intersect(cur.scissor).intersect(inner)
+}
+
+// glyphQuad returns the exact origin (gx, gy) and integer-aligned device
+// pixel bounds [ix0, ix1) × [iy0, iy1) of g. Untransformed glyphs with a
+// 1-texel transparent border in their atlas (U > 0, V > 0) keep fractional
+// device pixel positions (along Y for subpixel RGB glyphs, and along both X
+// and Y for mask/color glyphs) so hardware bilinear filtering interpolates
+// subpixel scroll motion without dropping out of ClassGlyph/ClassSubpixel.
+func glyphQuad(g scene.Glyph, transformed bool) (gx, gy, ix0, iy0, ix1, iy1 float32) {
+	rx, ry := float32(math.Round(float64(g.X))), float32(math.Round(float64(g.Y)))
+	if transformed {
+		return rx, ry, rx, ry, rx + float32(g.UW), ry + float32(g.VH)
+	}
+	gx, gy = g.X, g.Y
+	if g.Subpixel || g.U == 0 || math.Abs(float64(gx-rx)) < 1e-4 {
+		gx = rx
+	}
+	if g.V == 0 || math.Abs(float64(gy-ry)) < 1e-4 {
+		gy = ry
+	}
+	ix0 = float32(math.Floor(float64(gx)))
+	iy0 = float32(math.Floor(float64(gy)))
+	ix1 = float32(math.Ceil(float64(gx))) + float32(g.UW)
+	iy1 = float32(math.Ceil(float64(gy))) + float32(g.VH)
+	return gx, gy, ix0, iy0, ix1, iy1
 }

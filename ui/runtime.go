@@ -335,8 +335,9 @@ type engine struct {
 	// clock is a Tester's time, time.Now when nil.
 	clock func() time.Time
 	// frameAt is the time of the next frame, when the display asked for it
-	// earlier than it draws (windowHost.waitDisplay).
-	frameAt time.Time
+	// earlier than it draws (windowHost.waitDisplay); lastFrameAt keeps live
+	// frame timestamps monotonic when an unpaced frame mixes with VSync times.
+	frameAt, lastFrameAt time.Time
 
 	pointerX, pointerY float32
 	pointerIn          bool
@@ -925,11 +926,25 @@ func (rt *engine) now() time.Time {
 // refresh asked for it, for a frame that waited for the display to be
 // able to show it, so that what moves keeps its pace; now otherwise.
 func (rt *engine) frameTime() time.Time {
-	if t := rt.frameAt; !t.IsZero() {
-		rt.frameAt = time.Time{}
-		return t
+	t := rt.frameAt
+	rt.frameAt = time.Time{}
+	if t.IsZero() {
+		t = rt.now()
 	}
-	return rt.now()
+	if rt.clock == nil && !rt.lastFrameAt.IsZero() && t.Before(rt.lastFrameAt) {
+		t = rt.lastFrameAt
+	}
+	rt.lastFrameAt = t
+	return t
+}
+
+// refreshStep returns one refresh period of the display, or 1/60s when the
+// display's rate is unknown.
+func (rt *engine) refreshStep() time.Duration {
+	if hz := rt.host.refreshRate(); hz > 0 {
+		return time.Duration(float64(time.Second) / float64(hz))
+	}
+	return time.Second / 60
 }
 
 // next asks for the frame that what moves needs: one built anew while the

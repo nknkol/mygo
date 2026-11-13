@@ -900,9 +900,6 @@ func (rt *engine) scroll(dx, dy float32, mods Modifiers, precise, momentum bool)
 		}
 		s.wheel = nil
 		if scrollBy(s, sx, sy) {
-			if precise {
-				s.notePreciseScroll(rt.now(), momentum)
-			}
 			if s.snap != nil {
 				// It rests at a place once the fingers, and the momentum
 				// of their fling, settle.

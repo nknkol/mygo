@@ -793,12 +793,6 @@ type state struct {
 	// and its pressure as of the press's last move (PressedPointer).
 	pressPointer  PointerType
 	pressPressure float32
-	// preciseAt is when a touchpad or touchscreen last scrolled the
-	// element (Precise), and preciseStream tells that more than one move,
-	// or momentum, came in a row, while which its content paints between
-	// pixels and settles onto them once the stream stops.
-	preciseAt     time.Time
-	preciseStream bool
 	// drag follows the press's moves; released tells that it ended since
 	// the last frame, going at releaseVX and releaseVY in the element's
 	// axes, releaseWX and releaseWY in the window's, and canceled that it

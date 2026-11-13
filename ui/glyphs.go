@@ -108,7 +108,8 @@ func (p *Painter) Glyphs(glyphs []Glyph, x, y float32, c Color) {
 	shade := text.ShadeOf(c.R, c.G, c.B)
 	c = c.Alpha(p.opacity)
 	color := c.scene()
-	baseline := sys.Baseline(y * s)
+	baseline, snappedBase := p.snapBaseline(y)
+	cx, fx, hasX := p.snapTextX(x)
 	start := int32(len(p.s.Glyphs))
 	left, right := p.clip.X*s, (p.clip.X+p.clip.W)*s
 	var run *glyphRun
@@ -123,30 +124,41 @@ func (p *Painter) Glyphs(glyphs []Glyph, x, y float32, c Color) {
 		if !p.transform.Set && (pen > right || pen+(g.Advance+g.font.Size)*s < left) {
 			continue
 		}
-		ix := float32(math.Floor(float64(pen)))
+		cPen := pen
+		if hasX {
+			cPen = cx + g.X*s
+		}
 		shade := shade
 		if g.thick {
 			shade = text.Thick
 		} else if g.flat {
 			shade = text.Flat
 		}
-		gi := sys.Glyph(g.font, g.id, s, pen, shade, p.opaque)
+		gi := sys.Glyph(g.font, g.id, s, cPen, shade, p.opaque)
+		if gi.Subpixel && hasX && cPen != pen {
+			gi = sys.Glyph(g.font, g.id, s, pen, shade, p.opaque)
+			cPen = pen
+		}
 		if !gi.OK {
 			continue
 		}
+		gx := float32(math.Floor(float64(cPen))) + gi.Left
+		if hasX && !gi.Subpixel {
+			gx += fx
+		}
 		sg := scene.Glyph{
-			X: ix + gi.Left, Y: baseline + gi.Top, W: float32(gi.W), H: float32(gi.H),
+			X: gx, Y: baseline + gi.Top, W: float32(gi.W), H: float32(gi.H),
 			U: gi.X, V: gi.Y, UW: gi.W, VH: gi.H,
 			Color: color, Wide: p.glyphWide(c), Colored: gi.Colored, Subpixel: gi.Subpixel, Thin: gi.Thin,
 		}
 		if run != nil {
-			run.add(p, text.Glyph{Font: g.font, ID: g.id}, gi, pen, sg, shade, baseline)
+			run.add(p, text.Glyph{Font: g.font, ID: g.id}, gi, cPen, sg, shade, baseline, snappedBase, fx)
 			continue
 		}
 		p.s.Glyphs = append(p.s.Glyphs, sg)
 	}
 	if run != nil {
-		run.flush(p, baseline)
+		run.flush(p, baseline, fx)
 	}
 	if end := int32(len(p.s.Glyphs)); end > start {
 		p.add(scene.Op{Kind: scene.OpGlyphs, Start: start, End: end})
@@ -164,7 +176,8 @@ func (p *Painter) TextLine(l *text.Layout, x, y float32, color func(cluster int)
 	}
 	sys := p.rt.text
 	s := p.scale
-	baseline := sys.Baseline(y * s)
+	baseline, snappedBase := p.snapBaseline(y)
+	cx, fx, hasX := p.snapTextX(x)
 	left, right := p.clip.X*s, (p.clip.X+p.clip.W)*s
 	start := int32(len(p.s.Glyphs))
 	var run *glyphRun
@@ -177,26 +190,38 @@ func (p *Painter) TextLine(l *text.Layout, x, y float32, color func(cluster int)
 		if !p.transform.Set && (pen > right || pen+(g.Advance+g.Size)*s < left) {
 			continue
 		}
+		cPen := pen
+		if hasX {
+			cPen = cx + g.X*s
+		}
 		c := color(g.Cluster)
 		shade := text.ShadeOf(c.R, c.G, c.B)
-		gi := sys.Glyph(g.Font, g.ID, s, pen, shade, p.opaque)
+		gi := sys.Glyph(g.Font, g.ID, s, cPen, shade, p.opaque)
+		if gi.Subpixel && hasX && cPen != pen {
+			gi = sys.Glyph(g.Font, g.ID, s, pen, shade, p.opaque)
+			cPen = pen
+		}
 		if !gi.OK {
 			continue
 		}
+		gx := float32(math.Floor(float64(cPen))) + gi.Left
+		if hasX && !gi.Subpixel {
+			gx += fx
+		}
 		c = c.Alpha(p.opacity)
 		sg := scene.Glyph{
-			X: float32(math.Floor(float64(pen))) + gi.Left, Y: baseline + gi.Top, W: float32(gi.W), H: float32(gi.H),
+			X: gx, Y: baseline + gi.Top, W: float32(gi.W), H: float32(gi.H),
 			U: gi.X, V: gi.Y, UW: gi.W, VH: gi.H,
 			Color: c.scene(), Wide: p.glyphWide(c), Colored: gi.Colored, Subpixel: gi.Subpixel, Thin: gi.Thin,
 		}
 		if run != nil {
-			run.add(p, text.Glyph{Font: g.Font, ID: g.ID}, gi, pen, sg, shade, baseline)
+			run.add(p, text.Glyph{Font: g.Font, ID: g.ID}, gi, cPen, sg, shade, baseline, snappedBase, fx)
 			continue
 		}
 		p.s.Glyphs = append(p.s.Glyphs, sg)
 	}
 	if run != nil {
-		run.flush(p, baseline)
+		run.flush(p, baseline, fx)
 	}
 	if end := int32(len(p.s.Glyphs)); end > start {
 		p.add(scene.Op{Kind: scene.OpGlyphs, Start: start, End: end})

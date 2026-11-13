@@ -1373,3 +1373,38 @@ func TestMovedClipStaysInTheShader(t *testing.T) {
 		t.Fatalf("clip %v, mask mode %v", in.Clip, in.Transform1[3])
 	}
 }
+
+// Untransformed glyphs at fractional scroll baselines expand their pixel quad by 1px and shift UVs for hardware bilinear filtering while remaining in ClassSubpixel/ClassGlyph.
+func TestFractionalSubpixelGlyphStaysInSubpixelClass(t *testing.T) {
+	colorAtlas := scene.NewAtlas(4, 32, 32)
+	maskAtlas := scene.NewAtlas(1, 32, 32)
+	s := &scene.Scene{
+		Width: 200, Height: 200,
+		MaskAtlas: maskAtlas, ColorAtlas: colorAtlas,
+		Glyphs: []scene.Glyph{
+			{X: 12, Y: 20.3, W: 8, H: 10, U: 4, V: 5, UW: 8, VH: 10, Subpixel: true, Color: scene.Color{R: 255, G: 255, B: 255, A: 255}},
+			{X: 30.25, Y: 20.3, W: 8, H: 10, U: 4, V: 5, UW: 8, VH: 10, Color: scene.Color{R: 255, G: 255, B: 255, A: 255}},
+		},
+		Ops: []scene.Op{
+			{Kind: scene.OpGlyphs, Start: 0, End: 1},
+			{Kind: scene.OpGlyphs, Start: 1, End: 2},
+		},
+	}
+	b := Builder{Classes: true, NoJoin: true}
+	defer b.Release()
+	b.Build(s, nil)
+	if len(b.Batches) != 2 || b.Batches[0].Class != ClassSubpixel || b.Batches[1].Class != ClassGlyph {
+		t.Fatalf("batches = %+v, want ClassSubpixel then ClassGlyph", b.Batches)
+	}
+	sub := b.Instances[0]
+	if sub.Transform0[3] != 0 || sub.Rect != [4]float32{12, 20, 8, 11} {
+		t.Fatalf("subpixel instance transform=%v rect=%v, want untransformed [12 20 8 11]", sub.Transform0, sub.Rect)
+	}
+	if wantV0 := float32(5+20-20.3) / 32; sub.UV[1] < wantV0-1e-5 || sub.UV[1] > wantV0+1e-5 {
+		t.Fatalf("subpixel UV.y0 = %v, want %v", sub.UV[1], wantV0)
+	}
+	mask := b.Instances[1]
+	if mask.Transform0[3] != 0 || mask.Rect != [4]float32{30, 20, 9, 11} {
+		t.Fatalf("mask instance transform=%v rect=%v, want untransformed [30 20 9 11]", mask.Transform0, mask.Rect)
+	}
+}

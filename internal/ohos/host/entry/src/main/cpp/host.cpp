@@ -571,16 +571,16 @@ struct WinSession {
     uint32_t requestedFps = 0;
     bool fpsDirty = true;
 
-    // VSync-locked touchpad scroll resampler state (guarded by mu).
-    // Converts ~90-115Hz touchpad axis packets into smooth per-VSync deltas
-    // while strictly conserving 100% of total hardware scroll distance.
+    // VSync-locked 2-pole touchpad scroll resampler state (guarded by mu).
+    // Converts ~90-115Hz touchpad axis packets into smooth, zero-starvation
+    // 120Hz per-VSync deltas while conserving 100% of hardware scroll distance.
+    int64_t lastFrameTimeNs = 0;
     bool scrollAxisActive = false;
     bool scrollCoasting = false;
-    bool scrollFirstStep = false;
-    double scrollRemX = 0.0;
-    double scrollRemY = 0.0;
-    double scrollVelX = 0.0;
-    double scrollVelY = 0.0;
+    double scrollStage1X = 0.0;
+    double scrollStage1Y = 0.0;
+    double scrollStage2X = 0.0;
+    double scrollStage2Y = 0.0;
     int64_t scrollLastEvNs = 0;
     int64_t scrollLastEmitNs = 0;
     uint32_t scrollMods = 0;
@@ -1967,14 +1967,20 @@ void enqueueTouchpadScroll(WinSession *ws, bool coasting, bool isBegin, uint32_t
             ws->scrollAxisActive = false;
             ws->scrollCoasting = true;
         } else {
-            if (ws->scrollCoasting) {
-                ws->scrollRemX = 0.0;
-                ws->scrollRemY = 0.0;
-                ws->scrollVelX = 0.0;
-                ws->scrollVelY = 0.0;
-            }
-            if (isBegin || !ws->scrollAxisActive) {
-                ws->scrollFirstStep = (std::abs(ws->scrollRemX) < 0.05 && std::abs(ws->scrollRemY) < 0.05);
+            if (ws->scrollCoasting || isBegin) {
+                ws->scrollStage1X = 0.0;
+                ws->scrollStage1Y = 0.0;
+                ws->scrollStage2X = 0.0;
+                ws->scrollStage2Y = 0.0;
+            } else {
+                if (dx != 0.0f && static_cast<double>(dx) * (ws->scrollStage1X + ws->scrollStage2X) < 0.0) {
+                    ws->scrollStage1X = 0.0;
+                    ws->scrollStage2X = 0.0;
+                }
+                if (dy != 0.0f && static_cast<double>(dy) * (ws->scrollStage1Y + ws->scrollStage2Y) < 0.0) {
+                    ws->scrollStage1Y = 0.0;
+                    ws->scrollStage2Y = 0.0;
+                }
             }
             ws->scrollAxisActive = true;
             ws->scrollCoasting = false;
@@ -1983,29 +1989,8 @@ void enqueueTouchpadScroll(WinSession *ws, bool coasting, bool isBegin, uint32_t
         ws->scrollPtrX = x;
         ws->scrollPtrY = y;
         if (dx != 0.0f || dy != 0.0f) {
-            double evDt = 0.010;
-            bool freshStream = (ws->scrollLastEvNs <= 0) || ((now - ws->scrollLastEvNs) > 80000000LL);
-            if (!freshStream) {
-                evDt = std::clamp(static_cast<double>(now - ws->scrollLastEvNs) / 1e9, 0.0025, 0.050);
-            } else {
-                ws->scrollFirstStep = true;
-            }
-            auto updateVel = [&](double d, double &vel) {
-                if (d == 0.0) {
-                    vel *= 0.6;
-                    return;
-                }
-                double inst = d / evDt;
-                if (freshStream || (d > 0.0 && vel < 0.0) || (d < 0.0 && vel > 0.0)) {
-                    vel = inst;
-                } else {
-                    vel = 0.45 * inst + 0.55 * vel;
-                }
-            };
-            updateVel(static_cast<double>(dx), ws->scrollVelX);
-            updateVel(static_cast<double>(dy), ws->scrollVelY);
-            ws->scrollRemX += static_cast<double>(dx);
-            ws->scrollRemY += static_cast<double>(dy);
+            ws->scrollStage1X += static_cast<double>(dx);
+            ws->scrollStage1Y += static_cast<double>(dy);
             ws->scrollLastEvNs = now;
             if (ws->renderRunning && !ws->stopRender) {
                 ws->ensureVsyncArmedLocked();
@@ -2029,14 +2014,15 @@ void endTouchpadScrollPhase(WinSession *ws, bool coasting) {
         std::lock_guard<std::mutex> lk(ws->mu);
         if (coasting) {
             ws->scrollCoasting = false;
-            ws->scrollRemX = 0.0;
-            ws->scrollRemY = 0.0;
-            ws->scrollVelX = 0.0;
-            ws->scrollVelY = 0.0;
+            ws->scrollStage1X = 0.0;
+            ws->scrollStage1Y = 0.0;
+            ws->scrollStage2X = 0.0;
+            ws->scrollStage2Y = 0.0;
         } else {
             ws->scrollAxisActive = false;
         }
-        if ((std::abs(ws->scrollRemX) > 0.01 || std::abs(ws->scrollRemY) > 0.01) &&
+        if ((std::abs(ws->scrollStage1X) + std::abs(ws->scrollStage2X) +
+             std::abs(ws->scrollStage1Y) + std::abs(ws->scrollStage2Y) > 1e-4) &&
             ws->renderRunning && !ws->stopRender) {
             ws->ensureVsyncArmedLocked();
             ws->wantFrame = true;
@@ -2059,8 +2045,8 @@ void flushTouchpadScrollImmediate(WinSession *ws) {
     float px = 0.0f, py = 0.0f;
     {
         std::lock_guard<std::mutex> lk(ws->mu);
-        outX = static_cast<float>(ws->scrollRemX);
-        outY = static_cast<float>(ws->scrollRemY);
+        outX = static_cast<float>(ws->scrollStage1X + ws->scrollStage2X);
+        outY = static_cast<float>(ws->scrollStage1Y + ws->scrollStage2Y);
         if (ws->scrollCoasting) {
             flags |= kScrollMomentum;
         }
@@ -2069,11 +2055,10 @@ void flushTouchpadScrollImmediate(WinSession *ws) {
         py = ws->scrollPtrY;
         ws->scrollAxisActive = false;
         ws->scrollCoasting = false;
-        ws->scrollFirstStep = false;
-        ws->scrollRemX = 0.0;
-        ws->scrollRemY = 0.0;
-        ws->scrollVelX = 0.0;
-        ws->scrollVelY = 0.0;
+        ws->scrollStage1X = 0.0;
+        ws->scrollStage1Y = 0.0;
+        ws->scrollStage2X = 0.0;
+        ws->scrollStage2Y = 0.0;
         ws->scrollLastEmitNs = 0;
     }
     if (std::abs(outX) > 1e-4f || std::abs(outY) > 1e-4f) {
@@ -4509,7 +4494,7 @@ void OnNodeEvent(ArkUI_NodeEvent *event) {
             return;
         }
         flushTouchpadScrollImmediate(ws.get());
-        constexpr double kDipPerDeg = 50.0 / 45.0;
+        constexpr double kDipPerDeg = 90.0 / 45.0;
         float dx = static_cast<float>(horiz * kDipPerDeg);
         float dy = static_cast<float>(vert * kDipPerDeg);
         if (dx != 0 || dy != 0) {
@@ -5226,17 +5211,30 @@ void WinSession::renderLoop() {
             const int64_t periodNs = vsyncPeriodHwNs > 0
                 ? vsyncPeriodHwNs
                 : static_cast<int64_t>(1e9 / std::max(60.0, refresh));
-            // Immediate dispatch (0ms VSync wait, matching macOS drawSoon) when:
-            //   1. First frame on this surface (lastFlushNs == 0), OR
-            //   2. Surface was idle for >= 1 refresh period before input woke it, OR
-            //   3. A hardware VSync boundary has already passed since the last FlushBuffer.
-            // Only wait when a frame was already flushed in this [VSync_k, VSync_{k+1}) slot.
-            const bool needWait = (lastFlushNs > 0) &&
-                                  ((vsCheckNs - lastFlushNs) < periodNs) &&
-                                  (vsyncSeq <= lastFlushVsyncSeq);
+            const bool scrollActive = scrollAxisActive || scrollCoasting ||
+                (std::abs(scrollStage1X) + std::abs(scrollStage2X) +
+                 std::abs(scrollStage1Y) + std::abs(scrollStage2Y) > 1e-4);
+            // Lock touchpad scroll streams strictly onto hardware VSync ticks so
+            // Frame 1 and Frame 2 never fire 1ms apart and starve the resampler;
+            // keep 0ms drawSoon dispatch for discrete clicks, keys and wheel start.
+            uint64_t waitTargetSeq = 0;
+            bool needWait = false;
+            if (scrollActive) {
+                if (vsyncSeq <= lastFlushVsyncSeq) {
+                    needWait = true;
+                    waitTargetSeq = lastFlushVsyncSeq + 1;
+                } else if (vsyncHwNs <= 0 || (vsCheckNs - vsyncHwNs) > 2000000LL) {
+                    needWait = true;
+                    waitTargetSeq = vsyncSeq + 1;
+                }
+            } else if ((lastFlushNs > 0) &&
+                       ((vsCheckNs - lastFlushNs) < periodNs) &&
+                       (vsyncSeq <= lastFlushVsyncSeq)) {
+                needWait = true;
+                waitTargetSeq = lastFlushVsyncSeq + 1;
+            }
             if (needWait) {
                 ensureVsyncArmedLocked();
-                const uint64_t waitTargetSeq = lastFlushVsyncSeq + 1;
                 const auto maxWait = std::chrono::nanoseconds(std::max<int64_t>(periodNs * 2, 20000000LL));
                 cv.wait_for(lk, maxWait, [&] {
                     return stopRender || forceResendSurface ||
@@ -5256,9 +5254,14 @@ void WinSession::renderLoop() {
                 continue;
             }
             const int64_t nowFrameNs = monoNs();
-            frameTimeNs = (vsyncHwNs > 0 && std::llabs(nowFrameNs - vsyncHwNs) <= 25000000LL)
+            const int64_t maxVsAgeNs = needWait ? 25000000LL : 2000000LL;
+            frameTimeNs = (vsyncHwNs > 0 && std::llabs(nowFrameNs - vsyncHwNs) <= maxVsAgeNs)
                 ? vsyncHwNs
                 : nowFrameNs;
+            if (frameTimeNs <= lastFrameTimeNs) {
+                frameTimeNs = lastFrameTimeNs + 1000000LL;
+            }
+            lastFrameTimeNs = frameTimeNs;
             clearReplyFenceLocked();
             reply = BufReply::None;
         } else {
@@ -5273,13 +5276,17 @@ void WinSession::renderLoop() {
                 continue;
             }
             frameTimeNs = monoNs();
+            if (frameTimeNs <= lastFrameTimeNs) {
+                frameTimeNs = lastFrameTimeNs + 1000000LL;
+            }
+            lastFrameTimeNs = frameTimeNs;
             clearReplyFenceLocked();
             reply = BufReply::None;
         }
 
-        // Emit VSync-resampled touchpad scroll delta right before kFrame so
-        // every 120Hz refresh advances by a smooth velocity-locked step even
-        // when the touchpad hardware reports at ~93-114Hz.
+        // Emit 2-pole VSync-resampled touchpad scroll delta right before kFrame
+        // so start, intermittent nudges, and continuous 93Hz packets all glide
+        // smoothly at 120Hz while conserving 100% of total scroll distance.
         {
             float emitDX = 0.0f, emitDY = 0.0f;
             uint8_t emitFlags = kScrollPrecise;
@@ -5292,55 +5299,39 @@ void WinSession::renderLoop() {
                 if (idleNs > 90000000LL) {
                     scrollAxisActive = false;
                     scrollCoasting = false;
-                    scrollVelX = 0.0;
-                    scrollVelY = 0.0;
-                } else if (idleNs > 35000000LL) {
-                    scrollVelX *= 0.25;
-                    scrollVelY *= 0.25;
                 }
-                const bool liveStream = (scrollAxisActive || scrollCoasting) && (idleNs <= 32000000LL);
-                const bool hasRem = std::abs(scrollRemX) > 1e-4 || std::abs(scrollRemY) > 1e-4;
-                if (hasRem) {
+                const bool liveStream = (scrollAxisActive || scrollCoasting) && (idleNs <= 28000000LL);
+                const double pending = std::abs(scrollStage1X) + std::abs(scrollStage2X) +
+                                       std::abs(scrollStage1Y) + std::abs(scrollStage2Y);
+                if (pending > 1e-4) {
                     double dt = 1.0 / std::max(60.0, refresh);
                     if (scrollLastEmitNs > 0 && frameTimeNs > scrollLastEmitNs) {
                         dt = std::clamp(static_cast<double>(frameTimeNs - scrollLastEmitNs) / 1e9, 0.004, 0.025);
                     }
-                    const bool firstStep = scrollFirstStep;
-                    scrollFirstStep = false;
-                    auto stepAxis = [&](double &rem, double vel) -> float {
-                        if (std::abs(rem) <= 1e-4) {
-                            rem = 0.0;
+                    const double tau = liveStream ? 0.0095 : 0.0070;
+                    const double alpha = 1.0 - std::exp(-dt / tau);
+                    auto stepCascade = [&](double &s1, double &s2) -> float {
+                        const double tot = std::abs(s1) + std::abs(s2);
+                        if (tot <= 1e-4) {
+                            s1 = 0.0;
+                            s2 = 0.0;
                             return 0.0f;
                         }
-                        if (!liveStream) {
-                            if (std::abs(rem) <= 0.08) {
-                                double s = rem;
-                                rem = 0.0;
-                                return static_cast<float>(s);
-                            }
-                            double s = rem * 0.65;
-                            rem -= s;
-                            return static_cast<float>(s);
+                        if (!liveStream && tot <= 0.02) {
+                            double out = s1 + s2;
+                            s1 = 0.0;
+                            s2 = 0.0;
+                            return static_cast<float>(out);
                         }
-                        if (firstStep) {
-                            // Immediate low-latency first step while retaining a 1-packet
-                            // cushion so asynchronous 93Hz packets never starve 120Hz VSyncs.
-                            double s = rem * 0.45;
-                            rem -= s;
-                            return static_cast<float>(s);
-                        }
-                        const double targetRem = vel * 0.012;
-                        double s = vel * dt + 0.16 * (rem - targetRem);
-                        if (rem > 0.0) {
-                            s = std::clamp(s, 0.0, rem);
-                        } else {
-                            s = std::clamp(s, rem, 0.0);
-                        }
-                        rem -= s;
-                        return static_cast<float>(s);
+                        const double m1 = s1 * alpha;
+                        s1 -= m1;
+                        s2 += m1;
+                        const double out = s2 * alpha;
+                        s2 -= out;
+                        return static_cast<float>(out);
                     };
-                    emitDX = stepAxis(scrollRemX, scrollVelX);
-                    emitDY = stepAxis(scrollRemY, scrollVelY);
+                    emitDX = stepCascade(scrollStage1X, scrollStage2X);
+                    emitDY = stepCascade(scrollStage1Y, scrollStage2Y);
                     if (std::abs(emitDX) > 1e-4f || std::abs(emitDY) > 1e-4f) {
                         shouldEmit = true;
                         if (scrollCoasting) {
@@ -5350,6 +5341,12 @@ void WinSession::renderLoop() {
                         emitPX = scrollPtrX;
                         emitPY = scrollPtrY;
                         scrollLastEmitNs = frameTimeNs;
+                    }
+                    if ((std::abs(scrollStage1X) + std::abs(scrollStage2X) +
+                         std::abs(scrollStage1Y) + std::abs(scrollStage2Y)) > 1e-4 &&
+                        !stopRender) {
+                        wantFrame = true;
+                        ensureVsyncArmedLocked();
                     }
                 } else if (!liveStream) {
                     scrollLastEmitNs = 0;
@@ -5569,7 +5566,8 @@ void WinSession::renderLoop() {
         {
             std::lock_guard<std::mutex> lk(mu);
             lastFlushVsyncSeq = vsyncSeq;
-            const bool scrollPending = std::abs(scrollRemX) > 0.01 || std::abs(scrollRemY) > 0.01;
+            const bool scrollPending = (std::abs(scrollStage1X) + std::abs(scrollStage2X) +
+                                        std::abs(scrollStage1Y) + std::abs(scrollStage2Y)) > 1e-4;
             const bool scrollLive = (scrollAxisActive || scrollCoasting) &&
                                     scrollLastEvNs > 0 && (nowNs - scrollLastEvNs) <= 28000000LL;
             if ((scrollPending || scrollLive) && !stopRender) {

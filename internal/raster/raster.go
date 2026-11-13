@@ -1416,9 +1416,18 @@ func (r *renderer) glyphs(op *scene.Op) {
 		if atlas == nil {
 			continue
 		}
-		gx, gy := int(math.Round(float64(g.X))), int(math.Round(float64(g.Y)))
-		x0, y0 := max(gx, r.x0), max(gy, r.y0)
-		x1, y1 := min(gx+int(g.UW), r.x1), min(gy+int(g.VH), r.y1)
+		rx, ry := float32(math.Round(float64(g.X))), float32(math.Round(float64(g.Y)))
+		fx, fy := g.X, g.Y
+		if g.Subpixel || g.U == 0 || abs(fx-rx) < 1e-4 {
+			fx = rx
+		}
+		if g.V == 0 || abs(fy-ry) < 1e-4 {
+			fy = ry
+		}
+		ix0, iy0 := int(math.Floor(float64(fx))), int(math.Floor(float64(fy)))
+		ix1, iy1 := int(math.Ceil(float64(fx)))+int(g.UW), int(math.Ceil(float64(fy)))+int(g.VH)
+		x0, y0 := max(ix0, r.x0), max(iy0, r.y0)
+		x1, y1 := min(ix1, r.x1), min(iy1, r.y1)
 		if x0 >= x1 || y0 >= y1 {
 			continue
 		}
@@ -1432,6 +1441,11 @@ func (r *renderer) glyphs(op *scene.Op) {
 			boost = scene.ThinBoost
 		}
 		correct := contrast != 0 || boost != 0 || text.GammaRatios != [4]float32{}
+		if fx != rx || fy != ry {
+			r.glyphBilinear(atlas, g, fx, fy, x0, y0, x1, y1, pt, tint, alpha, contrast, boost, correct)
+			continue
+		}
+		gx, gy := ix0, iy0
 		if !g.Colored && !g.Subpixel && pt == nil && !correct && g.Color.A == 255 {
 			r.maskOpaque(atlas, g, gx, gy, image.Rect(x0, y0, x1, y1))
 			continue
@@ -1482,6 +1496,95 @@ func (r *renderer) glyphs(op *scene.Op) {
 					}
 					blend(p, tint, cov*a)
 				}
+			}
+		}
+	}
+}
+
+// glyphBilinear draws an untransformed glyph at fractional device pixel
+// coordinates (fx, fy) using 2×2 bilinear filtering against a 1-texel
+// transparent border, matching GPU hardware bilinear sampling in ClassGlyph
+// and ClassSubpixel without losing LCD RGB subpixel coverage.
+func (r *renderer) glyphBilinear(atlas *scene.Atlas, g scene.Glyph, fx, fy float32, x0, y0, x1, y1 int, pt *painter, tint [4]float32, alpha, contrast, boost float32, correct bool) {
+	text := r.s.Text
+	uw, vh := int(g.UW), int(g.VH)
+	au, av := int(g.U), int(g.V)
+	bpp := atlas.BPP
+	for y := y0; y < y1; y++ {
+		row := r.dst.Pix[y*r.dst.Stride:]
+		cl, ch := r.clipSolid(y)
+		v := float32(y) - fy
+		iy := int(math.Floor(float64(v)))
+		ty := v - float32(iy)
+		for x := x0; x < x1; x++ {
+			cov := float32(1)
+			if x < cl || x >= ch {
+				if cov = r.clipCoverage(x, y); cov == 0 {
+					continue
+				}
+			}
+			u := float32(x) - fx
+			ix := int(math.Floor(float64(u)))
+			tx := u - float32(ix)
+			var s [4]float32
+			for j := range 2 {
+				sy := iy + j
+				if sy < 0 || sy >= vh {
+					continue
+				}
+				wy := 1 - ty
+				if j == 1 {
+					wy = ty
+				}
+				for i := range 2 {
+					sx := ix + i
+					if sx < 0 || sx >= uw {
+						continue
+					}
+					wx := 1 - tx
+					if i == 1 {
+						wx = tx
+					}
+					w := wx * wy / 255
+					idx := ((av+sy)*atlas.W + au + sx) * bpp
+					for k := range bpp {
+						s[k] += float32(atlas.Pix[idx+k]) * w
+					}
+				}
+			}
+			p := row[4*x : 4*x+4]
+			switch {
+			case g.Colored:
+				if s[3] == 0 && s[0] == 0 && s[1] == 0 && s[2] == 0 {
+					continue
+				}
+				c := [4]float32{s[0] * alpha, s[1] * alpha, s[2] * alpha, s[3] * alpha}
+				blend(p, c, cov)
+			case g.Subpixel:
+				if s[0] == 0 && s[1] == 0 && s[2] == 0 {
+					continue
+				}
+				if pt != nil {
+					tint = pt.at(float32(x)+0.5, float32(y)+0.5)
+				}
+				c := unpremul(tint)
+				a := [3]float32{s[0], s[1], s[2]}
+				if correct {
+					a = scene.SubpixelCoverage(a, c, contrast, boost, text.GammaRatios)
+				}
+				blendSubpixel(p, c, a, tint[3]*cov)
+			default:
+				if s[0] == 0 {
+					continue
+				}
+				if pt != nil {
+					tint = pt.at(float32(x)+0.5, float32(y)+0.5)
+				}
+				a := s[0]
+				if correct {
+					a = scene.TextCoverage(a, unpremul(tint), contrast, boost, text.GammaRatios)
+				}
+				blend(p, tint, cov*a)
 			}
 		}
 	}
