@@ -67,6 +67,9 @@ func (rt *engine) event(ev platform.SurfaceEvent) (taken bool) {
 	}
 	switch ev.Kind {
 	case platform.SurfaceFrame:
+		if !ev.Time.IsZero() && rt.frameAt.IsZero() && rt.clock == nil {
+			rt.frameAt = ev.Time
+		}
 		rt.surfaceFrame()
 	case platform.SurfaceResize:
 		rt.requestFrame()
@@ -897,6 +900,9 @@ func (rt *engine) scroll(dx, dy float32, mods Modifiers, precise, momentum bool)
 		}
 		s.wheel = nil
 		if scrollBy(s, sx, sy) {
+			if precise {
+				s.notePreciseScroll(rt.now(), momentum)
+			}
 			if s.snap != nil {
 				// It rests at a place once the fingers, and the momentum
 				// of their fling, settle.

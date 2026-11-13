@@ -347,7 +347,11 @@ func (h *windowHost) event(ev platform.SurfaceEvent) bool {
 		}
 	}
 	if ev.Kind == platform.SurfaceFrame {
-		if ev.Paced && h.waitDisplay(time.Now()) {
+		at := ev.Time
+		if at.IsZero() {
+			at = time.Now()
+		}
+		if ev.Paced && h.waitDisplay(at) {
 			return true
 		}
 		h.waiting, h.waitingOn = false, nil

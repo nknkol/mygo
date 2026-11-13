@@ -7,8 +7,9 @@ import (
 )
 
 // wheelAnimation is how the notches of a mouse wheel scroll: along a short
-// ease out, as browsers scroll them, rather than the whole notch at once.
-var wheelAnimation = Animation{Duration: 150 * time.Millisecond, Ease: EaseOut}
+// critically-damped spring, keeping the content's velocity as consecutive
+// notches arrive rather than restarting from a step in speed.
+var wheelAnimation = Animation{Spring: SpringOptions{Duration: 220 * time.Millisecond}}
 
 // wheelGlide is the notches of a wheel on their way through a scroll
 // container: x and y go from 0 to as far as all of them scroll, and done

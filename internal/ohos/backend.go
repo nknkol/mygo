@@ -973,6 +973,10 @@ func (b *Backend) onFrame(payload []byte, fd int) {
 	h := int(binary.LittleEndian.Uint32(payload[16:]))
 	stride := int(binary.LittleEndian.Uint32(payload[20:]))
 	size := int(binary.LittleEndian.Uint32(payload[24:]))
+	var frameTime time.Time
+	if len(payload) >= 36 {
+		frameTime = monoTime(int64(binary.LittleEndian.Uint64(payload[28:])))
+	}
 	if size > 0 && fd < 0 {
 		return
 	}
@@ -1031,11 +1035,17 @@ func (b *Backend) onFrame(payload []byte, fd int) {
 		if hz > 0 {
 			dt = 1.0 / hz
 		}
+		if !frameTime.IsZero() && !bufs.lastFrameTime.IsZero() {
+			if d := frameTime.Sub(bufs.lastFrameTime).Seconds(); d >= 0.004 && d <= 0.025 {
+				dt = d
+			}
+		}
 		if ev, ok := bufs.touch.stepFling(dt); ok {
 			bufs.send(ev)
 		}
 	}
-	bufs.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame, Paced: true})
+	bufs.lastFrameTime = frameTime
+	bufs.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame, Paced: true, Time: frameTime})
 
 	bufs.mu.Lock()
 	bufs.inFrame = false

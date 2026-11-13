@@ -47,6 +47,10 @@ type Painter struct {
 	// over the rest of its layer (matches.paint), which elsewhere paints
 	// nothing.
 	lifting *node
+	// subpixelX and subpixelY place flowing content of a scrolling
+	// container between device pixels while it moves, keeping sizes whole
+	// so rows, icons and text glide continuously without height stepping.
+	subpixelX, subpixelY bool
 }
 
 // opaqueBox is the box of an element painting an opaque background, and
@@ -170,12 +174,81 @@ func (p *Painter) After(d time.Duration) {
 }
 
 // snap converts a rectangle to device pixels, rounding its edges to whole
-// pixels so that edges stay crisp.
+// pixels so that edges stay crisp, or keeping fractional position with a
+// constant pixel size along axes that are actively scrolling.
 func (p *Painter) snap(r Rect) scene.Rect {
 	s := p.scale
 	x0, y0 := round(r.X*s), round(r.Y*s)
-	x1, y1 := round((r.X+r.W)*s), round((r.Y+r.H)*s)
-	return scene.Rect{X: x0, Y: y0, W: x1 - x0, H: y1 - y0}
+	w, h := round((r.X+r.W)*s)-x0, round((r.Y+r.H)*s)-y0
+	if p.subpixelX {
+		x0, w = r.X*s, round(r.W*s)
+	}
+	if p.subpixelY {
+		y0, h = r.Y*s, round(r.H*s)
+	}
+	return scene.Rect{X: x0, Y: y0, W: w, H: h}
+}
+
+const preciseSettleWindow = 100 * time.Millisecond
+
+func (s *state) notePreciseScroll(now time.Time, momentum bool) {
+	if momentum || !s.preciseAt.IsZero() && now.Sub(s.preciseAt) <= 120*time.Millisecond {
+		s.preciseStream = true
+	} else {
+		s.preciseStream = false
+	}
+	s.preciseAt = now
+}
+
+func (s *state) preciseSettle(now time.Time) time.Duration {
+	if !s.preciseStream || s.preciseAt.IsZero() {
+		return 0
+	}
+	d := now.Sub(s.preciseAt)
+	if d < 0 {
+		return preciseSettleWindow
+	}
+	if d >= preciseSettleWindow {
+		s.preciseStream = false
+		return 0
+	}
+	return preciseSettleWindow - d
+}
+
+// scrollMotion reports which axes of e actively scroll right now, arming a
+// repaint once a touchpad stream settles so stationary text lands back on
+// whole pixels.
+func (p *Painter) scrollMotion(e *node) (subX, subY bool) {
+	if !e.scrolls() {
+		return false, false
+	}
+	st := e.st
+	moving := st.wheel != nil ||
+		e.track != nil && e.track.glide != nil ||
+		st.list != nil && (st.list.followLag.moving || st.list.followLag.pending) ||
+		st.snap != nil && slices.Contains(p.rt.snapping, e.id) ||
+		p.rt.scrollDrag.st == st
+	if !moving {
+		rem := st.preciseSettle(p.rt.c.now)
+		if rem <= 0 {
+			return false, false
+		}
+		if p.s == &p.rt.scene {
+			p.After(rem)
+		}
+	}
+	return e.flags&flagScrollX != 0, e.flags&flagScrollY != 0
+}
+
+func glyphShift(m scene.Affine, fx, fy float32) scene.Affine {
+	if abs32(fx) <= 1e-3 && abs32(fy) <= 1e-3 {
+		return m
+	}
+	t := scene.Translation(fx, fy)
+	if !m.Set {
+		return t
+	}
+	return t.Mul(m)
 }
 
 func round(v float32) float32 { return float32(math.Round(float64(v))) }
@@ -421,6 +494,9 @@ func (p *Painter) element(e *node) {
 		inner, rad := e.clipRect()
 		p.pushClip(inner, rad)
 	}
+	scrollSubX, scrollSubY := p.scrollMotion(e)
+	savedSubX, savedSubY := p.subpixelX, p.subpixelY
+	flowSubX, flowSubY := savedSubX || scrollSubX, savedSubY || scrollSubY
 	if !clips || p.clip.W > 0 && p.clip.H > 0 {
 		zOrder := e.zOrder && e != e.c.overlay && zPaint != nil
 		if e.ghosts && !zOrder {
@@ -428,7 +504,11 @@ func (p *Painter) element(e *node) {
 			// those of the same one (paintByZ).
 			for c := e.first; c != nil; c = c.next {
 				if c.leaving != 0 {
+					if c.flags&flagAbsolute == 0 && !c.sticky {
+						p.subpixelX, p.subpixelY = flowSubX, flowSubY
+					}
 					p.element(c)
+					p.subpixelX, p.subpixelY = savedSubX, savedSubY
 				}
 			}
 		}
@@ -439,6 +519,7 @@ func (p *Painter) element(e *node) {
 			// its overlays, or their overlay, under those after it.
 			m := p.rt.matches
 			layers := m != nil && e == e.c.overlay
+			p.subpixelX, p.subpixelY = flowSubX, flowSubY
 			for c := e.first; c != nil; c = c.next {
 				if c.flags&flagAbsolute == 0 && !c.sticky && p.paintable(c) {
 					p.element(c)
@@ -450,6 +531,7 @@ func (p *Painter) element(e *node) {
 			if e.flags&flagDividers != 0 && !e.grid {
 				p.dividers(e)
 			}
+			p.subpixelX, p.subpixelY = savedSubX, savedSubY
 			content := m != nil && e.parent == nil
 			for c := e.first; c != nil; c = c.next {
 				if content && c == e.c.overlay {
@@ -830,10 +912,17 @@ func (p *Painter) divider(row bool, at, lo, hi, width float32, c Color) {
 	s := p.scale
 	t := max(round(width*s), 1)
 	a := round(at*s - t/2)
-	r := scene.Rect{X: round(lo * s), Y: a, W: round(hi*s) - round(lo*s), H: t}
+	if row && p.subpixelX || !row && p.subpixelY {
+		a = at*s - t/2
+	}
+	x0, x1 := round(lo*s), round(hi*s)
+	if !row && p.subpixelX || row && p.subpixelY {
+		x0, x1 = lo*s, x0+round((hi-lo)*s)
+	}
+	r := scene.Rect{X: x0, Y: a, W: x1 - x0, H: t}
 	box := Rect{lo, a / s, hi - lo, t / s}
 	if row {
-		r = scene.Rect{X: a, Y: round(lo * s), W: t, H: round(hi*s) - round(lo*s)}
+		r = scene.Rect{X: a, Y: x0, W: t, H: x1 - x0}
 		box = Rect{a / s, lo, t / s, hi - lo}
 	}
 	if !p.visible(box, 0) {
@@ -990,15 +1079,28 @@ func (p *Painter) textForeground(l *text.Layout, x, y float32, color Color, ts t
 		run = &p.rt.glyphRun
 		run.ids, run.pens, run.glyphs = run.ids[:0], run.pens[:0], run.glyphs[:0]
 	}
+	var sx, fx float32
+	if p.subpixelX {
+		sx = round(x * s)
+		fx = x*s - sx
+	}
 	for li := range l.Lines {
 		line := &l.Lines[li]
 		if clips && (y+line.Y > p.clip.Y+p.clip.H || y+line.Y+line.Height < p.clip.Y) {
 			continue
 		}
-		baseline := sys.Baseline((y + line.Baseline) * s)
+		exactBase := (y + line.Baseline) * s
+		baseline := sys.Baseline(exactBase)
+		fy := float32(0)
+		if p.subpixelY {
+			fy = exactBase - baseline
+		}
 		for _, g := range line.Glyphs {
 			pen := (x + g.X) * s
-			if g.Object || clips && (pen > (p.clip.X+p.clip.W)*s || pen+(g.Advance+g.Size)*s < p.clip.X*s) {
+			if p.subpixelX {
+				pen = sx + g.X*s
+			}
+			if g.Object || clips && (pen+fx > (p.clip.X+p.clip.W)*s || pen+fx+(g.Advance+g.Size)*s < p.clip.X*s) {
 				continue
 			}
 			ix := float32(math.Floor(float64(pen)))
@@ -1019,7 +1121,7 @@ func (p *Painter) textForeground(l *text.Layout, x, y float32, color Color, ts t
 			sg := scene.Glyph{
 				X: ix + gi.Left, Y: baseline + gi.Top, W: float32(gi.W), H: float32(gi.H),
 				U: gi.X, V: gi.Y, UW: gi.W, VH: gi.H,
-				Transform: p.inlineTransform(g.Cluster).Pixels(s),
+				Transform: glyphShift(p.inlineTransform(g.Cluster).Pixels(s), fx, fy),
 				Color:     glyphColor.scene(), Wide: p.glyphWide(glyphColor), Colored: gi.Colored, Subpixel: gi.Subpixel, Thin: gi.Thin,
 			}
 			if run != nil {
@@ -1071,16 +1173,29 @@ func (p *Painter) textStrokes(l *text.Layout, x, y float32, color Color, ts text
 	s := p.scale
 	shade := text.ShadeOf(color.R, color.G, color.B)
 	start := int32(len(p.s.Glyphs))
+	var sx, fx float32
+	if p.subpixelX {
+		sx = round(x * s)
+		fx = x*s - sx
+	}
 	for li := range l.Lines {
 		line := &l.Lines[li]
 		if clips && (y+line.Y > p.clip.Y+p.clip.H || y+line.Y+line.Height < p.clip.Y) {
 			continue
 		}
-		baseline := sys.Baseline((y + line.Baseline) * s)
+		exactBase := (y + line.Baseline) * s
+		baseline := sys.Baseline(exactBase)
+		fy := float32(0)
+		if p.subpixelY {
+			fy = exactBase - baseline
+		}
 		for _, g := range line.Glyphs {
 			pen := (x + g.X) * s
+			if p.subpixelX {
+				pen = sx + g.X*s
+			}
 			width, stroke := ts.strokeWidth, ts.strokeColor
-			if g.Object || clips && (pen > (p.clip.X+p.clip.W+width)*s || pen+(g.Advance+g.Size+width)*s < p.clip.X*s) {
+			if g.Object || clips && (pen+fx > (p.clip.X+p.clip.W+width)*s || pen+fx+(g.Advance+g.Size+width)*s < p.clip.X*s) {
 				continue
 			}
 			glyphShade := shade
@@ -1102,7 +1217,7 @@ func (p *Painter) textStrokes(l *text.Layout, x, y float32, color Color, ts text
 			p.s.Glyphs = append(p.s.Glyphs, scene.Glyph{
 				X: float32(math.Floor(float64(pen))) + gi.Left, Y: baseline + gi.Top, W: float32(gi.W), H: float32(gi.H),
 				U: gi.X, V: gi.Y, UW: gi.W, VH: gi.H,
-				Transform: p.inlineTransform(g.Cluster).Pixels(s),
+				Transform: glyphShift(p.inlineTransform(g.Cluster).Pixels(s), fx, fy),
 				Color:     stroke.scene(), Wide: p.glyphWide(stroke),
 			})
 		}
@@ -1170,15 +1285,26 @@ func (p *Painter) textShadows(l *text.Layout, x, y float32, color Color, ts text
 				continue
 			}
 			pen := gx * s
+			var fx, fy float32
+			if p.subpixelX {
+				sx := round((x + sh.x) * s)
+				fx = (x+sh.x)*s - sx
+				pen = sx + g.X*s
+			}
+			exactBase := (y + line.Baseline + sh.y) * s
+			baseline := sys.Baseline(exactBase)
+			if p.subpixelY {
+				fy = exactBase - baseline
+			}
 			gi := shadowGlyph(sys, g.Font, g.ID, s, pen, glyphShade, p.opaque && !moves, sh.blur/2*s)
 			if !gi.OK {
 				continue
 			}
 			c := sh.color.Alpha(p.opacity)
 			p.s.Glyphs = append(p.s.Glyphs, scene.Glyph{
-				X: float32(math.Floor(float64(pen))) + gi.Left, Y: sys.Baseline((y+line.Baseline+sh.y)*s) + gi.Top, W: float32(gi.W), H: float32(gi.H),
+				X: float32(math.Floor(float64(pen))) + gi.Left, Y: baseline + gi.Top, W: float32(gi.W), H: float32(gi.H),
 				U: gi.X, V: gi.Y, UW: gi.W, VH: gi.H,
-				Transform: p.inlineTransform(g.Cluster).Pixels(s),
+				Transform: glyphShift(p.inlineTransform(g.Cluster).Pixels(s), fx, fy),
 				Color:     c.scene(), Wide: p.glyphWide(c),
 			})
 		}
@@ -1282,6 +1408,17 @@ func (p *Painter) decorationRun(l *text.Layout, li, i, j int, x, y float32, d de
 	if d.color.A > 0 {
 		c = d.color
 	}
+	s := p.scale
+	dx, dy := x, y
+	var fx, fy float32
+	if p.subpixelX {
+		sx := round(x * s)
+		dx, fx = sx/s, x*s-sx
+	}
+	if p.subpixelY {
+		sy := round(y * s)
+		dy, fy = sy/s, y*s-sy
+	}
 	for _, k := range [2]text.Decoration{text.Underline, text.Strikethrough} {
 		if k == text.Underline && !d.underline || k == text.Strikethrough && !d.strike {
 			continue
@@ -1290,7 +1427,9 @@ func (p *Painter) decorationRun(l *text.Layout, li, i, j int, x, y float32, d de
 		if k == text.Underline && d.solid {
 			kind = text.SolidUnderline
 		}
-		for _, st := range p.rt.text.Decorate(l, li, i, j, x, y, p.scale, kind, d.lineStyle()) {
+		for _, st := range p.rt.text.Decorate(l, li, i, j, dx, dy, s, kind, d.lineStyle()) {
+			st.X0, st.X1 = st.X0+fx, st.X1+fx
+			st.Top, st.Bottom = st.Top+fy, st.Bottom+fy
 			if st.X1 <= st.X0 || st.Bottom <= st.Top {
 				continue
 			}

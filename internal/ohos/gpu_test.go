@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/egoist/mygo/internal/gpu/gl"
@@ -526,5 +527,80 @@ func TestGPUZeroCopySwapchainBlitsAndExportsReleaseFence(t *testing.T) {
 	}
 	if got := pixelAt(ring[0], 22, 6); got != [4]byte{20, 30, 40, 255} {
 		t.Fatalf("ring[0] after Idle (22,6) = %v, want clear [20 30 40 255]", got)
+	}
+}
+
+// Frame messages carrying a 36-byte hardware VSync timestamp propagate that monotonic timestamp onto SurfaceFrame while preserving 28-byte compatibility.
+func TestOnFramePropagatesHardwareVsyncTime(t *testing.T) {
+	b, s, hostConn, h := newTestSurface(t)
+
+	var gotTime time.Time
+	h.take = func(ev platform.SurfaceEvent) bool {
+		if ev.Kind == platform.SurfaceFrame {
+			gotTime = ev.Time
+			s.PresentPixels(make([]byte, 16*16*4), 16*4, 16, 16)
+		}
+		return false
+	}
+
+	tmp, err := os.CreateTemp(t.TempDir(), "ohos-vsync-*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer tmp.Close()
+	if err := tmp.Truncate(16 * 16 * 4); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+
+	var ts syscall.Timespec
+	if _, _, errno := syscall.Syscall(syscall.SYS_CLOCK_GETTIME, 1, uintptr(unsafe.Pointer(&ts)), 0); errno != 0 {
+		t.Fatalf("clock_gettime: %v", errno)
+	}
+	vsyncNs := int64(ts.Sec)*1_000_000_000 + int64(ts.Nsec) - int64(3*time.Millisecond)
+	expect := time.Now().Add(-3 * time.Millisecond)
+
+	dupFD, err := syscall.Dup(int(tmp.Fd()))
+	if err != nil {
+		t.Fatalf("Dup: %v", err)
+	}
+	p := make([]byte, 36)
+	binary.LittleEndian.PutUint32(p[0:], 1)
+	binary.LittleEndian.PutUint32(p[4:], 1)
+	binary.LittleEndian.PutUint32(p[8:], 1)
+	binary.LittleEndian.PutUint32(p[12:], 16)
+	binary.LittleEndian.PutUint32(p[16:], 16)
+	binary.LittleEndian.PutUint32(p[20:], 16*4)
+	binary.LittleEndian.PutUint32(p[24:], 16*16*4)
+	binary.LittleEndian.PutUint64(p[28:], uint64(vsyncNs))
+	b.onFrame(p, dupFD)
+	kind, _, relFD, err := hostConn.read()
+	if relFD >= 0 {
+		_ = syscall.Close(relFD)
+	}
+	if err != nil || kind != kindPresent {
+		t.Fatalf("read reply: kind=%d err=%v", kind, err)
+	}
+	if gotTime.IsZero() {
+		t.Fatal("expected non-zero SurfaceFrame.Time from 36-byte kFrame")
+	}
+	if diff := gotTime.Sub(expect).Abs(); diff > 10*time.Millisecond {
+		t.Fatalf("SurfaceFrame.Time differed from hardware VSync timestamp by %v", diff)
+	}
+
+	dupFD2, err := syscall.Dup(int(tmp.Fd()))
+	if err != nil {
+		t.Fatalf("Dup: %v", err)
+	}
+	binary.LittleEndian.PutUint32(p[4:], 2)
+	b.onFrame(p[:28], dupFD2)
+	kind, _, relFD, err = hostConn.read()
+	if relFD >= 0 {
+		_ = syscall.Close(relFD)
+	}
+	if err != nil || kind != kindPresent {
+		t.Fatalf("read 28-byte reply: kind=%d err=%v", kind, err)
+	}
+	if !gotTime.IsZero() {
+		t.Fatalf("expected zero SurfaceFrame.Time from legacy 28-byte kFrame, got %v", gotTime)
 	}
 }

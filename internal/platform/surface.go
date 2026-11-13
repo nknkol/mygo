@@ -1,8 +1,10 @@
 package platform
 
 import (
-	"github.com/egoist/mygo/transfer"
 	"image"
+	"time"
+
+	"github.com/egoist/mygo/transfer"
 )
 
 // Surface is the drawing area of a window created with
@@ -451,6 +453,10 @@ type SurfaceEvent struct {
 	// once the display can take it, which it tells by returning true from
 	// SurfaceEvent; the refreshes go on meanwhile.
 	Paced bool
+	// Time is when the display's refresh asked for a SurfaceFrame, where
+	// the backend knows it; zero otherwise, for which the content reads
+	// the clock.
+	Time time.Time
 }
 
 // PointerKind is the kind of device of a pointer event.

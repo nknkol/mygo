@@ -157,11 +157,16 @@ func (p *Painter) paintByZ(e *node) {
 	m := p.rt.matches
 	content := m != nil && e.parent == nil
 	dividers := e.flags&flagDividers != 0 && !e.grid
+	savedSubX, savedSubY := p.subpixelX, p.subpixelY
+	scrollSubX, scrollSubY := p.scrollMotion(e)
+	flowSubX, flowSubY := savedSubX || scrollSubX, savedSubY || scrollSubY
 	for i := base; i < end; i++ {
 		// Read again each time: painting c may grow the slice.
 		c := z.order[i]
 		if dividers && (c.zIndex > 0 || c.zIndex == 0 && c.aboveFlow() && c.leaving == 0) {
+			p.subpixelX, p.subpixelY = flowSubX, flowSubY
 			p.dividers(e)
+			p.subpixelX, p.subpixelY = savedSubX, savedSubY
 			dividers = false
 		}
 		if content && c == e.c.overlay {
@@ -169,11 +174,17 @@ func (p *Painter) paintByZ(e *node) {
 			content = false
 		}
 		if p.paintable(c) {
+			if !c.aboveFlow() {
+				p.subpixelX, p.subpixelY = flowSubX, flowSubY
+			}
 			p.element(c)
+			p.subpixelX, p.subpixelY = savedSubX, savedSubY
 		}
 	}
 	if dividers {
+		p.subpixelX, p.subpixelY = flowSubX, flowSubY
 		p.dividers(e)
+		p.subpixelX, p.subpixelY = savedSubX, savedSubY
 	}
 	if content {
 		m.paint(p, nil)

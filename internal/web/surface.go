@@ -7,6 +7,7 @@ import (
 	"math"
 	"strconv"
 	"syscall/js"
+	"time"
 	"unicode/utf8"
 
 	"github.com/egoist/mygo/internal/gpu/gl"
@@ -72,8 +73,20 @@ func newSurface(w *window) (*surface, error) {
 	} else {
 		s.gl = ctx
 	}
-	s.frame = js.FuncOf(func(js.Value, []js.Value) any {
-		w.b.sync(s.drawFrame)
+	s.frame = js.FuncOf(func(_ js.Value, args []js.Value) any {
+		var at time.Time
+		if len(args) > 0 && args[0].Type() == js.TypeNumber {
+			if perf := js.Global().Get("performance"); !perf.IsUndefined() && !perf.IsNull() {
+				ts := args[0].Float()
+				now := time.Now()
+				cur := perf.Call("now").Float()
+				d := time.Duration((ts - cur) * float64(time.Millisecond))
+				if d >= -100*time.Millisecond && d <= 100*time.Millisecond {
+					at = now.Add(d)
+				}
+			}
+		}
+		w.b.sync(func() { s.drawFrame(at) })
 		return nil
 	})
 	s.listen()
@@ -688,7 +701,7 @@ func (s *surface) pixels() (int, int) {
 
 // drawFrame handles a frame of the browser's, when the content asked for
 // one, with the canvas as large as the frame and WebGL's context current.
-func (s *surface) drawFrame() {
+func (s *surface) drawFrame(at time.Time) {
 	s.pending = false
 	if s.closed || !s.w.visible {
 		return
@@ -702,7 +715,7 @@ func (s *surface) drawFrame() {
 	if s.gl != nil {
 		s.gl.MakeCurrent()
 	}
-	s.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame})
+	s.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame, Time: at})
 }
 
 func (s *surface) Native() platform.SurfaceNative {

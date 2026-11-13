@@ -996,8 +996,12 @@ func (rt *engine) paceSkips() bool {
 	if !rt.redraw || rt.paceEvery <= 1 || hz <= 0 || rt.pacedAt.IsZero() {
 		return false
 	}
+	at := rt.frameAt
+	if at.IsZero() {
+		at = rt.now()
+	}
 	due := time.Duration((float32(rt.paceEvery) - 0.5) * float32(time.Second) / hz)
-	return rt.now().Sub(rt.pacedAt) < due
+	return at.Sub(rt.pacedAt) < due
 }
 
 // repaintNow asks for the frame that Painter.After asked for, unless
@@ -1035,7 +1039,11 @@ func (rt *engine) surfaceFrame() {
 		rt.host.requestFrame()
 		return
 	}
-	rt.pacedAt = rt.now()
+	if !rt.frameAt.IsZero() {
+		rt.pacedAt = rt.frameAt
+	} else {
+		rt.pacedAt = rt.now()
+	}
 	if next := rt.pacedNext; !next.IsZero() {
 		// The frame the timer asked for keeps the pace's own times, as the
 		// timer fires a little late: frames would come later and later.

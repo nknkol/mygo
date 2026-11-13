@@ -4,6 +4,7 @@ package darwin
 
 import (
 	"testing"
+	"time"
 
 	"github.com/egoist/mygo/internal/platform"
 )
@@ -14,6 +15,7 @@ type frameHandler struct {
 	platform.WindowHandler
 	wait  bool
 	paced []bool
+	times []time.Time
 }
 
 func (h *frameHandler) SurfaceEvent(ev platform.SurfaceEvent) bool {
@@ -21,6 +23,7 @@ func (h *frameHandler) SurfaceEvent(ev platform.SurfaceEvent) bool {
 		return false
 	}
 	h.paced = append(h.paced, ev.Paced)
+	h.times = append(h.times, ev.Time)
 	return ev.Paced && h.wait
 }
 
@@ -33,9 +36,13 @@ func TestDeferredFrames(t *testing.T) {
 	h := &frameHandler{}
 	s := &surface{w: &window{h: h}}
 	h.wait = true
-	s.frameNow(true)
+	stamp := time.Now()
+	s.frameNow(true, stamp)
 	if !s.deferred {
 		t.Fatal("a paced frame left to draw later: not deferred")
+	}
+	if !h.times[0].Equal(stamp) {
+		t.Fatalf("paced frame timestamp = %v, want %v", h.times[0], stamp)
 	}
 	h.wait = false
 	s.FrameNow()
@@ -45,24 +52,24 @@ func TestDeferredFrames(t *testing.T) {
 
 	// A frame AppKit displays, not paced, draws the one left.
 	h.wait = true
-	s.frameNow(true)
-	s.frameNow(false)
+	s.frameNow(true, time.Time{})
+	s.frameNow(false, time.Time{})
 	if s.deferred {
 		t.Fatal("a frame drawn meanwhile left the link running")
 	}
 
 	// A paced frame the content draws, as after its renderer was let go.
-	s.frameNow(true)
+	s.frameNow(true, time.Time{})
 	h.wait = false
-	s.frameNow(true)
+	s.frameNow(true, time.Time{})
 	if s.deferred {
 		t.Fatal("a paced frame drawn left the link running")
 	}
 
 	// Refreshes passing while the content waits keep it deferred.
 	h.wait = true
-	s.frameNow(true)
-	s.frameNow(true)
+	s.frameNow(true, time.Time{})
+	s.frameNow(true, time.Time{})
 	if !s.deferred {
 		t.Fatal("refreshes passing while the content waits: not deferred")
 	}
@@ -89,7 +96,7 @@ func TestDrawSoon(t *testing.T) {
 	}
 
 	s.drawSoon()
-	s.frameNow(false)
+	s.frameNow(false, time.Time{})
 	drainMainQueue()
 	if len(h.paced) != 2 {
 		t.Fatalf("drew %d frames, want the one drawn meanwhile alone", len(h.paced)-1)
@@ -100,7 +107,7 @@ func TestDrawSoon(t *testing.T) {
 	// shows (SurfaceShown), still draws: dropped with the first, what
 	// moves would stop for good.
 	s.drawSoon()
-	s.frameNow(false)
+	s.frameNow(false, time.Time{})
 	s.drawSoon()
 	drainMainQueue()
 	if len(h.paced) != 4 || s.soon {

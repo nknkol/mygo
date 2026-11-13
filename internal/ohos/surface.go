@@ -21,6 +21,23 @@ import (
 // that changed since it was last presented.
 const maxDamageHistory = 16
 
+func monoTime(ns int64) time.Time {
+	if ns <= 0 {
+		return time.Time{}
+	}
+	var ts syscall.Timespec
+	now := time.Now()
+	if _, _, errno := syscall.Syscall(syscall.SYS_CLOCK_GETTIME, 1, uintptr(unsafe.Pointer(&ts)), 0); errno != 0 {
+		return time.Time{}
+	}
+	cur := int64(ts.Sec)*1_000_000_000 + int64(ts.Nsec)
+	d := time.Duration(ns - cur)
+	if d < -100*time.Millisecond || d > 100*time.Millisecond {
+		return time.Time{}
+	}
+	return now.Add(d)
+}
+
 type frameDamage struct {
 	seq   uint64
 	w, h  int
@@ -82,7 +99,8 @@ type Surface struct {
 	dropFormats       []transfer.Format
 	accessEnabled     bool
 
-	frameStart       time.Time
+	frameStart    time.Time
+	lastFrameTime time.Time
 	dmaSyncStart     time.Time
 	lastUIGLUs       uint32
 	lastGPUFinishUs  uint32

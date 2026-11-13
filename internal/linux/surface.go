@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"sync"
+	"time"
 	"unicode/utf8"
 	"unsafe"
 
@@ -81,8 +82,10 @@ var (
 	gdkDeviceGetSource          func(d ptr) int32
 	gdkEventGetAxis             func(e ptr, use int32, value *float64) bool
 	gtkWidgetGetFrameClock      func(w ptr) ptr
+	gdkFrameClockGetFrameTime   func(clock ptr) int64
 	gdkFrameClockCurrentTimings func(clock ptr) ptr
 	gdkFrameTimingsRefresh      func(t ptr) int64
+	gGetMonotonicTime           func() int64
 
 	cbSurfaceDraw, cbSurfaceSize, cbSurfaceRealize, cbSurfaceButton ptr
 	cbSurfaceMotion, cbSurfaceLeave, cbSurfaceScroll, cbSurfaceKey  ptr
@@ -129,8 +132,12 @@ func loadSurface() {
 		mustBind(d, &gdkDeviceGetSource, "gdk_device_get_source")
 		mustBind(d, &gdkEventGetAxis, "gdk_event_get_axis")
 		mustBind(t, &gtkWidgetGetFrameClock, "gtk_widget_get_frame_clock")
+		bind(d, &gdkFrameClockGetFrameTime, "gdk_frame_clock_get_frame_time")
 		mustBind(d, &gdkFrameClockCurrentTimings, "gdk_frame_clock_get_current_timings")
 		mustBind(d, &gdkFrameTimingsRefresh, "gdk_frame_timings_get_refresh_interval")
+		if fn, err := purego.Dlsym(purego.RTLD_DEFAULT, "g_get_monotonic_time"); err == nil && fn != 0 {
+			purego.RegisterFunc(&gGetMonotonicTime, fn)
+		}
 		// GtkGLArea came in GTK 3.16.
 		if !bind(t, &gtkGLAreaNew, "gtk_gl_area_new") || !bind(t, &gtkGLAreaSetRequiredVersion, "gtk_gl_area_set_required_version") ||
 			!bind(t, &gtkGLAreaSetHasAlpha, "gtk_gl_area_set_has_alpha") || !bind(t, &gtkGLAreaGetError, "gtk_gl_area_get_error") ||
@@ -610,6 +617,27 @@ func (s *surface) paceFrameClock() {
 	if us > 0 {
 		setRefreshInterval(t, us, gdkFrameTimingsRefresh)
 	}
+}
+
+func (s *surface) frameClockTime() time.Time {
+	if gdkFrameClockGetFrameTime == nil || gGetMonotonicTime == nil {
+		return time.Time{}
+	}
+	clock := gtkWidgetGetFrameClock(s.area)
+	if clock == 0 {
+		return time.Time{}
+	}
+	ft := gdkFrameClockGetFrameTime(clock)
+	now := time.Now()
+	cur := gGetMonotonicTime()
+	if ft <= 0 || cur <= 0 {
+		return time.Time{}
+	}
+	d := time.Duration(ft-cur) * time.Microsecond
+	if d < -100*time.Millisecond || d > 100*time.Millisecond {
+		return time.Time{}
+	}
+	return now.Add(d)
 }
 
 // uncappedInterval is the refresh interval paceFrameClock tells GTK's
@@ -1155,7 +1183,7 @@ func initSurfaceCallbacks() {
 		}
 		s.again, s.ticking, s.staged.pix = false, true, nil
 		s.paceFrameClock()
-		s.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame})
+		s.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame, Time: s.frameClockTime()})
 		s.ticking = false
 		if !s.again {
 			s.tick = 0
@@ -1205,7 +1233,7 @@ func initSurfaceCallbacks() {
 		}
 		s.rendering, s.rendered, s.inMemory = true, true, false
 		s.paceFrameClock()
-		s.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame})
+		s.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame, Time: s.frameClockTime()})
 		s.rendering = false
 		if s.renderAgain {
 			s.renderAgain = false

@@ -69,9 +69,10 @@ var (
 	caPassArmed bool
 	// caPassCallout is the observer's callback, made once (purego callbacks
 	// are never freed), and observerCreate and addObserver what arms it.
-	caPassCallout  uintptr
-	observerCreate func(alloc uintptr, activities uint, repeats bool, order int, callout, ctx uintptr) uintptr
-	addObserver    func(rl, observer, mode uintptr)
+	caPassCallout      uintptr
+	observerCreate     func(alloc uintptr, activities uint, repeats bool, order int, callout, ctx uintptr) uintptr
+	addObserver        func(rl, observer, mode uintptr)
+	caCurrentMediaTime func() float64
 )
 
 const (
@@ -106,6 +107,11 @@ func loadSurface() {
 		// committed (armPass).
 		purego.RegisterLibFunc(&observerCreate, libCF, "CFRunLoopObserverCreate")
 		purego.RegisterLibFunc(&addObserver, libCF, "CFRunLoopAddObserver")
+		if qc, err := purego.Dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", purego.RTLD_GLOBAL|purego.RTLD_NOW); err == nil {
+			if fn, err := purego.Dlsym(qc, "CACurrentMediaTime"); err == nil && fn != 0 {
+				purego.RegisterFunc(&caCurrentMediaTime, fn)
+			}
+		}
 		caPassCallout = purego.NewCallback(func(observer, activity, info uintptr) {
 			caPass++
 			caPassArmed = false
@@ -504,7 +510,7 @@ func (s *surface) drawSoon() {
 		if s.w.b.surfaceOf(s.view) != s || s.lastFrame != s.soonAfter {
 			return
 		}
-		s.frameNow(false)
+		s.frameNow(false, time.Time{})
 	})
 }
 
@@ -529,8 +535,25 @@ func (s *surface) SetFrameRate(fps float64) {
 // draw until the renderer had a drawable.
 func (s *surface) FrameNow() {
 	if !s.w.closed {
-		s.frameNow(false)
+		s.frameNow(false, time.Time{})
 	}
+}
+
+func linkFrameTime(link id) time.Time {
+	if link == 0 || caCurrentMediaTime == nil {
+		return time.Time{}
+	}
+	ts := msgFloat(link, sel("timestamp"))
+	now := time.Now()
+	cur := caCurrentMediaTime()
+	if ts <= 0 || cur <= 0 {
+		return time.Time{}
+	}
+	d := time.Duration((ts - cur) * float64(time.Second))
+	if d < -100*time.Millisecond || d > 100*time.Millisecond {
+		return time.Time{}
+	}
+	return now.Add(d)
 }
 
 // frameNow draws a frame now, rather than when AppKit displays the view
@@ -544,12 +567,12 @@ func (s *surface) FrameNow() {
 // (deferred). Any frame it draws instead, paced or not, as a resize's,
 // draws what the one left would have, and the content draws that one no
 // more: deferred holds only while the last frame sent was left.
-func (s *surface) frameNow(paced bool) {
+func (s *surface) frameNow(paced bool, at time.Time) {
 	s.resized = false
 	s.framePass = caPass
 	armPass()
 	s.lastFrame = time.Now()
-	s.deferred = s.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame, Paced: paced}) && paced
+	s.deferred = s.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame, Paced: paced, Time: at}) && paced
 }
 
 // presentsWithTransaction reports whether the GPU renderer's CAMetalLayer
@@ -1236,7 +1259,7 @@ func registerSurfaceClass() {
 				s.RequestFrame()
 				return
 			}
-			s.frameNow(false)
+			s.frameNow(false, time.Time{})
 		}),
 		method("mygoTick:", func(self id, _ objc.SEL, link id) {
 			s := b().surfaceOf(self)
@@ -1256,7 +1279,7 @@ func registerSurfaceClass() {
 				// frame shows with the window's changes then.
 				return
 			}
-			s.frameNow(true)
+			s.frameNow(true, linkFrameTime(link))
 		}),
 		method("mygoTimer:", func(self id, _ objc.SEL, timer id) {
 			// A closed window's view lives until its timer fires.
@@ -1264,7 +1287,7 @@ func registerSurfaceClass() {
 				s.timing = false
 				// Uncapped, the content may leave the frame to draw
 				// once the renderer can (frameSoon).
-				s.frameNow(pacing.Uncapped)
+				s.frameNow(pacing.Uncapped, time.Time{})
 			}
 		}),
 		method("setFrameSize:", func(self id, cmd objc.SEL, size NSSize) {
