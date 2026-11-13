@@ -389,7 +389,7 @@ func (b *Backend) popNextLocked() (event, bool) {
 				kindCookieResult, kindWebEvent, kindWebAsyncRes, kindSchemeReq,
 				kindHotkeyTrig, kindTrayEvent, kindDragEvent, kindAccessEvent, kindInternal:
 				idx = i
-			case kindQuit, kindSurface:
+			case kindQuit, kindSurface, kindGPUBuffer:
 				i = len(b.events)
 			}
 			if idx != 0 {
@@ -533,6 +533,8 @@ func (b *Backend) Quit() {
 	sendQuit := !b.quitSent && b.conn != nil
 	b.quitSent = true
 	b.quit = true
+	pendingEvents := b.events
+	b.events = nil
 	for id, ch := range b.secretWaiters {
 		delete(b.secretWaiters, id)
 		close(ch)
@@ -545,6 +547,12 @@ func (b *Backend) Quit() {
 		b.cond.Broadcast()
 	}
 	b.mu.Unlock()
+	for _, ev := range pendingEvents {
+		if ev.fd >= 0 {
+			_ = syscall.Close(ev.fd)
+		}
+		closeFDs(ev.fds)
+	}
 	if sendQuit {
 		_ = b.conn.write(kindQuit, nil)
 	}
@@ -654,10 +662,18 @@ func (b *Backend) send(kind byte, payload []byte) {
 	_ = b.conn.write(kind, payload)
 }
 
+func (b *Backend) sendWithFD(kind byte, payload []byte, fd int) {
+	if b.conn == nil {
+		return
+	}
+	_ = b.conn.writeWithFD(kind, payload, fd)
+}
+
 type event struct {
 	kind    byte
 	payload []byte
 	fd      int
+	fds     []int
 	fn      func()
 }
 
@@ -675,7 +691,7 @@ func (b *Backend) post(fn func()) {
 
 func (b *Backend) readLoop() {
 	for {
-		kind, payload, fd, err := b.conn.read()
+		kind, payload, fds, err := b.conn.readMulti()
 		if err != nil {
 			b.mu.Lock()
 			b.quitSent = true
@@ -684,15 +700,37 @@ func (b *Backend) readLoop() {
 			return
 		}
 		if kind == kindSecretRes {
+			closeFDs(fds)
 			b.handleSecretRes(payload)
 			continue
 		}
 		if kind == kindHotkeyRes {
+			closeFDs(fds)
 			b.handleHotkeyRes(payload)
 			continue
 		}
+		ev := event{kind: kind, payload: payload, fd: -1}
+		switch kind {
+		case kindGPUBuffer:
+			ev.fds = fds
+		case kindFrame:
+			if len(fds) > 0 {
+				ev.fd = fds[0]
+				closeFDs(fds[1:])
+			}
+		default:
+			closeFDs(fds)
+		}
 		b.mu.Lock()
-		b.events = append(b.events, event{kind: kind, payload: payload, fd: fd})
+		if b.quit {
+			b.mu.Unlock()
+			if ev.fd >= 0 {
+				_ = syscall.Close(ev.fd)
+			}
+			closeFDs(ev.fds)
+			return
+		}
+		b.events = append(b.events, ev)
 		b.cond.Broadcast()
 		b.mu.Unlock()
 	}
@@ -707,6 +745,8 @@ func (b *Backend) dispatch(ev event) {
 		b.Quit()
 	case kindSurface:
 		b.onSurface(ev.payload)
+	case kindGPUBuffer:
+		b.onGPUBuffer(ev.payload, ev.fds)
 	case kindFrame:
 		b.onFrame(ev.payload, ev.fd)
 	case kindInput:
@@ -755,6 +795,92 @@ func (b *Backend) dispatch(ev event) {
 		if ev.fn != nil {
 			ev.fn()
 		}
+	default:
+		if ev.fd >= 0 {
+			_ = syscall.Close(ev.fd)
+		}
+		closeFDs(ev.fds)
+	}
+}
+
+func (b *Backend) onGPUBuffer(payload []byte, fds []int) {
+	defer closeFDs(fds)
+	winID, bufID, w, h, isFD, ints, fdCount, ok := decodeGPUBufferMessage(payload)
+	if !ok || len(fds) != fdCount {
+		return
+	}
+	drv, err := getGPUDriver()
+	if err != nil {
+		return
+	}
+	nb, err := drv.deserializeNativeBuffer(isFD, ints, fds)
+	if err != nil {
+		return
+	}
+	win := b.windowByID(winID)
+	if win == nil || win.closed || win.surface == nil {
+		drv.nbUnref(nb)
+		return
+	}
+	s := win.surface
+	var evicted []*gpuSwapTarget
+	s.mu.Lock()
+	if s.gpuTargets == nil {
+		s.gpuTargets = make(map[uint32]*gpuSwapTarget)
+	}
+	if old, ok := s.gpuTargets[bufID]; ok {
+		evicted = append(evicted, old)
+		delete(s.gpuTargets, bufID)
+	}
+	if buf, ok := s.buffers[bufID]; ok {
+		if buf.mem != nil {
+			_ = syscall.Munmap(buf.mem)
+		}
+		if buf.acquireFD >= 0 && buf != s.cur {
+			_ = syscall.Close(buf.acquireFD)
+		}
+		delete(s.buffers, bufID)
+	}
+	for len(s.gpuTargets) >= 8 {
+		var victimID uint32
+		var victim *gpuSwapTarget
+		for k, cand := range s.gpuTargets {
+			if s.cur != nil && s.cur.id == k {
+				continue
+			}
+			if victim == nil || cand.lastUsed < victim.lastUsed {
+				victimID, victim = k, cand
+			}
+		}
+		if victim == nil {
+			break
+		}
+		evicted = append(evicted, victim)
+		delete(s.gpuTargets, victimID)
+		if buf, ok := s.buffers[victimID]; ok && buf.gpuSwap {
+			if buf.acquireFD >= 0 {
+				_ = syscall.Close(buf.acquireFD)
+			}
+			delete(s.buffers, victimID)
+		}
+	}
+	s.gpuTargets[bufID] = &gpuSwapTarget{id: bufID, w: w, h: h, nb: nb}
+	s.mu.Unlock()
+
+	if len(evicted) > 0 {
+		needGL := false
+		for _, st := range evicted {
+			if st.fb != 0 || st.tex != 0 {
+				needGL = true
+				break
+			}
+		}
+		if needGL && s.glCtx != 0 {
+			_ = drv.makeCurrent(s.glCtx)
+		}
+		for _, st := range evicted {
+			drv.unbindSwapTargetGL(s.glCtx, st, true)
+		}
 	}
 }
 
@@ -782,6 +908,7 @@ func (b *Backend) onSurface(payload []byte) {
 	}
 	s := win.surface
 	s.mu.Lock()
+	prevW, prevH := s.width, s.height
 	if hz > 0 {
 		s.hz = hz
 	}
@@ -800,6 +927,9 @@ func (b *Backend) onSurface(payload []byte) {
 	if same {
 		return
 	}
+	if fresh || prevW != w || prevH != h {
+		s.evictAllGPUTargets()
+	}
 	win.updateBoundsFromPixels(w, h, scale)
 	s.refreshPlacedWebViews()
 	s.send(platform.SurfaceEvent{Kind: platform.SurfaceResize})
@@ -808,13 +938,13 @@ func (b *Backend) onSurface(payload []byte) {
 	}
 }
 
-// onFrame maps the buffer the host handed over for winID and asks the content
-// to draw into it. Unused buffers are returned via kindAbort so the host never
-// stalls waiting on them.
+// onFrame maps or binds the buffer the host handed over for winID and asks the
+// content to draw into it. Unused buffers are returned via kindAbort so the host
+// never stalls waiting on them.
 func (b *Backend) onFrame(payload []byte, fd int) {
-	if fd < 0 || len(payload) < 28 {
+	if len(payload) < 28 {
 		if fd >= 0 {
-			syscall.Close(fd)
+			_ = syscall.Close(fd)
 		}
 		return
 	}
@@ -825,24 +955,42 @@ func (b *Backend) onFrame(payload []byte, fd int) {
 	h := int(binary.LittleEndian.Uint32(payload[16:]))
 	stride := int(binary.LittleEndian.Uint32(payload[20:]))
 	size := int(binary.LittleEndian.Uint32(payload[24:]))
+	if size > 0 && fd < 0 {
+		return
+	}
 
 	win := b.windowByID(winID)
 	if win == nil || win.closed || win.surface == nil {
-		syscall.Close(fd)
+		if fd >= 0 {
+			_ = syscall.Close(fd)
+		}
 		b.send(kindAbort, abortMessage(winID, seq))
 		return
 	}
 
 	bufs := win.surface
 	bufs.mu.Lock()
-	buf, err := bufs.bufferFor(id, w, h, stride, size, fd)
+	var (
+		buf *buffer
+		err error
+	)
+	if size == 0 {
+		buf, err = bufs.gpuBufferFor(id, w, h, stride, fd)
+	} else {
+		buf, err = bufs.bufferFor(id, w, h, stride, size, fd)
+	}
 	hz := bufs.hz
 	if err != nil {
 		bufs.waiting = false
 	}
 	bufs.mu.Unlock()
-	syscall.Close(fd)
+	if size > 0 && fd >= 0 {
+		_ = syscall.Close(fd)
+	}
 	if err != nil {
+		if size == 0 && fd >= 0 {
+			_ = syscall.Close(fd)
+		}
 		b.send(kindAbort, abortMessage(winID, seq))
 		return
 	}
@@ -874,11 +1022,19 @@ func (b *Backend) onFrame(payload []byte, fd int) {
 	bufs.mu.Lock()
 	bufs.inFrame = false
 	abort := bufs.cur != nil
+	abortedFD := -1
+	if abort {
+		abortedFD = bufs.cur.acquireFD
+		bufs.cur.acquireFD = -1
+	}
 	bufs.cur = nil
 	askNext := bufs.wantNext
 	bufs.wantNext = false
 	bufs.mu.Unlock()
 
+	if abortedFD >= 0 {
+		_ = syscall.Close(abortedFD)
+	}
 	if abort {
 		b.send(kindAbort, abortMessage(winID, seq))
 	}
@@ -887,22 +1043,64 @@ func (b *Backend) onFrame(payload []byte, fd int) {
 	}
 }
 
+func (s *Surface) gpuBufferFor(id uint32, w, h, stride, acquireFD int) (*buffer, error) {
+	st := s.gpuTargets[id]
+	if st == nil || st.nb == 0 || st.w != w || st.h != h {
+		return nil, fmt.Errorf("ohos: unknown GPU buffer id=%d (%dx%d)", id, w, h)
+	}
+	if b, ok := s.buffers[id]; ok && b.gpuSwap && b.w == w && b.h == h {
+		if b.acquireFD >= 0 && b.acquireFD != acquireFD {
+			_ = syscall.Close(b.acquireFD)
+		}
+		b.stride = stride
+		b.acquireFD = acquireFD
+		return b, nil
+	}
+	if b, ok := s.buffers[id]; ok {
+		if b.mem != nil {
+			_ = syscall.Munmap(b.mem)
+		}
+		if b.acquireFD >= 0 && b.acquireFD != acquireFD {
+			_ = syscall.Close(b.acquireFD)
+		}
+		delete(s.buffers, id)
+	}
+	b := &buffer{
+		id:        id,
+		stride:    stride,
+		w:         w,
+		h:         h,
+		gpuSwap:   true,
+		acquireFD: acquireFD,
+	}
+	if s.buffers == nil {
+		s.buffers = make(map[uint32]*buffer)
+	}
+	s.buffers[id] = b
+	return b, nil
+}
+
 // bufferFor returns the mapping of a buffer of the ring, making it the
 // first time the host hands that one over and evicting stale mappings when
 // the swapchain reallocates.
 func (s *Surface) bufferFor(id uint32, w, h, stride, size, fd int) (*buffer, error) {
-	if b, ok := s.buffers[id]; ok && b.size == size && b.w == w && b.h == h && b.stride == stride {
+	if b, ok := s.buffers[id]; ok && !b.gpuSwap && b.size == size && b.w == w && b.h == h && b.stride == stride {
 		return b, nil
 	}
 	if b, ok := s.buffers[id]; ok {
-		syscall.Munmap(b.mem)
+		if b.mem != nil {
+			_ = syscall.Munmap(b.mem)
+		}
+		if b.acquireFD >= 0 {
+			_ = syscall.Close(b.acquireFD)
+		}
 		delete(s.buffers, id)
 	}
 	for len(s.buffers) >= 8 {
 		var victimID uint32
 		var victim *buffer
 		for k, cand := range s.buffers {
-			if cand == s.cur {
+			if cand == s.cur || cand.gpuSwap {
 				continue
 			}
 			if victim == nil || cand.lastUsed < victim.lastUsed {
@@ -912,14 +1110,19 @@ func (s *Surface) bufferFor(id uint32, w, h, stride, size, fd int) (*buffer, err
 		if victim == nil {
 			break
 		}
-		syscall.Munmap(victim.mem)
+		if victim.mem != nil {
+			_ = syscall.Munmap(victim.mem)
+		}
+		if victim.acquireFD >= 0 {
+			_ = syscall.Close(victim.acquireFD)
+		}
 		delete(s.buffers, victimID)
 	}
 	mem, err := syscall.Mmap(fd, 0, size, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		return nil, fmt.Errorf("ohos: mmap %d bytes: %w", size, err)
 	}
-	b := &buffer{id: id, mem: mem, stride: stride, w: w, h: h, size: size}
+	b := &buffer{id: id, mem: mem, stride: stride, w: w, h: h, size: size, acquireFD: -1}
 	if s.buffers == nil {
 		s.buffers = make(map[uint32]*buffer)
 	}

@@ -90,6 +90,7 @@ const (
 	kindDragReply      = 61 // engine -> host: {u32 winID, u32 pendingID, u32 op, u8 taken, 3×pad}
 	kindAccessTree     = 62 // engine -> host: accessibility tree snapshot & live announcements
 	kindAccessEvent    = 63 // host -> engine: {u32 winID, u8 ev, u8 actionKind, 2×pad, u64 nodeID, i32 from, i32 to, str text}
+	kindGPUBuffer      = 64 // host -> engine: {u32 winID, u32 bufID, u32 w, u32 h, u32 tokenCount, mask..., ints...} + fds
 
 	kindInternal = 255 // internal main-thread callback queued via Backend.post
 )
@@ -353,6 +354,7 @@ type presentPerf struct {
 const (
 	presentPerfFromGPU   uint32 = 1 << 0
 	presentPerfWholeCopy uint32 = 1 << 1
+	presentPerfZeroCopy  uint32 = 1 << 2
 )
 
 // rect is a rectangle in the content's own coordinates, origin top left, as
@@ -444,13 +446,23 @@ func (c *conn) write(kind byte, payload []byte) error {
 }
 
 func (c *conn) writeWithFD(kind byte, payload []byte, fd int) error {
+	if fd < 0 {
+		return c.write(kind, payload)
+	}
+	return c.writeWithFDs(kind, payload, []int{fd})
+}
+
+func (c *conn) writeWithFDs(kind byte, payload []byte, fds []int) error {
+	if len(fds) == 0 {
+		return c.write(kind, payload)
+	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	msg := make([]byte, 5+len(payload))
 	msg[0] = kind
 	binary.LittleEndian.PutUint32(msg[1:], uint32(len(payload)))
 	copy(msg[5:], payload)
-	oob := syscall.UnixRights(fd)
+	oob := syscall.UnixRights(fds...)
 	for {
 		n, err := syscall.SendmsgN(c.fd, msg, oob, nil, 0)
 		if err != nil {
@@ -475,21 +487,36 @@ func (c *conn) writeWithFD(kind byte, payload []byte, fd int) error {
 	return nil
 }
 
-// read returns the next message, with the descriptor the host attached to
-// it, -1 when there is none.
-func (c *conn) read() (kind byte, payload []byte, fd int, err error) {
-	fd = -1
+func closeFDs(fds []int) {
+	for _, fd := range fds {
+		if fd >= 0 {
+			_ = syscall.Close(fd)
+		}
+	}
+}
+
+// readMulti returns the next message and any descriptors attached via SCM_RIGHTS.
+func (c *conn) readMulti() (kind byte, payload []byte, fds []int, err error) {
 	hdr := make([]byte, 5)
-	oob := make([]byte, syscall.CmsgSpace(4))
-	n, oobn, _, _, err := syscall.Recvmsg(c.fd, hdr, oob, 0)
+	oob := make([]byte, syscall.CmsgSpace(8*4))
+	n, oobn, _, _, err := syscall.Recvmsg(c.fd, hdr, oob, syscall.MSG_CMSG_CLOEXEC)
 	if err != nil {
 		if err == syscall.EINTR {
-			return c.read()
+			return c.readMulti()
 		}
-		return 0, nil, -1, err
+		return 0, nil, nil, err
 	}
 	if n == 0 {
-		return kindQuit, nil, -1, nil
+		return kindQuit, nil, nil, nil
+	}
+	if oobn > 0 {
+		if msgs, err := syscall.ParseSocketControlMessage(oob[:oobn]); err == nil {
+			for i := range msgs {
+				if parsed, err := syscall.ParseUnixRights(&msgs[i]); err == nil {
+					fds = append(fds, parsed...)
+				}
+			}
+		}
 	}
 	for n < len(hdr) {
 		m, err := syscall.Read(c.fd, hdr[n:])
@@ -497,24 +524,20 @@ func (c *conn) read() (kind byte, payload []byte, fd int, err error) {
 			if err == syscall.EINTR {
 				continue
 			}
-			return 0, nil, -1, err
+			closeFDs(fds)
+			return 0, nil, nil, err
 		}
 		if m == 0 {
-			return 0, nil, -1, fmt.Errorf("ohos: short message header")
+			closeFDs(fds)
+			return 0, nil, nil, fmt.Errorf("ohos: short message header")
 		}
 		n += m
-	}
-	if oobn > 0 {
-		if msgs, err := syscall.ParseSocketControlMessage(oob[:oobn]); err == nil && len(msgs) > 0 {
-			if fds, err := syscall.ParseUnixRights(&msgs[0]); err == nil && len(fds) > 0 {
-				fd = fds[0]
-			}
-		}
 	}
 	kind = hdr[0]
 	length := int(binary.LittleEndian.Uint32(hdr[1:]))
 	if length > 64<<20 {
-		return 0, nil, fd, fmt.Errorf("ohos: payload of %d bytes", length)
+		closeFDs(fds)
+		return 0, nil, nil, fmt.Errorf("ohos: payload of %d bytes", length)
 	}
 	payload = make([]byte, length)
 	for total := 0; total < length; {
@@ -523,14 +546,89 @@ func (c *conn) read() (kind byte, payload []byte, fd int, err error) {
 			if err == syscall.EINTR {
 				continue
 			}
-			return 0, nil, fd, err
+			closeFDs(fds)
+			return 0, nil, nil, err
 		}
 		if m == 0 {
-			return 0, nil, fd, fmt.Errorf("ohos: short payload")
+			closeFDs(fds)
+			return 0, nil, nil, fmt.Errorf("ohos: short payload")
 		}
 		total += m
 	}
-	return kind, payload, fd, nil
+	return kind, payload, fds, nil
+}
+
+// read returns the next message, with the descriptor the host attached to
+// it, -1 when there is none.
+func (c *conn) read() (kind byte, payload []byte, fd int, err error) {
+	kind, payload, fds, err := c.readMulti()
+	if err != nil {
+		return 0, nil, -1, err
+	}
+	if len(fds) == 0 {
+		return kind, payload, -1, nil
+	}
+	if len(fds) > 1 {
+		closeFDs(fds[1:])
+	}
+	return kind, payload, fds[0], nil
+}
+
+func encodeGPUBufferMessage(winID, bufID uint32, w, h int, isFD []bool, ints []int32) []byte {
+	tc := len(isFD)
+	maskBytes := (tc + 7) / 8
+	p := make([]byte, 20+maskBytes+len(ints)*4)
+	binary.LittleEndian.PutUint32(p[0:], winID)
+	binary.LittleEndian.PutUint32(p[4:], bufID)
+	binary.LittleEndian.PutUint32(p[8:], uint32(w))
+	binary.LittleEndian.PutUint32(p[12:], uint32(h))
+	binary.LittleEndian.PutUint32(p[16:], uint32(tc))
+	for i, fdTok := range isFD {
+		if fdTok {
+			p[20+(i>>3)] |= 1 << (uint(i) & 7)
+		}
+	}
+	off := 20 + maskBytes
+	for _, v := range ints {
+		binary.LittleEndian.PutUint32(p[off:], uint32(v))
+		off += 4
+	}
+	return p
+}
+
+func decodeGPUBufferMessage(p []byte) (winID, bufID uint32, w, h int, isFD []bool, ints []int32, fdCount int, ok bool) {
+	if len(p) < 20 {
+		return 0, 0, 0, 0, nil, nil, 0, false
+	}
+	winID = binary.LittleEndian.Uint32(p[0:])
+	bufID = binary.LittleEndian.Uint32(p[4:])
+	w = int(binary.LittleEndian.Uint32(p[8:]))
+	h = int(binary.LittleEndian.Uint32(p[12:]))
+	tc := int(binary.LittleEndian.Uint32(p[16:]))
+	if w <= 0 || h <= 0 || tc <= 0 || tc > 1024 {
+		return 0, 0, 0, 0, nil, nil, 0, false
+	}
+	maskBytes := (tc + 7) / 8
+	if len(p) < 20+maskBytes {
+		return 0, 0, 0, 0, nil, nil, 0, false
+	}
+	isFD = make([]bool, tc)
+	for i := range tc {
+		if (p[20+(i>>3)] & (1 << (uint(i) & 7))) != 0 {
+			isFD[i] = true
+			fdCount++
+		}
+	}
+	intCount := tc - fdCount
+	off := 20 + maskBytes
+	if fdCount > 8 || len(p) != off+intCount*4 {
+		return 0, 0, 0, 0, nil, nil, 0, false
+	}
+	ints = make([]int32, intCount)
+	for i := range intCount {
+		ints[i] = int32(binary.LittleEndian.Uint32(p[off+i*4:]))
+	}
+	return winID, bufID, w, h, isFD, ints, fdCount, true
 }
 
 func requestMessage(winID uint32) []byte {

@@ -75,6 +75,7 @@ type Surface struct {
 	placed            []platform.WebViewPlacement
 	glCtx             uintptr
 	gl                *glTarget
+	gpuTargets        map[uint32]*gpuSwapTarget
 	dragReq           *platform.DragRequest
 	dragCanceled      bool
 	dragEscaped       bool
@@ -90,15 +91,17 @@ type Surface struct {
 }
 
 type buffer struct {
-	id       uint32
-	mem      []byte
-	stride   int
-	w, h     int
-	size     int
-	lastSeq  uint64
-	lastW    int
-	lastH    int
-	lastUsed uint64
+	id        uint32
+	mem       []byte
+	stride    int
+	w, h      int
+	size      int
+	gpuSwap   bool
+	acquireFD int
+	lastSeq   uint64
+	lastW     int
+	lastH     int
+	lastUsed  uint64
 }
 
 func (s *Surface) Native() platform.SurfaceNative {
@@ -167,30 +170,7 @@ func (s *Surface) PresentDamage(pix []byte, stride, width, height int, damage []
 	s.presentInternal(pix, stride, width, height, damage, false, false, -1)
 }
 
-func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage []image.Rectangle, whole, fromGPU bool, dmaFD int) {
-	copyStart := time.Now()
-	if fromGPU && !s.dmaSyncStart.IsZero() {
-		copyStart = s.dmaSyncStart
-	}
-	var uiGLUs, gpuFinishUs uint32
-	if fromGPU {
-		uiGLUs = s.lastUIGLUs
-		gpuFinishUs = s.lastGPUFinishUs
-	} else if !s.frameStart.IsZero() {
-		uiGLUs = uint32(max(0, copyStart.Sub(s.frameStart).Microseconds()))
-	}
-
-	s.mu.Lock()
-	b := s.cur
-	if b == nil {
-		s.mu.Unlock()
-		if dmaFD >= 0 {
-			dmaBufSync(dmaFD, dmaBufSyncEnd|dmaBufSyncRead)
-		}
-		return
-	}
-	s.cur = nil
-
+func (s *Surface) accumulateDamageLocked(b *buffer, width, height int, damage []image.Rectangle, whole bool) (paintWhole bool, clippedAcc []image.Rectangle, rects []rect) {
 	s.renderSeq++
 	rseq := s.renderSeq
 	b.lastUsed = rseq
@@ -221,7 +201,7 @@ func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage 
 		s.history = append(s.history, entry)
 	}
 
-	paintWhole := entry.whole ||
+	paintWhole = entry.whole ||
 		b.lastSeq == 0 ||
 		b.lastW != width || b.lastH != height ||
 		rseq-b.lastSeq > uint64(len(s.history))
@@ -235,8 +215,8 @@ func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage 
 		}
 	}
 
-	var acc []image.Rectangle
 	if !paintWhole {
+		var acc []image.Rectangle
 		accArea := 0
 		for i := len(s.history) - 1; i >= 0 && s.history[i].seq > b.lastSeq; i-- {
 			for _, r := range s.history[i].rects {
@@ -261,9 +241,53 @@ func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage 
 				break
 			}
 		}
+		if !paintWhole {
+			clippedAcc = make([]image.Rectangle, 0, len(acc))
+			rects = make([]rect, 0, len(acc))
+			bufBounds := image.Rect(0, 0, min(width, b.w), min(height, b.h))
+			for _, r := range acc {
+				r = r.Intersect(bufBounds)
+				if r.Empty() {
+					continue
+				}
+				clippedAcc = append(clippedAcc, r)
+				rects = append(rects, rect{int32(r.Min.X), int32(r.Min.Y), uint32(r.Dx()), uint32(r.Dy())})
+			}
+		}
 	}
 
-	var rects []rect
+	b.lastSeq = rseq
+	b.lastW = width
+	b.lastH = height
+	return paintWhole, clippedAcc, rects
+}
+
+func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage []image.Rectangle, whole, fromGPU bool, dmaFD int) {
+	copyStart := time.Now()
+	if fromGPU && !s.dmaSyncStart.IsZero() {
+		copyStart = s.dmaSyncStart
+	}
+	var uiGLUs, gpuFinishUs uint32
+	if fromGPU {
+		uiGLUs = s.lastUIGLUs
+		gpuFinishUs = s.lastGPUFinishUs
+	} else if !s.frameStart.IsZero() {
+		uiGLUs = uint32(max(0, copyStart.Sub(s.frameStart).Microseconds()))
+	}
+
+	s.mu.Lock()
+	b := s.cur
+	if b == nil || b.gpuSwap || b.mem == nil {
+		s.mu.Unlock()
+		if dmaFD >= 0 {
+			dmaBufSync(dmaFD, dmaBufSyncEnd|dmaBufSyncRead)
+		}
+		return
+	}
+	s.cur = nil
+
+	pixBounds := image.Rect(0, 0, width, height)
+	paintWhole, clippedAcc, rects := s.accumulateDamageLocked(b, width, height, damage, whole)
 	if paintWhole {
 		if fromGPU {
 			copyRectGPUFlipY(b, pix, stride, width, height, pixBounds)
@@ -271,19 +295,12 @@ func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage 
 			copyRectBGRAtoRGBA(b, pix, stride, width, height, pixBounds)
 		}
 	} else {
-		rects = make([]rect, 0, len(acc))
-		bufBounds := image.Rect(0, 0, min(width, b.w), min(height, b.h))
-		for _, r := range acc {
-			r = r.Intersect(bufBounds)
-			if r.Empty() {
-				continue
-			}
+		for _, r := range clippedAcc {
 			if fromGPU {
 				copyRectGPUFlipY(b, pix, stride, width, height, r)
 			} else {
 				copyRectBGRAtoRGBA(b, pix, stride, width, height, r)
 			}
-			rects = append(rects, rect{int32(r.Min.X), int32(r.Min.Y), uint32(r.Dx()), uint32(r.Dy())})
 		}
 	}
 	if dmaFD >= 0 {
@@ -291,9 +308,6 @@ func (s *Surface) presentInternal(pix []byte, stride, width, height int, damage 
 	}
 	copyUs := uint32(max(0, time.Since(copyStart).Microseconds()))
 
-	b.lastSeq = rseq
-	b.lastW = width
-	b.lastH = height
 	seq := s.seq
 	s.seq++
 	s.mu.Unlock()
@@ -517,7 +531,13 @@ func (s *Surface) Idle() {
 		if b == s.cur {
 			continue
 		}
-		syscall.Munmap(b.mem)
+		if b.gpuSwap {
+			b.lastSeq = 0
+			continue
+		}
+		if b.mem != nil {
+			syscall.Munmap(b.mem)
+		}
 		delete(s.buffers, id)
 	}
 	s.mu.Unlock()

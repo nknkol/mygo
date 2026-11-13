@@ -55,6 +55,7 @@
 #include <unordered_map>
 #include <vector>
 #include <poll.h>
+#include <dlfcn.h>
 #include <semaphore.h>
 #include <signal.h>
 #include <time.h>
@@ -62,6 +63,7 @@
 #include <fcntl.h>
 #include <linux/dma-buf.h>
 #include <linux/futex.h>
+#include <linux/sync_file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -149,6 +151,7 @@ constexpr uint8_t kDragEvent       = 60; // host -> engine: drag enter/move/leav
 constexpr uint8_t kDragReply       = 61; // engine -> host: drag over/drop reply
 constexpr uint8_t kAccessTree      = 62; // engine -> host: surface accessibility tree snapshot
 constexpr uint8_t kAccessEvent     = 63; // host -> engine: accessibility enabled / action
+constexpr uint8_t kGpuBuffer       = 64; // host -> engine: serialized OH_NativeBuffer swapchain slot + fds
 
 constexpr uint8_t kWinActEnableWebLayer = 17;
 constexpr uint8_t kWinActFocusSurface   = 18;
@@ -558,8 +561,20 @@ struct WinSession {
     uint32_t replyGpuFinishUs = 0;
     uint32_t replyCopyUs = 0;
     uint32_t replyPerfMeta = 0;
+    int replyFenceFd = -1;
     uint32_t requestedFps = 0;
     bool fpsDirty = true;
+
+    ~WinSession() {
+        clearReplyFenceLocked();
+    }
+
+    void clearReplyFenceLocked() {
+        if (replyFenceFd >= 0) {
+            close(replyFenceFd);
+            replyFenceFd = -1;
+        }
+    }
 
     void waitVsync();
     void applyExpectedFrameRateLocked(uint32_t fps);
@@ -1526,6 +1541,228 @@ bool sendMessage(uint8_t kind, const void *payload, uint32_t len, int fd) {
         }
         return sent == static_cast<ssize_t>(sizeof(hdr) + len);
     }
+}
+
+bool sendMessageFds(uint8_t kind, const void *payload, uint32_t len, const int *fds, size_t fdCount) {
+    if (fdCount == 0 || fds == nullptr) {
+        return sendMessage(kind, payload, len, -1);
+    }
+    if (fdCount > 8) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(sendMu);
+    if (sock < 0) {
+        return false;
+    }
+    std::vector<uint8_t> msg(5 + len);
+    msg[0] = kind;
+    memcpy(msg.data() + 1, &len, 4);
+    if (len > 0 && payload != nullptr) {
+        memcpy(msg.data() + 5, payload, len);
+    }
+
+    struct iovec iov;
+    iov.iov_base = msg.data();
+    iov.iov_len = msg.size();
+
+    const size_t rightsBytes = sizeof(int) * fdCount;
+    std::vector<char> cbuf(CMSG_SPACE(rightsBytes), 0);
+    struct msghdr mh;
+    memset(&mh, 0, sizeof(mh));
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = cbuf.data();
+    mh.msg_controllen = cbuf.size();
+    struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(rightsBytes);
+    memcpy(CMSG_DATA(c), fds, rightsBytes);
+
+    ssize_t sent = 0;
+    for (;;) {
+        sent = sendmsg(sock, &mh, MSG_NOSIGNAL);
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent <= 0) {
+            return false;
+        }
+        break;
+    }
+    size_t off = static_cast<size_t>(sent);
+    while (off < msg.size()) {
+        ssize_t n = send(sock, msg.data() + off, msg.size() - off, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+struct OHIPCParcel;
+
+struct IpcParcelApi {
+    OHIPCParcel *(*create)() = nullptr;
+    void (*destroy)(OHIPCParcel *) = nullptr;
+    int (*getDataSize)(const OHIPCParcel *) = nullptr;
+    int (*getReadPos)(const OHIPCParcel *) = nullptr;
+    int (*rewindReadPos)(OHIPCParcel *, uint32_t) = nullptr;
+    int (*readInt32)(OHIPCParcel *, int32_t *) = nullptr;
+    int (*readFd)(OHIPCParcel *, int32_t *) = nullptr;
+    int32_t (*nbWriteToParcel)(OH_NativeBuffer *, OHIPCParcel *) = nullptr;
+    bool ok = false;
+};
+
+const IpcParcelApi &getIpcParcelApi() {
+    static IpcParcelApi api = []() {
+        IpcParcelApi a;
+        void *ipcLib = dlopen("libipc_capi.so", RTLD_NOW);
+        void *nbLib = dlopen("libnative_buffer.so", RTLD_NOW);
+        if (ipcLib != nullptr && nbLib != nullptr) {
+            a.create = reinterpret_cast<decltype(a.create)>(dlsym(ipcLib, "OH_IPCParcel_Create"));
+            a.destroy = reinterpret_cast<decltype(a.destroy)>(dlsym(ipcLib, "OH_IPCParcel_Destroy"));
+            a.getDataSize = reinterpret_cast<decltype(a.getDataSize)>(dlsym(ipcLib, "OH_IPCParcel_GetDataSize"));
+            a.getReadPos = reinterpret_cast<decltype(a.getReadPos)>(dlsym(ipcLib, "OH_IPCParcel_GetReadPosition"));
+            a.rewindReadPos = reinterpret_cast<decltype(a.rewindReadPos)>(dlsym(ipcLib, "OH_IPCParcel_RewindReadPosition"));
+            a.readInt32 = reinterpret_cast<decltype(a.readInt32)>(dlsym(ipcLib, "OH_IPCParcel_ReadInt32"));
+            a.readFd = reinterpret_cast<decltype(a.readFd)>(dlsym(ipcLib, "OH_IPCParcel_ReadFileDescriptor"));
+            a.nbWriteToParcel = reinterpret_cast<decltype(a.nbWriteToParcel)>(dlsym(nbLib, "OH_NativeBuffer_WriteToParcel"));
+            a.ok = a.create && a.destroy && a.getDataSize && a.getReadPos &&
+                   a.rewindReadPos && a.readInt32 && a.readFd && a.nbWriteToParcel;
+        }
+        return a;
+    }();
+    return api;
+}
+
+bool envTruthy(const char *val) {
+    if (val == nullptr || val[0] == '\0') {
+        return false;
+    }
+    return strcmp(val, "1") == 0 || strcasecmp(val, "true") == 0 ||
+           strcasecmp(val, "yes") == 0 || strcasecmp(val, "on") == 0;
+}
+
+bool wantGpuSwapchain() {
+    if (envTruthy(getenv("MYGO_SOFTWARE"))) {
+        return false;
+    }
+    const char *gpuEnv = getenv("MYGO_GPU");
+    if (gpuEnv != nullptr && (strcmp(gpuEnv, "0") == 0 || strcasecmp(gpuEnv, "false") == 0 || strcasecmp(gpuEnv, "off") == 0)) {
+        return false;
+    }
+    if (access("/system/lib64/libEGL.so", R_OK) != 0 || access("/system/lib64/libGLESv3.so", R_OK) != 0) {
+        return false;
+    }
+    return getIpcParcelApi().ok;
+}
+
+bool sendGpuBuffer(uint32_t winId, uint32_t bufId, int32_t w, int32_t h, OH_NativeBuffer *nb) {
+    const auto &api = getIpcParcelApi();
+    if (!api.ok || nb == nullptr || w <= 0 || h <= 0) {
+        return false;
+    }
+    OHIPCParcel *p = api.create();
+    if (p == nullptr) {
+        return false;
+    }
+    if (api.nbWriteToParcel(nb, p) != 0) {
+        api.destroy(p);
+        return false;
+    }
+    int dataSize = api.getDataSize(p);
+    if (dataSize <= 0 || dataSize > 4096) {
+        api.destroy(p);
+        return false;
+    }
+    std::vector<uint8_t> isFd;
+    std::vector<int32_t> ints;
+    std::vector<int> fds;
+    isFd.reserve(96);
+    ints.reserve(96);
+    while (api.getReadPos(p) < dataSize) {
+        int pos = api.getReadPos(p);
+        int32_t v = 0;
+        if (api.readInt32(p, &v) == 0) {
+            isFd.push_back(0);
+            ints.push_back(v);
+            continue;
+        }
+        api.rewindReadPos(p, static_cast<uint32_t>(pos));
+        int32_t fd = -1;
+        if (api.readFd(p, &fd) == 0 && fd >= 0) {
+            isFd.push_back(1);
+            fds.push_back(static_cast<int>(fd));
+            continue;
+        }
+        for (int cfd : fds) {
+            close(cfd);
+        }
+        api.destroy(p);
+        return false;
+    }
+    api.destroy(p);
+
+    const size_t tc = isFd.size();
+    if (tc == 0 || tc > 1024 || fds.size() > 8) {
+        for (int cfd : fds) {
+            close(cfd);
+        }
+        return false;
+    }
+    const size_t maskBytes = (tc + 7) / 8;
+    std::vector<uint8_t> wire(20 + maskBytes + ints.size() * 4, 0);
+    uint32_t uWin = winId;
+    uint32_t uBuf = bufId;
+    uint32_t uW = static_cast<uint32_t>(w);
+    uint32_t uH = static_cast<uint32_t>(h);
+    uint32_t uTc = static_cast<uint32_t>(tc);
+    memcpy(wire.data() + 0, &uWin, 4);
+    memcpy(wire.data() + 4, &uBuf, 4);
+    memcpy(wire.data() + 8, &uW, 4);
+    memcpy(wire.data() + 12, &uH, 4);
+    memcpy(wire.data() + 16, &uTc, 4);
+    for (size_t i = 0; i < tc; ++i) {
+        if (isFd[i]) {
+            wire[20 + (i >> 3)] |= static_cast<uint8_t>(1u << (i & 7u));
+        }
+    }
+    if (!ints.empty()) {
+        memcpy(wire.data() + 20 + maskBytes, ints.data(), ints.size() * 4);
+    }
+    bool sent = sendMessageFds(kGpuBuffer, wire.data(), static_cast<uint32_t>(wire.size()), fds.data(), fds.size());
+    for (int cfd : fds) {
+        close(cfd);
+    }
+    return sent;
+}
+
+int64_t queryFenceSignalNs(int fd) {
+    struct sync_file_info info;
+    memset(&info, 0, sizeof(info));
+    if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) != 0 || info.status <= 0 || info.num_fences == 0 || info.num_fences > 16) {
+        return 0;
+    }
+    std::vector<struct sync_fence_info> fences(info.num_fences);
+    info.sync_fence_info = reinterpret_cast<uintptr_t>(fences.data());
+    if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) != 0) {
+        return 0;
+    }
+    uint64_t maxTs = 0;
+    for (uint32_t i = 0; i < info.num_fences; ++i) {
+        if (fences[i].status > 0 && fences[i].timestamp_ns > maxTs) {
+            maxTs = fences[i].timestamp_ns;
+        }
+    }
+    return static_cast<int64_t>(maxTs);
 }
 
 bool sendSurface(uint32_t winId, int32_t w, int32_t h, double scale, double hz, bool fresh = false) {
@@ -4209,6 +4446,7 @@ void logLatencyStats(uint32_t winId, const char *reason, const LatencyRing &draw
 }
 
 struct PerfFrameSample {
+    uint64_t sampleSeq = 0;
     double dtMs = 0.0;
     double uiGlMs = 0.0;
     double gpuMs = 0.0;
@@ -4217,6 +4455,7 @@ struct PerfFrameSample {
     double vsyncMs = 0.0;
     double in2FlushMs = -1.0;
     bool wholeCopy = false;
+    bool zeroCopy = false;
     uint8_t coalesced = 0;
     uint8_t scrollEvs = 0;
 };
@@ -4256,6 +4495,7 @@ PerfHudData buildPerfHudSnapshot(WinSession *ws, int32_t w, int32_t h, double sc
     double sumUiGl = 0.0, sumGpu = 0.0, sumCopy = 0.0, sumSwap = 0.0, sumVsync = 0.0;
     int tier120 = 0, tier60 = 0, tierDrop = 0;
     int wholeCnt = 0;
+    int zeroCopyCnt = 0;
     int coalSum = 0;
 
     for (const auto &s : window) {
@@ -4282,6 +4522,9 @@ PerfHudData buildPerfHudSnapshot(WinSession *ws, int32_t w, int32_t h, double sc
         }
         if (s.wholeCopy) {
             wholeCnt++;
+        }
+        if (s.zeroCopy) {
+            zeroCopyCnt++;
         }
         coalSum += s.coalesced;
     }
@@ -4348,16 +4591,22 @@ PerfHudData buildPerfHudSnapshot(WinSession *ws, int32_t w, int32_t h, double sc
 
     if (nDt > 0) {
         snprintf(buf, sizeof(buf),
-                 "dt(ms)  p50 %4.1f  p90 %4.1f  p99 %4.1f  max %4.1f  |  120f %d%% · 60f %d%% · <60f %d%%",
+                 "dt(ms) p50 %.1f p90 %.1f p99 %.1f max %.1f | 120f %d%% 60f %d%% <60f %d%%",
                  p50Dt, p90Dt, p99Dt, maxDt, pct120, pct60, pctDrop);
     } else {
         snprintf(buf, sizeof(buf), "dt(ms)  waiting for continuous motion frames...");
     }
     out.pacingLine = buf;
 
-    snprintf(buf, sizeof(buf),
-             "Stage   UI+GL %.1f(p90 %.1f) | GPU %.1f(%.1f) | Copy %.1f | Swap %.1f | VSync %.1fms",
-             avgUiGl, p90UiGl, avgGpu, p90Gpu, avgCopy, avgSwap, avgVsync);
+    if (zeroCopyCnt > 0) {
+        snprintf(buf, sizeof(buf),
+                 "Stage  UI+GL %.1f/%.1f | GPU %.1f/%.1f | ZC | Swap %.1f | VS %.1fms",
+                 avgUiGl, p90UiGl, avgGpu, p90Gpu, avgSwap, avgVsync);
+    } else {
+        snprintf(buf, sizeof(buf),
+                 "Stage  UI+GL %.1f/%.1f | GPU %.1f/%.1f | Copy %.1f | Swap %.1fms",
+                 avgUiGl, p90UiGl, avgGpu, p90Gpu, avgCopy, avgSwap);
+    }
     out.stageLine = buf;
 
     if (scHz > 0.1) {
@@ -4413,15 +4662,43 @@ void WinSession::renderLoop() {
         return;
     }
 
-    OH_NativeWindow_NativeWindowHandleOpt(win, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_RGBA_8888);
-    uint64_t usage = 0;
-    OH_NativeWindow_NativeWindowHandleOpt(win, GET_USAGE, &usage);
-    usage &= ~static_cast<uint64_t>(NATIVEBUFFER_USAGE_CPU_READ_OFTEN);
-    usage |= NATIVEBUFFER_USAGE_CPU_READ | NATIVEBUFFER_USAGE_CPU_WRITE | NATIVEBUFFER_USAGE_MEM_DMA;
-    OH_NativeWindow_NativeWindowHandleOpt(win, SET_USAGE, usage);
-    OH_LOG_INFO(LOG_APP, "win=%{public}u surface %{public}dx%{public}d scale=%{public}.2f hz=%{public}.0f",
-                winId, w, h, sc, refresh);
+    bool gpuMode = wantGpuSwapchain();
+    auto configureWinUsage = [&](bool gpu) {
+        OH_NativeWindow_NativeWindowHandleOpt(win, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_RGBA_8888);
+        uint64_t usage = 0;
+        OH_NativeWindow_NativeWindowHandleOpt(win, GET_USAGE, &usage);
+        if (gpu) {
+            usage &= ~static_cast<uint64_t>(NATIVEBUFFER_USAGE_CPU_READ |
+                                            NATIVEBUFFER_USAGE_CPU_WRITE |
+                                            NATIVEBUFFER_USAGE_CPU_READ_OFTEN |
+                                            NATIVEBUFFER_USAGE_MEM_MMZ_CACHE);
+            usage |= NATIVEBUFFER_USAGE_HW_RENDER | NATIVEBUFFER_USAGE_HW_TEXTURE | NATIVEBUFFER_USAGE_MEM_DMA;
+        } else {
+            usage &= ~static_cast<uint64_t>(NATIVEBUFFER_USAGE_CPU_READ_OFTEN);
+            usage |= NATIVEBUFFER_USAGE_CPU_READ | NATIVEBUFFER_USAGE_CPU_WRITE | NATIVEBUFFER_USAGE_MEM_DMA;
+        }
+        OH_NativeWindow_NativeWindowHandleOpt(win, SET_USAGE, usage);
+    };
+    configureWinUsage(gpuMode);
+    OH_LOG_INFO(LOG_APP, "win=%{public}u surface %{public}dx%{public}d scale=%{public}.2f hz=%{public}.0f gpuSwap=%{public}d",
+                winId, w, h, sc, refresh, gpuMode ? 1 : 0);
     sendSurface(winId, w, h, sc, refresh, true);
+
+    struct SentGpuBuf {
+        uint32_t id = 0;
+        int32_t w = 0;
+        int32_t h = 0;
+    };
+    struct PendingGpuFence {
+        int fd = -1;
+        int64_t submitNs = 0;
+        uint64_t sampleSeq = 0;
+    };
+    std::deque<SentGpuBuf> sentGpuBufs;
+    std::deque<PendingGpuFence> pendingGpuFences;
+    uint64_t nextSampleSeq = 1;
+    int64_t lastGpuSignalNs = 0;
+    double lastMeasuredGpuMs = 0.0;
 
     uint32_t seq = 0;
     int frames = 0, damaged = 0, whole = 0, aborted = 0;
@@ -4432,6 +4709,37 @@ void WinSession::renderLoop() {
     bool hudSettled = true;
     LatencyRing drawRing, inRing, intervalRing;
     std::deque<PerfFrameSample> perfWindow;
+
+    auto drainGpuFences = [&]() {
+        for (auto it = pendingGpuFences.begin(); it != pendingGpuFences.end();) {
+            struct pollfd pfd = {};
+            pfd.fd = it->fd;
+            pfd.events = POLLIN;
+            int prc = poll(&pfd, 1, 0);
+            if (prc > 0 && (pfd.revents & (POLLIN | POLLERR | POLLHUP)) != 0) {
+                int64_t tsNs = queryFenceSignalNs(it->fd);
+                close(it->fd);
+                if (tsNs > 0) {
+                    int64_t startNs = std::max(it->submitNs, lastGpuSignalNs);
+                    double ms = tsNs > startNs ? std::min(200.0, static_cast<double>(tsNs - startNs) / 1e6) : 0.05;
+                    lastGpuSignalNs = std::max(lastGpuSignalNs, tsNs);
+                    lastMeasuredGpuMs = ms;
+                    for (auto &s : perfWindow) {
+                        if (s.sampleSeq == it->sampleSeq) {
+                            s.gpuMs = ms;
+                            break;
+                        }
+                    }
+                }
+                it = pendingGpuFences.erase(it);
+            } else if (prc < 0 && errno != EINTR && errno != EAGAIN) {
+                close(it->fd);
+                it = pendingGpuFences.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
 
     for (;;) {
         bool pushNow = false;
@@ -4449,6 +4757,8 @@ void WinSession::renderLoop() {
                 pushNow = true;
             }
             if (!woke) {
+                lk.unlock();
+                drainGpuFences();
                 if (!hudSettled && !perfWindow.empty()) {
                     hudSettled = true;
                     bool vis = gPerfHudEnabled.load(std::memory_order_relaxed);
@@ -4479,6 +4789,7 @@ void WinSession::renderLoop() {
                 h = curH;
                 sc = scale;
                 refresh = hz;
+                sentGpuBufs.clear();
                 lk.unlock();
                 OH_LOG_INFO(LOG_APP, "win=%{public}u resize %{public}dx%{public}d", winId, w, h);
                 sendSurface(winId, w, h, sc, refresh, false);
@@ -4491,8 +4802,9 @@ void WinSession::renderLoop() {
                 forceResendSurface = false;
                 sc = scale;
                 refresh = hz;
+                sentGpuBufs.clear();
                 lk.unlock();
-                sendSurface(winId, w, h, sc, refresh, false);
+                sendSurface(winId, w, h, sc, refresh, true);
                 lk.lock();
                 if (stopRender) {
                     break;
@@ -4500,6 +4812,7 @@ void WinSession::renderLoop() {
             }
             if (pushNow && !wantFrame) {
                 lk.unlock();
+                drainGpuFences();
                 bool vis = gPerfHudEnabled.load(std::memory_order_relaxed);
                 PerfHudData snap = buildPerfHudSnapshot(this, w, h, sc, refresh, aborted, !hudSettled, vis, perfWindow);
                 auto bev = std::make_unique<BridgeEvent>();
@@ -4540,6 +4853,7 @@ void WinSession::renderLoop() {
                 h = curH;
                 sc = scale;
                 refresh = hz;
+                sentGpuBufs.clear();
                 lk.unlock();
                 sendSurface(winId, w, h, sc, refresh, false);
                 lk.lock();
@@ -4547,6 +4861,7 @@ void WinSession::renderLoop() {
                     break;
                 }
             }
+            clearReplyFenceLocked();
             reply = BufReply::None;
         }
 
@@ -4567,26 +4882,8 @@ void WinSession::renderLoop() {
             usleep(16000);
             continue;
         }
-        if (fence >= 0) {
-            struct pollfd pfd = {};
-            pfd.fd = fence;
-            pfd.events = POLLIN;
-            int prc = -1;
-            do {
-                prc = poll(&pfd, 1, 3000);
-            } while (prc == -1 && (errno == EINTR || errno == EAGAIN));
-            close(fence);
-        }
-        const double reqFenceMs = static_cast<double>(std::max<int64_t>(0, monoNs() - reqStartNs)) / 1e6;
 
         BufferHandle *bh = OH_NativeWindow_GetBufferHandleFromNative(buf);
-        if (bh == nullptr || bh->fd < 0) {
-            OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
-            continue;
-        }
-        struct dma_buf_sync syncStart = {DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE};
-        (void)ioctl(bh->fd, DMA_BUF_IOCTL_SYNC, &syncStart);
-
         uint32_t bufId = 0;
         OH_NativeBuffer *nb = nullptr;
         if (OH_NativeBuffer_FromNativeWindowBuffer(buf, &nb) == 0 && nb != nullptr) {
@@ -4597,18 +4894,95 @@ void WinSession::renderLoop() {
             bufId = static_cast<uint32_t>(ptr ^ (ptr >> 32)) | 1u;
         }
 
+        double reqFenceMs = 0.0;
         const uint32_t curSeq = seq++;
-        const int64_t sendFrameNs = monoNs();
-        if (!sendFrame(winId, curSeq, bufId, bh->width, bh->height, bh->stride, bh->size, bh->fd)) {
-            struct dma_buf_sync syncEnd = {DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE};
-            (void)ioctl(bh->fd, DMA_BUF_IOCTL_SYNC, &syncEnd);
-            OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
-            continue;
+        int64_t sendFrameNs = 0;
+
+        if (gpuMode) {
+            reqFenceMs = static_cast<double>(std::max<int64_t>(0, monoNs() - reqStartNs)) / 1e6;
+            OH_NativeBuffer_Config nbCfg = {};
+            if (nb != nullptr) {
+                OH_NativeBuffer_GetConfig(nb, &nbCfg);
+            }
+            int32_t bufW = nbCfg.width > 0 ? nbCfg.width : (bh != nullptr ? bh->width : 0);
+            int32_t bufH = nbCfg.height > 0 ? nbCfg.height : (bh != nullptr ? bh->height : 0);
+            int32_t bufStride = nbCfg.stride > 0 ? nbCfg.stride : (bh != nullptr ? bh->stride : bufW * 4);
+            if (nb == nullptr || bufW <= 0 || bufH <= 0) {
+                if (fence >= 0) {
+                    close(fence);
+                    fence = -1;
+                }
+                OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
+                gpuMode = false;
+                sentGpuBufs.clear();
+                configureWinUsage(false);
+                std::lock_guard<std::mutex> lk(mu);
+                wantFrame = true;
+                continue;
+            }
+            bool alreadySent = false;
+            for (const auto &sb : sentGpuBufs) {
+                if (sb.id == bufId && sb.w == bufW && sb.h == bufH) {
+                    alreadySent = true;
+                    break;
+                }
+            }
+            if (!alreadySent) {
+                if (!sendGpuBuffer(winId, bufId, bufW, bufH, nb)) {
+                    if (fence >= 0) {
+                        close(fence);
+                        fence = -1;
+                    }
+                    OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
+                    continue;
+                }
+                if (sentGpuBufs.size() >= 6) {
+                    sentGpuBufs.pop_front();
+                }
+                sentGpuBufs.push_back(SentGpuBuf{bufId, bufW, bufH});
+            }
+            sendFrameNs = monoNs();
+            bool sent = sendFrame(winId, curSeq, bufId, bufW, bufH, bufStride, 0, fence);
+            if (fence >= 0) {
+                close(fence);
+                fence = -1;
+            }
+            if (!sent) {
+                OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
+                continue;
+            }
+        } else {
+            if (fence >= 0) {
+                struct pollfd pfd = {};
+                pfd.fd = fence;
+                pfd.events = POLLIN;
+                int prc = -1;
+                do {
+                    prc = poll(&pfd, 1, 3000);
+                } while (prc == -1 && (errno == EINTR || errno == EAGAIN));
+                close(fence);
+                fence = -1;
+            }
+            reqFenceMs = static_cast<double>(std::max<int64_t>(0, monoNs() - reqStartNs)) / 1e6;
+            if (bh == nullptr || bh->fd < 0) {
+                OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
+                continue;
+            }
+            struct dma_buf_sync syncStart = {DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE};
+            (void)ioctl(bh->fd, DMA_BUF_IOCTL_SYNC, &syncStart);
+            sendFrameNs = monoNs();
+            if (!sendFrame(winId, curSeq, bufId, bh->width, bh->height, bh->stride, bh->size, bh->fd)) {
+                struct dma_buf_sync syncEnd = {DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE};
+                (void)ioctl(bh->fd, DMA_BUF_IOCTL_SYNC, &syncEnd);
+                OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
+                continue;
+            }
         }
 
         BufReply gotReply = BufReply::None;
         uint32_t rectCount = 0;
         uint32_t uiGLUs = 0, gpuFinishUs = 0, copyUs = 0, perfMeta = 0;
+        int releaseFence = -1;
         bool timedOut = false;
         {
             std::unique_lock<std::mutex> lk(mu);
@@ -4618,6 +4992,7 @@ void WinSession::renderLoop() {
             });
             if (!ok) {
                 timedOut = true;
+                clearReplyFenceLocked();
             } else {
                 gotReply = reply;
                 rectCount = replyRectCount;
@@ -4625,14 +5000,21 @@ void WinSession::renderLoop() {
                 gpuFinishUs = replyGpuFinishUs;
                 copyUs = replyCopyUs;
                 perfMeta = replyPerfMeta;
+                releaseFence = replyFenceFd;
+                replyFenceFd = -1;
                 reply = BufReply::None;
             }
         }
 
-        struct dma_buf_sync syncEnd = {DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE};
-        (void)ioctl(bh->fd, DMA_BUF_IOCTL_SYNC, &syncEnd);
+        if (!gpuMode && bh != nullptr && bh->fd >= 0) {
+            struct dma_buf_sync syncEnd = {DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE};
+            (void)ioctl(bh->fd, DMA_BUF_IOCTL_SYNC, &syncEnd);
+        }
 
         if (timedOut) {
+            if (releaseFence >= 0) {
+                close(releaseFence);
+            }
             OH_LOG_ERROR(LOG_APP, "win=%{public}u frame %{public}u timed out", winId, curSeq);
             OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
             gFrameTimeoutRestart.store(true);
@@ -4648,6 +5030,9 @@ void WinSession::renderLoop() {
         }
 
         if (gotReply != BufReply::Present) {
+            if (releaseFence >= 0) {
+                close(releaseFence);
+            }
             OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
             if (gotReply == BufReply::Abort) {
                 aborted++;
@@ -4655,9 +5040,40 @@ void WinSession::renderLoop() {
             continue;
         }
 
+        drainGpuFences();
         const int64_t flushStartNs = monoNs();
+        const uint64_t curSampleSeq = nextSampleSeq++;
+        double immediateGpuMs = -1.0;
+        if (gpuMode && releaseFence >= 0) {
+            const int64_t glSubmitNs = std::min<int64_t>(flushStartNs, sendFrameNs + static_cast<int64_t>(uiGLUs) * 1000);
+            struct pollfd pfd = {};
+            pfd.fd = releaseFence;
+            pfd.events = POLLIN;
+            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN) != 0) {
+                int64_t tsNs = queryFenceSignalNs(releaseFence);
+                if (tsNs > 0) {
+                    int64_t startNs = std::max(glSubmitNs, lastGpuSignalNs);
+                    immediateGpuMs = tsNs > startNs ? std::min(200.0, static_cast<double>(tsNs - startNs) / 1e6) : 0.05;
+                    lastGpuSignalNs = std::max(lastGpuSignalNs, tsNs);
+                    lastMeasuredGpuMs = immediateGpuMs;
+                }
+            } else {
+                int dupFd = dup(releaseFence);
+                if (dupFd >= 0) {
+                    if (pendingGpuFences.size() >= 8) {
+                        close(pendingGpuFences.front().fd);
+                        pendingGpuFences.pop_front();
+                    }
+                    pendingGpuFences.push_back(PendingGpuFence{dupFd, glSubmitNs, curSampleSeq});
+                }
+            }
+        } else if (!gpuMode && releaseFence >= 0) {
+            close(releaseFence);
+            releaseFence = -1;
+        }
+
         Region region = {nullptr, 0};
-        rc = OH_NativeWindow_NativeWindowFlushBuffer(win, buf, -1, region);
+        rc = OH_NativeWindow_NativeWindowFlushBuffer(win, buf, gpuMode ? releaseFence : -1, region);
         if (rc != 0) {
             OH_LOG_ERROR(LOG_APP, "win=%{public}u FlushBuffer failed rc=%{public}d", winId, rc);
             continue;
@@ -4692,10 +5108,18 @@ void WinSession::renderLoop() {
         lastFlushNs = nowNs;
 
         PerfFrameSample sample;
+        sample.sampleSeq = curSampleSeq;
         sample.dtMs = ivMs;
-        if (uiGLUs > 0 || gpuFinishUs > 0 || copyUs > 0) {
+        sample.zeroCopy = (perfMeta & (1u << 2)) != 0;
+        if (uiGLUs > 0 || gpuFinishUs > 0 || copyUs > 0 || sample.zeroCopy) {
             sample.uiGlMs = static_cast<double>(uiGLUs) / 1000.0;
-            sample.gpuMs = static_cast<double>(gpuFinishUs) / 1000.0;
+            if (immediateGpuMs >= 0.0) {
+                sample.gpuMs = immediateGpuMs;
+            } else if (gpuFinishUs > 0) {
+                sample.gpuMs = static_cast<double>(gpuFinishUs) / 1000.0;
+            } else if (sample.zeroCopy) {
+                sample.gpuMs = lastMeasuredGpuMs;
+            }
             sample.copyMs = static_cast<double>(copyUs) / 1000.0;
         } else {
             sample.uiGlMs = std::max(0.0, totalDrawMs - flushMs);
@@ -4737,8 +5161,8 @@ void WinSession::renderLoop() {
 
         unloggedFrames++;
         if (frames <= 3 || frames % 60 == 0) {
-            OH_LOG_INFO(LOG_APP, "win=%{public}u frames=%{public}d damaged=%{public}d whole=%{public}d aborted=%{public}d",
-                        winId, frames, damaged, whole, aborted);
+            OH_LOG_INFO(LOG_APP, "win=%{public}u frames=%{public}d damaged=%{public}d whole=%{public}d aborted=%{public}d gpuSwap=%{public}d",
+                        winId, frames, damaged, whole, aborted, gpuMode ? 1 : 0);
         }
         if (frames % 60 == 0) {
             logLatencyStats(winId, "periodic", drawRing, inRing, intervalRing);
@@ -4747,6 +5171,15 @@ void WinSession::renderLoop() {
                         winId, snap.pacingLine.c_str(), snap.stageLine.c_str(), snap.inputLine.c_str());
             unloggedFrames = 0;
         }
+    }
+    for (const auto &pf : pendingGpuFences) {
+        if (pf.fd >= 0) {
+            close(pf.fd);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        clearReplyFenceLocked();
     }
     logLatencyStats(winId, "stop", drawRing, inRing, intervalRing);
 }
@@ -4759,6 +5192,7 @@ void stopWinRenderThread(const std::shared_ptr<WinSession> &ws) {
         std::lock_guard<std::mutex> lk(ws->mu);
         ws->stopRender = true;
         if (ws->reply == BufReply::None) {
+            ws->clearReplyFenceLocked();
             ws->reply = BufReply::Reset;
         }
     }
@@ -5727,6 +6161,7 @@ void resetAllPendingBuffers() {
     for (auto &ws : list) {
         {
             std::lock_guard<std::mutex> lk(ws->mu);
+            ws->clearReplyFenceLocked();
             ws->reply = BufReply::Reset;
             ws->wantFrame = false;
         }
@@ -5807,7 +6242,7 @@ bool pumpEngineMessages() {
             closeAllAudioStreams();
             return !gSupervisorRunning.load() || gEngineCleanQuit.load();
         }
-        if (inFd >= 0 && kind != kAudioOpen) {
+        if (inFd >= 0 && kind != kAudioOpen && kind != kPresent) {
             close(inFd);
             inFd = -1;
         }
@@ -5855,6 +6290,7 @@ bool pumpEngineMessages() {
                 if (ws) {
                     {
                         std::lock_guard<std::mutex> lk(ws->mu);
+                        ws->clearReplyFenceLocked();
                         ws->reply = BufReply::Present;
                         ws->replySeq = seq;
                         ws->replyRectCount = rects;
@@ -5862,9 +6298,15 @@ bool pumpEngineMessages() {
                         ws->replyGpuFinishUs = gpuFinishUs;
                         ws->replyCopyUs = copyUs;
                         ws->replyPerfMeta = perfMeta;
+                        ws->replyFenceFd = inFd;
+                        inFd = -1;
                     }
                     ws->cv.notify_all();
                 }
+            }
+            if (inFd >= 0) {
+                close(inFd);
+                inFd = -1;
             }
             break;
         }
@@ -5877,6 +6319,7 @@ bool pumpEngineMessages() {
                 if (ws) {
                     {
                         std::lock_guard<std::mutex> lk(ws->mu);
+                        ws->clearReplyFenceLocked();
                         ws->reply = BufReply::Abort;
                         ws->replySeq = seq;
                     }
