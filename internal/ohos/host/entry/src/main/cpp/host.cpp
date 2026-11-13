@@ -542,9 +542,14 @@ struct WinSession {
     bool stopRender = false;
     OHNativeWindow *nativeWindow = nullptr;
     OH_NativeVSync *vsync = nullptr;
-    sem_t vsyncSem{};
-    bool vsyncInited = false;
-    std::atomic<int64_t> lastVsyncNs{0};
+    uint64_t vsyncSeq = 0;
+    int64_t vsyncHwNs = 0;
+    int64_t vsyncPeriodHwNs = 0;
+    bool vsyncArmed = false;
+    bool frameInFlight = false;
+    bool inputPrefetch = false;
+    int vsyncIdleTicks = 0;
+    int64_t lastWantFrameNs = 0;
     int32_t curW = 0;
     int32_t curH = 0;
     int32_t targetW = 0;
@@ -576,7 +581,7 @@ struct WinSession {
         }
     }
 
-    void waitVsync();
+    void ensureVsyncArmedLocked();
     void applyExpectedFrameRateLocked(uint32_t fps);
     void renderLoop();
 };
@@ -1798,6 +1803,29 @@ void markInputArrival(WinSession *ws) {
     }
 }
 
+// wakeRenderForInput arms hardware VSync and starts swapchain buffer prefetch
+// in parallel right after kInput is sent to Go so the first interactive frame
+// dispatches with zero VSync or RequestBuffer delay.
+void wakeRenderForInput(WinSession *ws) {
+    if (ws == nullptr) {
+        return;
+    }
+    bool notify = false;
+    {
+        std::lock_guard<std::mutex> lk(ws->mu);
+        if (ws->renderRunning && !ws->stopRender) {
+            ws->ensureVsyncArmedLocked();
+            if (!ws->inputPrefetch && !ws->frameInFlight) {
+                ws->inputPrefetch = true;
+                notify = true;
+            }
+        }
+    }
+    if (notify) {
+        ws->cv.notify_all();
+    }
+}
+
 void sendMouseInput(WinSession *ws, uint8_t op, uint8_t button, uint8_t pointerKind,
                     uint32_t mods, uint32_t timeMs, float x, float y, float pressure) {
     if (ws == nullptr) {
@@ -1816,6 +1844,7 @@ void sendMouseInput(WinSession *ws, uint8_t op, uint8_t button, uint8_t pointerK
     memcpy(p + 20, &y, 4);
     memcpy(p + 24, &pressure, 4);
     sendMessage(kInput, p, sizeof(p), -1);
+    wakeRenderForInput(ws);
 }
 
 struct WireTouchPoint {
@@ -1847,6 +1876,7 @@ void sendTouchInput(WinSession *ws, uint8_t op, bool firstNew, uint32_t mods,
         memcpy(at + 12, &pts[i].pressure, 4);
     }
     sendMessage(kInput, p.data(), static_cast<uint32_t>(p.size()), -1);
+    wakeRenderForInput(ws);
 }
 
 void sendScrollInput(WinSession *ws, uint8_t flags, uint32_t mods, float x, float y, float dx, float dy) {
@@ -1881,6 +1911,7 @@ void sendScrollInput(WinSession *ws, uint8_t flags, uint32_t mods, float x, floa
     memcpy(p + 20, &dx, 4);
     memcpy(p + 24, &dy, 4);
     sendMessage(kInput, p, sizeof(p), -1);
+    wakeRenderForInput(ws);
 }
 
 void setPerfHudEnabled(uint32_t winId, int mode) {
@@ -1940,6 +1971,7 @@ void sendZoomInput(WinSession *ws, uint8_t op, uint32_t mods, float x, float y, 
     memcpy(p + 16, &y, 4);
     memcpy(p + 20, &scale, 4);
     sendMessage(kInput, p, sizeof(p), -1);
+    wakeRenderForInput(ws);
 }
 
 void sendKeyInput(uint32_t winId, uint8_t op, uint32_t mods, int32_t keyCode, uint32_t unicode) {
@@ -1953,6 +1985,7 @@ void sendKeyInput(uint32_t winId, uint8_t op, uint32_t mods, int32_t keyCode, ui
     memcpy(p + 12, &keyCode, 4);
     memcpy(p + 16, &unicode, 4);
     sendMessage(kInput, p, sizeof(p), -1);
+    wakeRenderForInput(ws.get());
 }
 
 void sendWindowInput(uint32_t winId, uint8_t op) {
@@ -4388,11 +4421,53 @@ void OnNodeEvent(ArkUI_NodeEvent *event) {
 
 // ---------- Per-Window VSync & Swapchain Render Thread ----------
 
-void OnVsyncCallback(long long, void *data) {
+void OnVsyncCallback(long long timestamp, void *data) {
     auto *ws = static_cast<WinSession *>(data);
-    if (ws != nullptr && ws->vsyncInited) {
-        ws->lastVsyncNs.store(monoNs(), std::memory_order_relaxed);
-        sem_post(&ws->vsyncSem);
+    if (ws == nullptr) {
+        return;
+    }
+    const int64_t nowNs = monoNs();
+    int64_t hwNs = static_cast<int64_t>(timestamp);
+    if (hwNs <= 0 || std::llabs(nowNs - hwNs) > 50000000LL) {
+        hwNs = nowNs;
+    }
+    long long periodNs = 0;
+    {
+        std::lock_guard<std::mutex> lk(ws->mu);
+        ws->vsyncSeq++;
+        ws->vsyncHwNs = hwNs;
+        if (!ws->stopRender && ws->vsync != nullptr) {
+            if (OH_NativeVSync_GetPeriod(ws->vsync, &periodNs) == 0 &&
+                periodNs >= 2000000LL && periodNs <= 50000000LL) {
+                ws->vsyncPeriodHwNs = static_cast<int64_t>(periodNs);
+            }
+            if (ws->wantFrame || ws->frameInFlight || ws->inputPrefetch) {
+                ws->vsyncIdleTicks = 0;
+            } else {
+                ws->vsyncIdleTicks++;
+            }
+            // Self-rearm right at t=0.0ms of the hardware VSync callback across active
+            // rendering and brief (~100ms) input gaps so 5.5-7.9ms frames never miss
+            // Rosen's registration cutoff for the next 120Hz VSync.
+            if (ws->vsyncIdleTicks <= 12) {
+                ws->vsyncArmed = (OH_NativeVSync_RequestFrame(ws->vsync, OnVsyncCallback, ws) == 0);
+            } else {
+                ws->vsyncArmed = false;
+            }
+        } else {
+            ws->vsyncArmed = false;
+        }
+    }
+    ws->cv.notify_all();
+}
+
+void WinSession::ensureVsyncArmedLocked() {
+    if (stopRender || vsync == nullptr) {
+        return;
+    }
+    vsyncIdleTicks = 0;
+    if (!vsyncArmed) {
+        vsyncArmed = (OH_NativeVSync_RequestFrame(vsync, OnVsyncCallback, this) == 0);
     }
 }
 
@@ -4407,21 +4482,6 @@ void WinSession::applyExpectedFrameRateLocked(uint32_t) {
     int32_t maxHz = std::max<int32_t>(60, static_cast<int32_t>(std::lround(hz)));
     OH_NativeVSync_ExpectedRateRange range = {maxHz, maxHz, maxHz};
     OH_NativeVSync_SetExpectedFrameRateRange(vsync, &range);
-}
-
-void WinSession::waitVsync() {
-    if (vsync == nullptr || !vsyncInited) {
-        return;
-    }
-    OH_NativeVSync_RequestFrame(vsync, OnVsyncCallback, this);
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += 100 * 1000 * 1000;
-    if (ts.tv_nsec >= 1000000000) {
-        ts.tv_sec += 1;
-        ts.tv_nsec -= 1000000000;
-    }
-    (void)sem_timedwait(&vsyncSem, &ts);
 }
 
 void logLatencyStats(uint32_t winId, const char *reason, const LatencyRing &drawRing,
@@ -4663,8 +4723,12 @@ void WinSession::renderLoop() {
     }
 
     bool gpuMode = wantGpuSwapchain();
-    auto configureWinUsage = [&](bool gpu) {
+    const bool uncappedMode = envTruthy(getenv("MYGO_UNCAPPED"));
+    int32_t queueSize = 0;
+    auto configureWinUsage = [&](bool gpu, int32_t initW, int32_t initH) {
         OH_NativeWindow_NativeWindowHandleOpt(win, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_RGBA_8888);
+        OH_NativeWindow_NativeWindowHandleOpt(win, SET_SOURCE_TYPE, static_cast<int32_t>(OH_SURFACE_SOURCE_UI));
+        OH_NativeWindow_NativeWindowHandleOpt(win, SET_SWAP_INTERVAL, uncappedMode ? 0 : 1);
         uint64_t usage = 0;
         OH_NativeWindow_NativeWindowHandleOpt(win, GET_USAGE, &usage);
         if (gpu) {
@@ -4678,10 +4742,24 @@ void WinSession::renderLoop() {
             usage |= NATIVEBUFFER_USAGE_CPU_READ | NATIVEBUFFER_USAGE_CPU_WRITE | NATIVEBUFFER_USAGE_MEM_DMA;
         }
         OH_NativeWindow_NativeWindowHandleOpt(win, SET_USAGE, usage);
+        if (initW > 0 && initH > 0) {
+            OH_NativeWindow_NativeWindowHandleOpt(win, SET_BUFFER_GEOMETRY, initW, initH);
+        }
+        queueSize = 0;
+        OH_NativeWindow_NativeWindowHandleOpt(win, GET_BUFFERQUEUE_SIZE, &queueSize);
+        using PreAllocFn = int32_t (*)(OHNativeWindow *, uint32_t);
+        static PreAllocFn preAllocFn = reinterpret_cast<PreAllocFn>(
+            dlsym(RTLD_DEFAULT, "OH_NativeWindow_PreAllocBuffers"));
+        if (preAllocFn != nullptr) {
+            uint32_t preCnt = std::min<uint32_t>(
+                6u, std::max<uint32_t>(4u, static_cast<uint32_t>(std::max<int32_t>(0, queueSize))));
+            (void)preAllocFn(win, preCnt);
+        }
     };
-    configureWinUsage(gpuMode);
-    OH_LOG_INFO(LOG_APP, "win=%{public}u surface %{public}dx%{public}d scale=%{public}.2f hz=%{public}.0f gpuSwap=%{public}d",
-                winId, w, h, sc, refresh, gpuMode ? 1 : 0);
+    configureWinUsage(gpuMode, w, h);
+    OH_LOG_INFO(LOG_APP,
+                "win=%{public}u surface %{public}dx%{public}d scale=%{public}.2f hz=%{public}.0f gpuSwap=%{public}d qSize=%{public}d uncapped=%{public}d",
+                winId, w, h, sc, refresh, gpuMode ? 1 : 0, queueSize, uncappedMode ? 1 : 0);
     sendSurface(winId, w, h, sc, refresh, true);
 
     struct SentGpuBuf {
@@ -4694,8 +4772,16 @@ void WinSession::renderLoop() {
         int64_t submitNs = 0;
         uint64_t sampleSeq = 0;
     };
+    struct PrefetchedBuf {
+        OHNativeWindowBuffer *buf = nullptr;
+        int fence = -1;
+        int32_t w = 0;
+        int32_t h = 0;
+        double reqMs = 0.0;
+    };
     std::deque<SentGpuBuf> sentGpuBufs;
     std::deque<PendingGpuFence> pendingGpuFences;
+    PrefetchedBuf prefetched;
     uint64_t nextSampleSeq = 1;
     int64_t lastGpuSignalNs = 0;
     double lastMeasuredGpuMs = 0.0;
@@ -4704,11 +4790,92 @@ void WinSession::renderLoop() {
     int frames = 0, damaged = 0, whole = 0, aborted = 0;
     int unloggedFrames = 0;
     int64_t lastFlushNs = 0;
-    int64_t frameAnchorNs = 0;
+    uint64_t lastFlushVsyncSeq = 0;
     int64_t lastHudPushNs = 0;
     bool hudSettled = true;
     LatencyRing drawRing, inRing, intervalRing;
     std::deque<PerfFrameSample> perfWindow;
+
+    auto releasePrefetched = [&]() {
+        if (prefetched.fence >= 0) {
+            close(prefetched.fence);
+            prefetched.fence = -1;
+        }
+        if (prefetched.buf != nullptr) {
+            OH_NativeWindow_NativeWindowAbortBuffer(win, prefetched.buf);
+            prefetched.buf = nullptr;
+        }
+        prefetched.w = 0;
+        prefetched.h = 0;
+        prefetched.reqMs = 0.0;
+    };
+
+    auto ensureGeometryAndPrefetch = [&](int32_t reqW, int32_t reqH) -> bool {
+        if (reqW <= 0 || reqH <= 0) {
+            return false;
+        }
+        if (prefetched.buf != nullptr) {
+            if (prefetched.w == reqW && prefetched.h == reqH) {
+                return true;
+            }
+            releasePrefetched();
+        }
+        int32_t gw = 0, gh = 0;
+        if (OH_NativeWindow_NativeWindowHandleOpt(win, GET_BUFFER_GEOMETRY, &gh, &gw) != 0 ||
+            gw != reqW || gh != reqH) {
+            OH_NativeWindow_NativeWindowHandleOpt(win, SET_BUFFER_GEOMETRY, reqW, reqH);
+        }
+        const int64_t t0 = monoNs();
+        OHNativeWindowBuffer *b = nullptr;
+        int f = -1;
+        int32_t rc = OH_NativeWindow_NativeWindowRequestBuffer(win, &b, &f);
+        if (rc != 0 || b == nullptr) {
+            if (f >= 0) {
+                close(f);
+            }
+            OH_LOG_ERROR(LOG_APP, "win=%{public}u RequestBuffer failed rc=%{public}d", winId, rc);
+            return false;
+        }
+        prefetched.buf = b;
+        prefetched.fence = f;
+        prefetched.w = reqW;
+        prefetched.h = reqH;
+        prefetched.reqMs = static_cast<double>(std::max<int64_t>(0, monoNs() - t0)) / 1e6;
+
+        // Pre-register new swapchain slots with Go off the critical path so kFrame
+        // dispatch right after VSync or kRequest is a single lightweight sendmsg.
+        if (gpuMode) {
+            OH_NativeBuffer *nb = nullptr;
+            if (OH_NativeBuffer_FromNativeWindowBuffer(b, &nb) == 0 && nb != nullptr) {
+                uint32_t bid = OH_NativeBuffer_GetSeqNum(nb);
+                if (bid == 0) {
+                    uintptr_t ptr = reinterpret_cast<uintptr_t>(b);
+                    bid = static_cast<uint32_t>(ptr ^ (ptr >> 32)) | 1u;
+                }
+                OH_NativeBuffer_Config nbCfg = {};
+                OH_NativeBuffer_GetConfig(nb, &nbCfg);
+                BufferHandle *bh = OH_NativeWindow_GetBufferHandleFromNative(b);
+                int32_t bw = nbCfg.width > 0 ? nbCfg.width : (bh != nullptr ? bh->width : 0);
+                int32_t bhgt = nbCfg.height > 0 ? nbCfg.height : (bh != nullptr ? bh->height : 0);
+                if (bw > 0 && bhgt > 0) {
+                    bool alreadySent = false;
+                    for (const auto &sb : sentGpuBufs) {
+                        if (sb.id == bid && sb.w == bw && sb.h == bhgt) {
+                            alreadySent = true;
+                            break;
+                        }
+                    }
+                    if (!alreadySent && sendGpuBuffer(winId, bid, bw, bhgt, nb)) {
+                        if (sentGpuBufs.size() >= 6) {
+                            sentGpuBufs.pop_front();
+                        }
+                        sentGpuBufs.push_back(SentGpuBuf{bid, bw, bhgt});
+                    }
+                }
+            }
+        }
+        return true;
+    };
 
     auto drainGpuFences = [&]() {
         for (auto it = pendingGpuFences.begin(); it != pendingGpuFences.end();) {
@@ -4743,11 +4910,13 @@ void WinSession::renderLoop() {
 
     for (;;) {
         bool pushNow = false;
+        bool doPrefetchOnly = false;
+        int64_t reqArriveNs = 0;
         {
             std::unique_lock<std::mutex> lk(mu);
             bool woke = cv.wait_for(lk, std::chrono::milliseconds(250), [&] {
                 return stopRender || forceResendSurface || targetW != curW || targetH != curH ||
-                       fpsDirty || wantFrame || forcePerfPush;
+                       fpsDirty || wantFrame || inputPrefetch || forcePerfPush;
             });
             if (stopRender) {
                 break;
@@ -4758,6 +4927,7 @@ void WinSession::renderLoop() {
             }
             if (!woke) {
                 lk.unlock();
+                releasePrefetched();
                 drainGpuFences();
                 if (!hudSettled && !perfWindow.empty()) {
                     hudSettled = true;
@@ -4791,6 +4961,7 @@ void WinSession::renderLoop() {
                 refresh = hz;
                 sentGpuBufs.clear();
                 lk.unlock();
+                releasePrefetched();
                 OH_LOG_INFO(LOG_APP, "win=%{public}u resize %{public}dx%{public}d", winId, w, h);
                 sendSurface(winId, w, h, sc, refresh, false);
                 lk.lock();
@@ -4804,6 +4975,7 @@ void WinSession::renderLoop() {
                 refresh = hz;
                 sentGpuBufs.clear();
                 lk.unlock();
+                releasePrefetched();
                 sendSurface(winId, w, h, sc, refresh, true);
                 lk.lock();
                 if (stopRender) {
@@ -4819,69 +4991,116 @@ void WinSession::renderLoop() {
                 bev->kind = BridgeEventKind::PerfHud;
                 bev->perfHud = std::move(snap);
                 postBridgeEvent(std::move(bev));
-                continue;
-            }
-            if (!wantFrame) {
-                continue;
-            }
-            wantFrame = false;
-        }
-
-        const int64_t vsyncPeriodNs = static_cast<int64_t>(1e9 / std::max(60.0, refresh));
-        double vsyncWaitMs = 0.0;
-        const int64_t vsCheckNs = monoNs();
-        if (frameAnchorNs != 0 && (vsCheckNs - frameAnchorNs) < (vsyncPeriodNs * 9) / 10) {
-            lastVsyncNs.store(0, std::memory_order_relaxed);
-            waitVsync();
-            const int64_t afterVsNs = monoNs();
-            vsyncWaitMs = static_cast<double>(std::max<int64_t>(0, afterVsNs - vsCheckNs)) / 1e6;
-            int64_t vsNs = lastVsyncNs.load(std::memory_order_relaxed);
-            frameAnchorNs = vsNs > 0 ? vsNs : afterVsNs;
-        } else {
-            frameAnchorNs = vsCheckNs;
-        }
-
-        {
-            std::unique_lock<std::mutex> lk(mu);
-            if (stopRender) {
-                break;
-            }
-            if (targetW > 0 && targetH > 0 && (targetW != curW || targetH != curH)) {
-                curW = targetW;
-                curH = targetH;
-                w = curW;
-                h = curH;
-                sc = scale;
-                refresh = hz;
-                sentGpuBufs.clear();
-                lk.unlock();
-                sendSurface(winId, w, h, sc, refresh, false);
+                if (!inputPrefetch) {
+                    continue;
+                }
                 lk.lock();
                 if (stopRender) {
                     break;
                 }
             }
+            if (!wantFrame) {
+                if (inputPrefetch) {
+                    inputPrefetch = false;
+                    if (!uncappedMode) {
+                        ensureVsyncArmedLocked();
+                    }
+                    doPrefetchOnly = true;
+                } else {
+                    continue;
+                }
+            } else {
+                wantFrame = false;
+                inputPrefetch = false;
+                frameInFlight = true;
+                reqArriveNs = lastWantFrameNs;
+                if (!uncappedMode) {
+                    ensureVsyncArmedLocked();
+                }
+            }
+        }
+
+        if (doPrefetchOnly) {
+            (void)ensureGeometryAndPrefetch(w, h);
+            continue;
+        }
+
+        struct FrameFlightGuard {
+            WinSession *ws;
+            ~FrameFlightGuard() {
+                std::lock_guard<std::mutex> lk(ws->mu);
+                ws->frameInFlight = false;
+            }
+        } flightGuard{this};
+
+        // Acquire the next swapchain buffer BEFORE waiting on VSync so RequestBuffer
+        // and any first-use OH_NativeBuffer IPC serialization overlap with VSync slack.
+        if (!ensureGeometryAndPrefetch(w, h)) {
+            usleep(4000);
+            std::lock_guard<std::mutex> lk(mu);
+            if (!stopRender) {
+                wantFrame = true;
+            }
+            continue;
+        }
+
+        double vsyncWaitMs = 0.0;
+        if (!uncappedMode) {
+            std::unique_lock<std::mutex> lk(mu);
+            const int64_t vsCheckNs = monoNs();
+            const int64_t periodNs = vsyncPeriodHwNs > 0
+                ? vsyncPeriodHwNs
+                : static_cast<int64_t>(1e9 / std::max(60.0, refresh));
+            // Immediate dispatch (0ms VSync wait, matching macOS drawSoon) when:
+            //   1. First frame on this surface (lastFlushNs == 0), OR
+            //   2. Surface was idle for >= 1 refresh period before input woke it, OR
+            //   3. A hardware VSync boundary has already passed since the last FlushBuffer.
+            // Only wait when a frame was already flushed in this [VSync_k, VSync_{k+1}) slot.
+            const bool needWait = (lastFlushNs > 0) &&
+                                  ((vsCheckNs - lastFlushNs) < periodNs) &&
+                                  (vsyncSeq <= lastFlushVsyncSeq);
+            if (needWait) {
+                ensureVsyncArmedLocked();
+                const uint64_t waitTargetSeq = lastFlushVsyncSeq + 1;
+                const auto maxWait = std::chrono::nanoseconds(std::max<int64_t>(periodNs * 2, 20000000LL));
+                cv.wait_for(lk, maxWait, [&] {
+                    return stopRender || forceResendSurface ||
+                           targetW != curW || targetH != curH ||
+                           vsyncSeq >= waitTargetSeq;
+                });
+                const int64_t afterVsNs = monoNs();
+                vsyncWaitMs = static_cast<double>(std::max<int64_t>(0, afterVsNs - vsCheckNs)) / 1e6;
+            }
+            if (stopRender) {
+                break;
+            }
+            if ((targetW > 0 && targetH > 0 && (targetW != curW || targetH != curH)) || forceResendSurface) {
+                wantFrame = true;
+                lk.unlock();
+                releasePrefetched();
+                continue;
+            }
+            clearReplyFenceLocked();
+            reply = BufReply::None;
+        } else {
+            std::unique_lock<std::mutex> lk(mu);
+            if (stopRender) {
+                break;
+            }
+            if ((targetW > 0 && targetH > 0 && (targetW != curW || targetH != curH)) || forceResendSurface) {
+                wantFrame = true;
+                lk.unlock();
+                releasePrefetched();
+                continue;
+            }
             clearReplyFenceLocked();
             reply = BufReply::None;
         }
 
-        if (w > 0 && h > 0) {
-            int32_t gw = 0, gh = 0;
-            if (OH_NativeWindow_NativeWindowHandleOpt(win, GET_BUFFER_GEOMETRY, &gh, &gw) != 0 ||
-                gw != w || gh != h) {
-                OH_NativeWindow_NativeWindowHandleOpt(win, SET_BUFFER_GEOMETRY, w, h);
-            }
-        }
-
-        const int64_t reqStartNs = monoNs();
-        OHNativeWindowBuffer *buf = nullptr;
-        int fence = -1;
-        int32_t rc = OH_NativeWindow_NativeWindowRequestBuffer(win, &buf, &fence);
-        if (rc != 0 || buf == nullptr) {
-            OH_LOG_ERROR(LOG_APP, "win=%{public}u RequestBuffer failed rc=%{public}d", winId, rc);
-            usleep(16000);
-            continue;
-        }
+        OHNativeWindowBuffer *buf = prefetched.buf;
+        int fence = prefetched.fence;
+        double reqFenceMs = prefetched.reqMs;
+        prefetched = {};
 
         BufferHandle *bh = OH_NativeWindow_GetBufferHandleFromNative(buf);
         uint32_t bufId = 0;
@@ -4894,12 +5113,10 @@ void WinSession::renderLoop() {
             bufId = static_cast<uint32_t>(ptr ^ (ptr >> 32)) | 1u;
         }
 
-        double reqFenceMs = 0.0;
         const uint32_t curSeq = seq++;
         int64_t sendFrameNs = 0;
 
         if (gpuMode) {
-            reqFenceMs = static_cast<double>(std::max<int64_t>(0, monoNs() - reqStartNs)) / 1e6;
             OH_NativeBuffer_Config nbCfg = {};
             if (nb != nullptr) {
                 OH_NativeBuffer_GetConfig(nb, &nbCfg);
@@ -4915,7 +5132,7 @@ void WinSession::renderLoop() {
                 OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
                 gpuMode = false;
                 sentGpuBufs.clear();
-                configureWinUsage(false);
+                configureWinUsage(false, w, h);
                 std::lock_guard<std::mutex> lk(mu);
                 wantFrame = true;
                 continue;
@@ -4928,6 +5145,7 @@ void WinSession::renderLoop() {
                 }
             }
             if (!alreadySent) {
+                const int64_t ipcStartNs = monoNs();
                 if (!sendGpuBuffer(winId, bufId, bufW, bufH, nb)) {
                     if (fence >= 0) {
                         close(fence);
@@ -4936,6 +5154,7 @@ void WinSession::renderLoop() {
                     OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
                     continue;
                 }
+                reqFenceMs += static_cast<double>(std::max<int64_t>(0, monoNs() - ipcStartNs)) / 1e6;
                 if (sentGpuBufs.size() >= 6) {
                     sentGpuBufs.pop_front();
                 }
@@ -4953,6 +5172,7 @@ void WinSession::renderLoop() {
             }
         } else {
             if (fence >= 0) {
+                const int64_t pollStartNs = monoNs();
                 struct pollfd pfd = {};
                 pfd.fd = fence;
                 pfd.events = POLLIN;
@@ -4962,8 +5182,8 @@ void WinSession::renderLoop() {
                 } while (prc == -1 && (errno == EINTR || errno == EAGAIN));
                 close(fence);
                 fence = -1;
+                reqFenceMs += static_cast<double>(std::max<int64_t>(0, monoNs() - pollStartNs)) / 1e6;
             }
-            reqFenceMs = static_cast<double>(std::max<int64_t>(0, monoNs() - reqStartNs)) / 1e6;
             if (bh == nullptr || bh->fd < 0) {
                 OH_NativeWindow_NativeWindowAbortBuffer(win, buf);
                 continue;
@@ -5073,13 +5293,17 @@ void WinSession::renderLoop() {
         }
 
         Region region = {nullptr, 0};
-        rc = OH_NativeWindow_NativeWindowFlushBuffer(win, buf, gpuMode ? releaseFence : -1, region);
-        if (rc != 0) {
-            OH_LOG_ERROR(LOG_APP, "win=%{public}u FlushBuffer failed rc=%{public}d", winId, rc);
+        int32_t flushRc = OH_NativeWindow_NativeWindowFlushBuffer(win, buf, gpuMode ? releaseFence : -1, region);
+        if (flushRc != 0) {
+            OH_LOG_ERROR(LOG_APP, "win=%{public}u FlushBuffer failed rc=%{public}d", winId, flushRc);
             continue;
         }
 
         const int64_t nowNs = monoNs();
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            lastFlushVsyncSeq = vsyncSeq;
+        }
         const double flushMs = static_cast<double>(std::max<int64_t>(0, nowNs - flushStartNs)) / 1e6;
         const double totalDrawMs = static_cast<double>(std::max<int64_t>(0, nowNs - sendFrameNs)) / 1e6;
         if (frames > 0 && sendFrameNs > 0) {
@@ -5088,7 +5312,8 @@ void WinSession::renderLoop() {
         double in2FlushMs = -1.0;
         if (inputSincePresent.exchange(false, std::memory_order_relaxed)) {
             int64_t inNs = lastInputNs.load(std::memory_order_relaxed);
-            if (inNs > 0 && nowNs >= inNs) {
+            if (inNs > 0 && nowNs >= inNs && (nowNs - inNs) <= 200000000LL &&
+                (reqArriveNs == 0 || reqArriveNs <= inNs + 100000000LL)) {
                 in2FlushMs = static_cast<double>(nowNs - inNs) / 1e6;
                 inRing.add(in2FlushMs);
             }
@@ -5096,9 +5321,12 @@ void WinSession::renderLoop() {
         double ivMs = 0.0;
         if (lastFlushNs > 0) {
             double rawIv = static_cast<double>(nowNs - lastFlushNs) / 1e6;
+            double idleGapMs = reqArriveNs > lastFlushNs
+                ? static_cast<double>(reqArriveNs - lastFlushNs) / 1e6
+                : 0.0;
             if (rawIv >= 350.0) {
                 perfWindow.clear();
-            } else if (rawIv > 0.2) {
+            } else if (idleGapMs < 50.0 && rawIv > 0.2) {
                 ivMs = rawIv;
                 if (rawIv < 200.0) {
                     intervalRing.add(rawIv);
@@ -5150,7 +5378,7 @@ void WinSession::renderLoop() {
         }
 
         const bool hudVis = gPerfHudEnabled.load(std::memory_order_relaxed);
-        if (hudVis && (pushNow || lastHudPushNs == 0 || (nowNs - lastHudPushNs) >= 90000000LL)) {
+        if (hudVis && (pushNow || lastHudPushNs == 0 || (nowNs - lastHudPushNs) >= 150000000LL)) {
             lastHudPushNs = nowNs;
             PerfHudData snap = buildPerfHudSnapshot(this, w, h, sc, refresh, aborted, true, true, perfWindow);
             auto bev = std::make_unique<BridgeEvent>();
@@ -5172,6 +5400,7 @@ void WinSession::renderLoop() {
             unloggedFrames = 0;
         }
     }
+    releasePrefetched();
     for (const auto &pf : pendingGpuFences) {
         if (pf.fd >= 0) {
             close(pf.fd);
@@ -5191,26 +5420,27 @@ void stopWinRenderThread(const std::shared_ptr<WinSession> &ws) {
     {
         std::lock_guard<std::mutex> lk(ws->mu);
         ws->stopRender = true;
+        ws->renderRunning = false;
+        ws->frameInFlight = false;
+        ws->inputPrefetch = false;
         if (ws->reply == BufReply::None) {
             ws->clearReplyFenceLocked();
             ws->reply = BufReply::Reset;
         }
     }
-    if (ws->vsyncInited) {
-        sem_post(&ws->vsyncSem);
-    }
     ws->cv.notify_all();
     if (ws->renderThread.joinable()) {
         ws->renderThread.join();
     }
-    ws->renderRunning = false;
-    if (ws->vsync != nullptr) {
-        OH_NativeVSync_Destroy(ws->vsync);
+    OH_NativeVSync *oldVsync = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(ws->mu);
+        oldVsync = ws->vsync;
         ws->vsync = nullptr;
+        ws->vsyncArmed = false;
     }
-    if (ws->vsyncInited) {
-        sem_destroy(&ws->vsyncSem);
-        ws->vsyncInited = false;
+    if (oldVsync != nullptr) {
+        OH_NativeVSync_Destroy(oldVsync);
     }
 }
 
@@ -6262,9 +6492,14 @@ bool pumpEngineMessages() {
                 uint32_t wid = 0;
                 memcpy(&wid, payload.data(), 4);
                 auto ws = getOrCreateSession(wid > 0 ? wid : 1);
+                const int64_t nowNs = monoNs();
                 {
                     std::lock_guard<std::mutex> lk(ws->mu);
+                    if (!ws->wantFrame) {
+                        ws->lastWantFrameNs = nowNs;
+                    }
                     ws->wantFrame = true;
+                    ws->ensureVsyncArmedLocked();
                 }
                 ws->cv.notify_all();
             }
@@ -6933,9 +7168,21 @@ void OnSurfaceChanged(OH_ArkUI_SurfaceHolder *holder, uint64_t width, uint64_t h
     }
 
     stopWinRenderThread(ws);
+    OH_NativeVSync *newVsync = nullptr;
+    if (ws->arkWindowId > 0) {
+        newVsync = OH_NativeVSync_Create_ForAssociatedWindow(static_cast<uint64_t>(ws->arkWindowId), "mygo", 4);
+    }
+    if (newVsync == nullptr) {
+        newVsync = OH_NativeVSync_Create("mygo", 4);
+    }
     {
         std::lock_guard<std::mutex> lk(ws->mu);
         ws->nativeWindow = win;
+        ws->vsync = newVsync;
+        ws->vsyncArmed = false;
+        ws->vsyncIdleTicks = 0;
+        ws->frameInFlight = false;
+        ws->inputPrefetch = false;
         ws->curW = w;
         ws->curH = h;
         ws->targetW = w;
@@ -6943,17 +7190,8 @@ void OnSurfaceChanged(OH_ArkUI_SurfaceHolder *holder, uint64_t width, uint64_t h
         ws->stopRender = false;
         ws->reply = BufReply::None;
         ws->fpsDirty = true;
+        ws->renderRunning = true;
     }
-    if (sem_init(&ws->vsyncSem, 0, 0) == 0) {
-        ws->vsyncInited = true;
-    }
-    if (ws->arkWindowId > 0) {
-        ws->vsync = OH_NativeVSync_Create_ForAssociatedWindow(static_cast<uint64_t>(ws->arkWindowId), "mygo", 4);
-    }
-    if (ws->vsync == nullptr) {
-        ws->vsync = OH_NativeVSync_Create("mygo", 4);
-    }
-    ws->renderRunning = true;
     ws->renderThread = std::thread(&WinSession::renderLoop, ws.get());
 }
 

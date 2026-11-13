@@ -364,6 +364,13 @@ func isPreciseScroll(ev event) (winID uint32, flags byte, mods uint32, ok bool) 
 	return binary.LittleEndian.Uint32(ev.payload[0:]), fl, binary.LittleEndian.Uint32(ev.payload[8:]), true
 }
 
+func isZoomUpdate(ev event) (winID, mods uint32, ok bool) {
+	if ev.kind != kindInput || len(ev.payload) < 24 || ev.payload[4] != inputZoom || ev.payload[5] != zoomUpdate {
+		return 0, 0, false
+	}
+	return binary.LittleEndian.Uint32(ev.payload[0:]), binary.LittleEndian.Uint32(ev.payload[8:]), true
+}
+
 func surfaceWinID(ev event) (uint32, bool) {
 	if ev.kind != kindSurface || len(ev.payload) < 16 {
 		return 0, false
@@ -469,6 +476,17 @@ func (b *Backend) popNextLocked() (event, bool) {
 			if win := b.windows[wid]; win != nil && win.surface != nil {
 				win.surface.coalescedScrolls.Add(merged)
 			}
+		}
+	} else if wid, mods, ok := isZoomUpdate(ev); ok {
+		for idx < len(b.events) {
+			nwid, nmods, nok := isZoomUpdate(b.events[idx])
+			if !nok || nwid != wid || nmods != mods {
+				break
+			}
+			ev = b.events[idx]
+			copy(b.events[idx:], b.events[idx+1:])
+			b.events[len(b.events)-1] = event{}
+			b.events = b.events[:len(b.events)-1]
 		}
 	}
 	return ev, true

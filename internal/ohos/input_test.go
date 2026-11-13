@@ -1444,7 +1444,7 @@ func TestMixedPointerClicksResetDoubleClick(t *testing.T) {
 	}
 }
 
-// Consecutive precise touchpad scrolls queued ahead of a waiting frame sum into a single scroll event while discrete wheel notches stay separate.
+// Consecutive precise touchpad scrolls and cumulative pinch updates queued ahead of a waiting frame coalesce while discrete wheel notches stay separate.
 func TestPreciseScrollCoalescesAheadOfFrame(t *testing.T) {
 	b, _, _, h := newTestSurface(t)
 
@@ -1455,16 +1455,23 @@ func TestPreciseScrollCoalescesAheadOfFrame(t *testing.T) {
 		event{kind: kindInput, payload: encodeScrollInput(1, scrollPrecise, 0, 102, 204, 2.5, 14.0)},
 		event{kind: kindInput, payload: encodeScrollInput(1, 0, 0, 102, 204, 0, -1.0)},
 		event{kind: kindInput, payload: encodeScrollInput(1, 0, 0, 102, 204, 0, -1.0)},
+		event{kind: kindInput, payload: encodeZoomInput(1, zoomBegin, 0, 150, 220, 1.0)},
+		event{kind: kindInput, payload: encodeZoomInput(1, zoomUpdate, 0, 151, 221, 1.25)},
+		event{kind: kindInput, payload: encodeZoomInput(1, zoomUpdate, 0, 154, 225, 1.75)},
+		event{kind: kindInput, payload: encodeZoomInput(1, zoomEnd, 0, 154, 225, 1.75)},
 	)
 	b.mu.Unlock()
 
 	b.Step() // coalesced precise scroll
 	b.Step() // first discrete wheel notch
 	b.Step() // second discrete wheel notch
+	b.Step() // zoomBegin
+	b.Step() // coalesced zoomUpdate (1.25 + 1.75 -> 1.75)
+	b.Step() // zoomEnd
 	b.Step() // aborted fd=-1 frame
 
-	if len(h.events) != 3 {
-		t.Fatalf("got %d scroll events, want 3: %+v", len(h.events), h.events)
+	if len(h.events) != 4 {
+		t.Fatalf("got %d events, want 4: %+v", len(h.events), h.events)
 	}
 	if !h.events[0].Precise || math.Abs(h.events[0].DX-4.0) > 1e-5 || math.Abs(h.events[0].DY-24.0) > 1e-5 ||
 		math.Abs(h.events[0].X-102) > 1e-5 || math.Abs(h.events[0].Y-204) > 1e-5 {
@@ -1472,6 +1479,10 @@ func TestPreciseScrollCoalescesAheadOfFrame(t *testing.T) {
 	}
 	if h.events[1].Precise || h.events[1].DY != -1 || h.events[2].Precise || h.events[2].DY != -1 {
 		t.Fatalf("discrete wheel events = %+v %+v, want two separate DY=-1 notches", h.events[1], h.events[2])
+	}
+	if h.events[3].Kind != platform.PointerZoom || math.Abs(h.events[3].Scale-1.75) > 1e-5 ||
+		math.Abs(h.events[3].X-154) > 1e-5 || math.Abs(h.events[3].Y-225) > 1e-5 {
+		t.Fatalf("coalesced zoomUpdate = %+v, want X=154 Y=225 Scale=1.75", h.events[3])
 	}
 }
 
