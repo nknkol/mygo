@@ -366,11 +366,41 @@ func (s shellBackend) TrashItem(path string) error {
 	return s.callHost(shellTrash, abs)
 }
 
-func (shellBackend) PreviewItem(string) error                     { return platform.ErrUnsupported }
-func (shellBackend) Beep()                                        {}
-func (shellBackend) FileIcon(string, int) ([]byte, error)         { return nil, platform.ErrUnsupported }
-func (shellBackend) TypeIcon(string, int) ([]byte, error)         { return nil, platform.ErrUnsupported }
-func (shellBackend) OpenApplication(string) error                 { return platform.ErrUnsupported }
+func (s shellBackend) PreviewItem(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("ohos: empty path")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return err
+	}
+	return s.callHost(shellPreviewItem, abs)
+}
+
+func (shellBackend) Beep()                                 {}
+func (shellBackend) FileIcon(string, int) ([]byte, error)  { return nil, platform.ErrUnsupported }
+func (shellBackend) TypeIcon(string, int) ([]byte, error)  { return nil, platform.ErrUnsupported }
+
+func (s shellBackend) OpenApplication(path string) error {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return errors.New("ohos: empty application target")
+	}
+	if strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "./") || strings.HasPrefix(trimmed, "../") {
+		abs, err := filepath.Abs(trimmed)
+		if err != nil {
+			return err
+		}
+		if _, err := os.Stat(abs); err != nil {
+			return err
+		}
+		trimmed = abs
+	}
+	return s.callHost(shellOpenApp, trimmed)
+}
 func (shellBackend) DefaultApp(string) (platform.Application, error) {
 	return platform.Application{}, platform.ErrUnsupported
 }

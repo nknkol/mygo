@@ -7,8 +7,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/egoist/mygo/internal/ohosproxy"
+	"github.com/egoist/mygo/internal/ohosvideo"
 	"github.com/egoist/mygo/internal/platform"
 )
 
@@ -109,6 +112,145 @@ func decodeAudioCloseMessage(p []byte) (uint32, bool) {
 		return 0, false
 	}
 	return binary.LittleEndian.Uint32(p[0:]), true
+}
+
+// VideoOpen implements ohosvideo.Bridge, opening an OH_AVPlayer instance in the
+// host process from an open file descriptor or a remote URL.
+func (b *Backend) VideoOpen(playerID uint32, rawURL string, fd int, size int64) error {
+	b.ensureReadLoop()
+	b.mu.Lock()
+	c := b.conn
+	quit := b.quit
+	b.mu.Unlock()
+	if quit || c == nil {
+		return errors.New("ohos: host not connected")
+	}
+	payload := encodeVideoOpenMessage(playerID, size, rawURL)
+	if fd >= 0 {
+		return c.writeWithFD(kindVideoOpen, payload, fd)
+	}
+	return c.write(kindVideoOpen, payload)
+}
+
+// VideoCmd implements ohosvideo.Bridge, sending a playback control command for playerID.
+func (b *Backend) VideoCmd(playerID uint32, op byte, arg int64, farg float64) error {
+	b.mu.Lock()
+	c := b.conn
+	quit := b.quit
+	b.mu.Unlock()
+	if quit || c == nil {
+		return nil
+	}
+	return c.write(kindVideoCmd, encodeVideoCmdMessage(playerID, op, arg, farg))
+}
+
+func (b *Backend) onVideoShm(payload []byte, fd int) {
+	playerID, slotBytes, w, h, ok := decodeVideoShmMessage(payload)
+	if !ok {
+		if fd >= 0 {
+			_ = syscall.Close(fd)
+		}
+		return
+	}
+	ohosvideo.OnVideoShm(playerID, slotBytes, w, h, fd)
+}
+
+func (b *Backend) onVideoEvent(payload []byte) {
+	playerID, ev, buffering, posMs, durMs, w, h, errText, ok := decodeVideoEventMessage(payload)
+	if !ok {
+		return
+	}
+	ohosvideo.OnVideoEvent(playerID, ev, buffering, posMs, durMs, w, h, errText)
+}
+
+func encodeVideoOpenMessage(playerID uint32, size int64, rawURL string) []byte {
+	p := make([]byte, 12, 16+len(rawURL))
+	binary.LittleEndian.PutUint32(p[0:], playerID)
+	binary.LittleEndian.PutUint64(p[4:], uint64(size))
+	return appendWireStr(p, rawURL)
+}
+
+func decodeVideoOpenMessage(p []byte) (playerID uint32, size int64, rawURL string, ok bool) {
+	if len(p) < 16 {
+		return 0, 0, "", false
+	}
+	playerID = binary.LittleEndian.Uint32(p[0:])
+	size = int64(binary.LittleEndian.Uint64(p[4:]))
+	s, off, ok := readWireStr(p, 12)
+	if !ok || off != len(p) {
+		return 0, 0, "", false
+	}
+	return playerID, size, s, true
+}
+
+func encodeVideoCmdMessage(playerID uint32, op byte, arg int64, farg float64) []byte {
+	p := make([]byte, 24)
+	binary.LittleEndian.PutUint32(p[0:], playerID)
+	p[4] = op
+	binary.LittleEndian.PutUint64(p[8:], uint64(arg))
+	putF64(p[16:], farg)
+	return p
+}
+
+func decodeVideoCmdMessage(p []byte) (playerID uint32, op byte, arg int64, farg float64, ok bool) {
+	if len(p) != 24 {
+		return 0, 0, 0, 0, false
+	}
+	return binary.LittleEndian.Uint32(p[0:]),
+		p[4],
+		int64(binary.LittleEndian.Uint64(p[8:])),
+		getF64(p[16:]),
+		true
+}
+
+func encodeVideoShmMessage(playerID, slotBytes, w, h uint32) []byte {
+	p := make([]byte, 16)
+	binary.LittleEndian.PutUint32(p[0:], playerID)
+	binary.LittleEndian.PutUint32(p[4:], slotBytes)
+	binary.LittleEndian.PutUint32(p[8:], w)
+	binary.LittleEndian.PutUint32(p[12:], h)
+	return p
+}
+
+func decodeVideoShmMessage(p []byte) (playerID, slotBytes, w, h uint32, ok bool) {
+	if len(p) < 16 {
+		return 0, 0, 0, 0, false
+	}
+	return binary.LittleEndian.Uint32(p[0:]),
+		binary.LittleEndian.Uint32(p[4:]),
+		binary.LittleEndian.Uint32(p[8:]),
+		binary.LittleEndian.Uint32(p[12:]),
+		true
+}
+
+func encodeVideoEventMessage(playerID uint32, ev, buffering byte, posMs, durMs int64, w, h uint32, errText string) []byte {
+	p := make([]byte, 32, 36+len(errText))
+	binary.LittleEndian.PutUint32(p[0:], playerID)
+	p[4] = ev
+	p[5] = buffering
+	binary.LittleEndian.PutUint64(p[8:], uint64(posMs))
+	binary.LittleEndian.PutUint64(p[16:], uint64(durMs))
+	binary.LittleEndian.PutUint32(p[24:], w)
+	binary.LittleEndian.PutUint32(p[28:], h)
+	return appendWireStr(p, errText)
+}
+
+func decodeVideoEventMessage(p []byte) (playerID uint32, ev, buffering byte, posMs, durMs int64, w, h uint32, errText string, ok bool) {
+	if len(p) < 36 {
+		return 0, 0, 0, 0, 0, 0, 0, "", false
+	}
+	playerID = binary.LittleEndian.Uint32(p[0:])
+	ev = p[4]
+	buffering = p[5]
+	posMs = int64(binary.LittleEndian.Uint64(p[8:]))
+	durMs = int64(binary.LittleEndian.Uint64(p[16:]))
+	w = binary.LittleEndian.Uint32(p[24:])
+	h = binary.LittleEndian.Uint32(p[28:])
+	s, off, ok := readWireStr(p, 32)
+	if !ok || off != len(p) {
+		return 0, 0, 0, 0, 0, 0, 0, "", false
+	}
+	return playerID, ev, buffering, posMs, durMs, w, h, s, true
 }
 
 // NowPlaying returns the HarmonyOS AVSession integration.
@@ -706,17 +848,92 @@ func encodeNetStateMessage(online, metered bool) []byte {
 	return p
 }
 
-func decodeNetStateMessage(p []byte) (online, metered, ok bool) {
-	if len(p) != 4 {
-		return false, false, false
+func encodeNetStateProxyMessage(online, metered bool, proxy ohosproxy.Config) []byte {
+	p := make([]byte, 8)
+	if online {
+		p[0] = 1
 	}
-	return p[0] != 0, p[1] != 0, true
+	if metered {
+		p[1] = 1
+	}
+	p[2] = 1
+	excl := proxy.Exclusions
+	if len(excl) > 1024 {
+		excl = excl[:1024]
+	}
+	var port uint16
+	if proxy.Port > 0 && proxy.Port <= 65535 {
+		port = uint16(proxy.Port)
+	}
+	binary.LittleEndian.PutUint16(p[4:], port)
+	binary.LittleEndian.PutUint16(p[6:], uint16(len(excl)))
+	p = appendWireStr(p, proxy.Host)
+	p = appendWireStr(p, proxy.Username)
+	p = appendWireStr(p, proxy.Password)
+	for _, item := range excl {
+		p = appendWireStr(p, item)
+	}
+	return p
+}
+
+func decodeNetStateMessage(p []byte) (online, metered, ok bool) {
+	online, metered, _, _, ok = decodeNetStateFullMessage(p)
+	return online, metered, ok
+}
+
+func decodeNetStateFullMessage(p []byte) (online, metered, hasProxy bool, proxy ohosproxy.Config, ok bool) {
+	if len(p) < 4 {
+		return false, false, false, ohosproxy.Config{}, false
+	}
+	online = p[0] != 0
+	metered = p[1] != 0
+	if p[2] == 0 {
+		if len(p) != 4 {
+			return false, false, false, ohosproxy.Config{}, false
+		}
+		return online, metered, false, ohosproxy.Config{}, true
+	}
+	if len(p) < 8 {
+		return false, false, false, ohosproxy.Config{}, false
+	}
+	proxy.Port = int(binary.LittleEndian.Uint16(p[4:]))
+	exclCount := int(binary.LittleEndian.Uint16(p[6:]))
+	if exclCount > 1024 {
+		return false, false, false, ohosproxy.Config{}, false
+	}
+	off := 8
+	if proxy.Host, off, ok = readWireStr(p, off); !ok {
+		return false, false, false, ohosproxy.Config{}, false
+	}
+	if proxy.Username, off, ok = readWireStr(p, off); !ok {
+		return false, false, false, ohosproxy.Config{}, false
+	}
+	if proxy.Password, off, ok = readWireStr(p, off); !ok {
+		return false, false, false, ohosproxy.Config{}, false
+	}
+	if exclCount > 0 {
+		proxy.Exclusions = make([]string, 0, exclCount)
+		for range exclCount {
+			var item string
+			if item, off, ok = readWireStr(p, off); !ok {
+				return false, false, false, ohosproxy.Config{}, false
+			}
+			proxy.Exclusions = append(proxy.Exclusions, item)
+		}
+	}
+	if off != len(p) {
+		return false, false, false, ohosproxy.Config{}, false
+	}
+	return online, metered, true, proxy, true
 }
 
 func (b *Backend) onNetState(payload []byte) {
-	online, metered, ok := decodeNetStateMessage(payload)
+	online, metered, hasProxy, proxy, ok := decodeNetStateFullMessage(payload)
 	if !ok {
 		return
+	}
+	if hasProxy {
+		ohosproxy.Set(proxy)
 	}
 	st := platform.NetworkStatus{Online: online, Metered: metered}
 	b.mu.Lock()

@@ -613,6 +613,14 @@ func (b *Backend) UpdateMenuItem(item *platform.MenuItem) {
 		return
 	}
 	b.mu.Lock()
+	if b.appMenu != nil {
+		updateMenuItemInTree(b.appMenu.Items, item)
+	}
+	for _, w := range b.windows {
+		if w != nil && w.menu != nil {
+			updateMenuItemInTree(w.menu.Items, item)
+		}
+	}
 	trays := make([]*trayItem, 0, len(b.trays))
 	for _, tr := range b.trays {
 		trays = append(trays, tr)
@@ -626,6 +634,98 @@ func (b *Backend) UpdateMenuItem(item *platform.MenuItem) {
 			tr.sync(false, true)
 		}
 	}
+}
+
+func matchMenuAccelerator(w *Window, arkCode int32, unicode uint32, mods platform.Modifiers) bool {
+	if w == nil || w.closed || w.b == nil {
+		return false
+	}
+	b := w.b
+	b.mu.Lock()
+	var items []*platform.MenuItem
+	fromWinMenu := false
+	if w.menu != nil {
+		items = cloneMenuItems(w.menu.Items)
+		fromWinMenu = true
+	} else if b.appMenu != nil && !w.opts.Panel && w.opts.Flyout == nil {
+		items = cloneMenuItems(b.appMenu.Items)
+	}
+	app := b.app
+	b.mu.Unlock()
+	if len(items) == 0 {
+		return false
+	}
+	id, ok := findMatchingMenuAccelerator(items, arkCode, unicode, mods)
+	if !ok {
+		return false
+	}
+	if fromWinMenu || app == nil {
+		if w.h != nil {
+			w.h.MenuItemClicked(id)
+			return true
+		}
+		return false
+	}
+	app.MenuItemClicked(id)
+	return true
+}
+
+func findMatchingMenuAccelerator(items []*platform.MenuItem, arkCode int32, unicode uint32, mods platform.Modifiers) (int, bool) {
+	for _, it := range items {
+		if it == nil || !it.Visible || !it.Enabled {
+			continue
+		}
+		if it.Type == platform.MenuItemSubmenu {
+			if it.Submenu != nil {
+				if id, ok := findMatchingMenuAccelerator(it.Submenu.Items, arkCode, unicode, mods); ok {
+					return id, true
+				}
+			}
+			continue
+		}
+		if it.Type == platform.MenuItemSeparator || it.ID == 0 || it.Accelerator == "" {
+			continue
+		}
+		if acceleratorMatchesKey(it.Accelerator, arkCode, unicode, mods) {
+			return it.ID, true
+		}
+	}
+	return 0, false
+}
+
+func acceleratorMatchesKey(spec string, arkCode int32, unicode uint32, mods platform.Modifiers) bool {
+	acc, err := accelerator.Parse(spec, "linux")
+	if err != nil {
+		return false
+	}
+	var wantMods platform.Modifiers
+	if acc.Has(accelerator.Super) {
+		wantMods |= platform.ModSuper
+	}
+	if acc.Has(accelerator.Ctrl) {
+		wantMods |= platform.ModCtrl
+	}
+	if acc.Has(accelerator.Alt) {
+		wantMods |= platform.ModAlt
+	}
+	if acc.Has(accelerator.Shift) {
+		wantMods |= platform.ModShift
+	}
+	heldMods := mods & (platform.ModSuper | platform.ModCtrl | platform.ModAlt | platform.ModShift)
+	if acc.Key == "+" {
+		if arkCode == 2066 || arkCode == 2116 {
+			return heldMods == wantMods
+		}
+		if unicode == '+' || (arkCode == 2058 && heldMods&platform.ModShift != 0) {
+			return (heldMods &^ platform.ModShift) == (wantMods &^ platform.ModShift)
+		}
+		return false
+	}
+	if heldMods != wantMods {
+		return false
+	}
+	wantCode, ok := mapAcceleratorKeyToOHOS(acc.Key)
+	return ok && wantCode == arkCode
 }
 
 func cloneMenuItems(items []*platform.MenuItem) []*platform.MenuItem {

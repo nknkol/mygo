@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/egoist/mygo/internal/ohosproxy"
 	"github.com/egoist/mygo/internal/platform"
 	"github.com/egoist/mygo/internal/unsupported"
 )
@@ -80,6 +81,157 @@ func (a appController) Package() (platform.PackageInfo, bool) {
 		return platform.PackageInfo{}, false
 	}
 	return a.b.pkg, true
+}
+
+func (a appController) SetBadge(label string) {
+	if a.b == nil {
+		return
+	}
+	a.b.mu.Lock()
+	changed := a.b.badge != label
+	a.b.badge = label
+	hasConn := a.b.conn != nil
+	a.b.mu.Unlock()
+	if changed && hasConn {
+		a.b.send(kindShellReq, encodeShellReqMessage(0, shellSetBadge, label))
+	}
+}
+
+func (a appController) Badge() string {
+	if a.b == nil {
+		return ""
+	}
+	a.b.mu.Lock()
+	defer a.b.mu.Unlock()
+	return a.b.badge
+}
+
+func (a appController) Hide() {
+	if a.b == nil {
+		return
+	}
+	a.b.mu.Lock()
+	if a.b.appHidden {
+		a.b.mu.Unlock()
+		return
+	}
+	a.b.appHidden = true
+	a.b.hiddenWins = a.b.hiddenWins[:0]
+	var wins []*Window
+	for _, id := range a.b.winOrder {
+		if w := a.b.windows[id]; w != nil && w.host == nil && !w.closed && w.visible {
+			a.b.hiddenWins = append(a.b.hiddenWins, id)
+			wins = append(wins, w)
+		}
+	}
+	wasActive := a.b.appActive
+	a.b.appActive = false
+	app := a.b.app
+	a.b.mu.Unlock()
+
+	for _, w := range wins {
+		w.Hide()
+	}
+	if wasActive && app != nil {
+		app.DidResignActive()
+	}
+}
+
+func (a appController) Unhide() {
+	if a.b == nil {
+		return
+	}
+	a.b.mu.Lock()
+	if !a.b.appHidden {
+		a.b.mu.Unlock()
+		return
+	}
+	a.b.appHidden = false
+	ids := slices.Clone(a.b.hiddenWins)
+	a.b.hiddenWins = a.b.hiddenWins[:0]
+	var wins []*Window
+	for _, id := range ids {
+		if w := a.b.windows[id]; w != nil && w.host == nil && !w.closed {
+			wins = append(wins, w)
+		}
+	}
+	a.b.mu.Unlock()
+
+	for i, w := range wins {
+		if i == len(wins)-1 {
+			w.Show()
+		} else {
+			w.ShowInactive()
+		}
+	}
+}
+
+func (a appController) IsHidden() bool {
+	if a.b == nil {
+		return false
+	}
+	a.b.mu.Lock()
+	defer a.b.mu.Unlock()
+	return a.b.appHidden
+}
+
+func (a appController) ShowAboutPanel(opts platform.AboutPanelOptions) {
+	if a.b == nil {
+		return
+	}
+	name := strings.TrimSpace(opts.ApplicationName)
+	ver := strings.TrimSpace(opts.ApplicationVersion)
+	if pkg, ok := a.Package(); ok {
+		if name == "" {
+			name = pkg.Name
+		}
+		if ver == "" {
+			ver = pkg.Version
+		}
+	}
+	if name == "" {
+		name = "Application"
+	}
+	var details []string
+	if buildVer := strings.TrimSpace(opts.Version); buildVer != "" && buildVer != ver {
+		if ver != "" {
+			details = append(details, "Version "+ver+" ("+buildVer+")")
+		} else {
+			details = append(details, "Version "+buildVer)
+		}
+	} else if ver != "" {
+		details = append(details, "Version "+ver)
+	}
+	if cp := strings.TrimSpace(opts.Copyright); cp != "" {
+		details = append(details, cp)
+	}
+	if cr := strings.TrimSpace(opts.Credits); cr != "" {
+		details = append(details, cr)
+	}
+	a.b.mu.Lock()
+	win := a.b.focusedOrFirstWindowLocked()
+	a.b.mu.Unlock()
+	var pw platform.Window
+	if win != nil {
+		pw = win
+	}
+	a.b.Dialogs().ShowMessageBox(pw, &platform.MessageBoxOptions{
+		Type:    "info",
+		Title:   name,
+		Message: name,
+		Detail:  strings.Join(details, "\n"),
+		Buttons: []string{"OK"},
+	}, func(platform.MessageBoxResult, error) {})
+}
+
+func (a appController) SetLanguages(tags []string, rtl bool) {
+	if a.b == nil {
+		return
+	}
+	a.b.mu.Lock()
+	a.b.appLangs = slices.Clone(tags)
+	a.b.appRTL = rtl
+	a.b.mu.Unlock()
 }
 
 type screenBackend struct{ b *Backend }
@@ -189,6 +341,9 @@ func (b *Backend) loadInitialEnv() {
 	}
 	if v := strings.TrimSpace(os.Getenv("MYGO_OHOS_REDUCE_MOTION")); v == "1" || v == "true" {
 		b.prefs.ReduceMotion = true
+	}
+	if cfg, ok := ohosproxy.DecodeEnv(os.Getenv(ohosproxy.EnvVar)); ok {
+		ohosproxy.Set(cfg)
 	}
 }
 
@@ -302,6 +457,22 @@ func (b *Backend) onEnvInfo(payload []byte) {
 	}
 }
 
+func (b *Backend) SetApplicationMenu(m *platform.Menu) {
+	if b == nil {
+		return
+	}
+	var cloned *platform.Menu
+	if m != nil {
+		cloned = &platform.Menu{
+			RightToLeft: m.RightToLeft,
+			Items:       cloneMenuItems(m.Items),
+		}
+	}
+	b.mu.Lock()
+	b.appMenu = cloned
+	b.mu.Unlock()
+}
+
 // PopupMenu shows m on pw (or the active window when pw is nil) at pos in the
 // window's content DIPs (or the last pointer position when pos is nil), and
 // pumps nested events until the user picks an item or dismisses the menu.
@@ -310,11 +481,12 @@ func (b *Backend) PopupMenu(m *platform.Menu, pw platform.Window, pos *platform.
 		return
 	}
 	w, _ := pw.(*Window)
+	b.mu.Lock()
 	if w == nil {
-		b.mu.Lock()
 		w = b.focusedOrFirstWindowLocked()
-		b.mu.Unlock()
 	}
+	rtl := m.RightToLeft || b.appRTL
+	b.mu.Unlock()
 	if w == nil || w.closed || b.conn == nil {
 		return
 	}
@@ -326,7 +498,7 @@ func (b *Backend) PopupMenu(m *platform.Menu, pw platform.Window, pos *platform.
 	if pos != nil {
 		x, y = pos.X, pos.Y
 	}
-	payload, visibleCount := encodePopupMenuMessage(0, w.id, x, y, m.RightToLeft, m.Items)
+	payload, visibleCount := encodePopupMenuMessage(0, w.id, x, y, rtl, m.Items)
 	if visibleCount == 0 {
 		return
 	}

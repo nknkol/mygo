@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -393,5 +395,135 @@ func TestOhosPackHNPAndInjectIntoHAP(t *testing.T) {
 	}
 	if hnpCount != 1 {
 		t.Fatalf("hnp entry count = %d, want 1", hnpCount)
+	}
+}
+
+// ensureOhosDevHostHap reuses the cached unsigned host HAP until host inputs change, and packOhosHNPWithEnv embeds etc/mygo.env.
+func TestOhosDevHostCacheAndEnvHNP(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fake hvigorw requires POSIX sh")
+	}
+	workDir, err := os.MkdirTemp(ohosTempDir(), "mygo-ohos-dev-test-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(workDir) })
+
+	tmpl := filepath.Join(workDir, "tmpl")
+	for _, rel := range []string{
+		"AppScope/app.json5",
+		"entry/src/main/cpp/host.cpp",
+		"entry/src/main/cpp/types/libmygo_host/Index.d.ts",
+	} {
+		p := filepath.Join(tmpl, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("template-v1"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	countFile := filepath.Join(workDir, "hvigor-count")
+	fakeHvigor := filepath.Join(workDir, "fake-hvigorw.sh")
+	script := "#!/bin/sh\n" +
+		"echo 1 >> '" + countFile + "'\n" +
+		"mkdir -p entry/build/default/outputs/default\n" +
+		"printf 'PK\\005\\006\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000' > entry/build/default/outputs/default/entry-default-unsigned.hap\n"
+	if err := os.WriteFile(fakeHvigor, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	proj := filepath.Join(workDir, "proj")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proj, "mygo.json"), []byte(`{"name":"Demo","identifier":"dev.egoist.demo","version":"0.2.0"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := loadConfig(proj)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	dc := devConfig(c)
+	cacheDir := filepath.Join(workDir, "host-cache")
+
+	hap1, sum1, err := ensureOhosDevHostHap(context.Background(), nil, dc, tmpl, cacheDir, fakeHvigor, nil)
+	if err != nil {
+		t.Fatalf("first ensureOhosDevHostHap: %v", err)
+	}
+	hap2, sum2, err := ensureOhosDevHostHap(context.Background(), nil, dc, tmpl, cacheDir, fakeHvigor, nil)
+	if err != nil {
+		t.Fatalf("second ensureOhosDevHostHap: %v", err)
+	}
+	if hap1 != hap2 || sum1 != sum2 {
+		t.Fatalf("cache miss on identical config: (%q, %x) vs (%q, %x)", hap1, sum1, hap2, sum2)
+	}
+	runs, _ := os.ReadFile(countFile)
+	if got := len(bytes.Split(bytes.TrimSpace(runs), []byte("\n"))); got != 1 {
+		t.Fatalf("hvigorw invoked %d times on cached config, want 1", got)
+	}
+
+	// Changing a host-level setting (permissions) invalidates the host HAP cache.
+	dc.OHOS.Permissions = []string{"ohos.permission.MICROPHONE"}
+	hap3, sum3, err := ensureOhosDevHostHap(context.Background(), nil, dc, tmpl, cacheDir, fakeHvigor, nil)
+	if err != nil {
+		t.Fatalf("third ensureOhosDevHostHap: %v", err)
+	}
+	if hap3 == hap1 || sum3 == sum1 {
+		t.Fatal("expected new cached HAP after permission change")
+	}
+	runs, _ = os.ReadFile(countFile)
+	if got := len(bytes.Split(bytes.TrimSpace(runs), []byte("\n"))); got != 2 {
+		t.Fatalf("hvigorw invoked %d times after config change, want 2", got)
+	}
+
+	// Verify packOhosHNPWithEnv writes etc/mygo.env inside the HNP zip.
+	engine := filepath.Join(workDir, "mygo-engine")
+	if err := os.WriteFile(engine, []byte("ELF"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hnpPath := filepath.Join(workDir, "mygo.hnp")
+	wantEnv := []string{"MYGO_ENV=development", "MYGO_DEV=1", "MYGO_LOCALE=zh-CN"}
+	if err := packOhosHNPWithEnv(dc, engine, "", "", nil, wantEnv, hnpPath); err != nil {
+		t.Fatalf("packOhosHNPWithEnv: %v", err)
+	}
+	zr, err := zip.OpenReader(hnpPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	var gotEnv string
+	for _, zf := range zr.File {
+		if zf.Name == "mygo_0.2.0/etc/mygo.env" {
+			rc, err := zf.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, _ := io.ReadAll(rc)
+			_ = rc.Close()
+			gotEnv = string(b)
+		}
+	}
+	if gotEnv != "MYGO_ENV=development\nMYGO_DEV=1\nMYGO_LOCALE=zh-CN\n" {
+		t.Fatalf("etc/mygo.env = %q", gotEnv)
+	}
+}
+
+// formatOhosHilogLine strips hilog prefixes from Go engine logs while surfacing host error lines and suppressing routine bridge info logs.
+func TestFormatOhosHilogLine(t *testing.T) {
+	msg, isErr, ok := formatOhosHilogLine("11-13 18:05:50.294  4120  4128 I A00000/dev.egoist.demo.dev/mygo-host: listening on :8080")
+	if !ok || isErr || msg != "listening on :8080" {
+		t.Fatalf("mygo-host info = (%q, %v, %v), want ('listening on :8080', false, true)", msg, isErr, ok)
+	}
+	if _, _, ok := formatOhosHilogLine("11-13 18:05:50.294  4120  4121 I A00000/dev.egoist.demo.dev/mygo-host: engine started pid=4129"); ok {
+		t.Fatal("expected internal engine started pid line to be suppressed")
+	}
+	if _, _, ok := formatOhosHilogLine("11-13 18:05:50.294  4120  4120 I A00000/dev.egoist.demo.dev/mygo: onCreate uri="); ok {
+		t.Fatal("expected routine EntryAbility info log to be suppressed")
+	}
+	msg, isErr, ok = formatOhosHilogLine("11-13 18:05:50.294  4120  4120 E A00000/dev.egoist.demo.dev/mygo-bridge: loadContent failed: bad page")
+	if !ok || !isErr || msg != "[host] loadContent failed: bad page" {
+		t.Fatalf("mygo-bridge error = (%q, %v, %v)", msg, isErr, ok)
 	}
 }

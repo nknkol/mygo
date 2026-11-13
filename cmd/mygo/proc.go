@@ -222,7 +222,11 @@ func writeClient(ctx context.Context, c *Config, asked bool) error {
 	bin := tempBinary(c.executableName())
 	defer os.Remove(bin)
 	changed := false
-	err := goBuild(ctx, c, t, bin, nil)
+	var buildFlags []string
+	if isOhosHost() {
+		buildFlags = ohosBuildTags(true)
+	}
+	err := goBuild(ctx, c, t, bin, nil, buildFlags...)
 	if err == nil {
 		t.set("running the app in generate mode")
 		changed, err = generateBindings(c, bin)
@@ -274,7 +278,7 @@ func waitForURL(ctx context.Context, url string, exited <-chan error) error {
 }
 
 func tempBinary(name string) string {
-	dir := filepath.Join(os.TempDir(), "mygo-dev")
+	dir := filepath.Join(ohosTempDir(), "mygo-dev")
 	_ = os.MkdirAll(dir, 0o755)
 	name = strings.ReplaceAll(name, " ", "-")
 	if runtime.GOOS == "windows" {

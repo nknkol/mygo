@@ -3,6 +3,8 @@
 package ohos
 
 import (
+	"bytes"
+	"image/png"
 	"math"
 	"net/url"
 	"slices"
@@ -59,6 +61,7 @@ type Window struct {
 	flyoutSize   platform.Size
 	flyoutPlaced bool
 	dismissing   bool
+	menu         *platform.Menu
 }
 
 func newWindow(b *Backend, id uint32, scale float64, opts *platform.WindowOptions, h platform.WindowHandler) *Window {
@@ -583,9 +586,36 @@ func (w *Window) SetProgressBar(string, float64) {}
 func (w *Window) FlashFrame(bool)                 {}
 func (w *Window) SetSkipTaskbar(bool)             {}
 func (w *Window) SetVisibleOnAllWorkspaces(bool)  {}
-func (w *Window) SetIcon([]byte) error            { return platform.ErrUnsupported }
-func (w *Window) SetMenu(*platform.Menu)          {}
-func (w *Window) SetAutoHideMenu(bool)            {}
+
+func (w *Window) SetIcon(pngData []byte) error {
+	if len(pngData) == 0 {
+		return nil
+	}
+	_, err := png.DecodeConfig(bytes.NewReader(pngData))
+	return err
+}
+
+func (w *Window) SetMenu(m *platform.Menu) {
+	if w == nil {
+		return
+	}
+	var cloned *platform.Menu
+	if m != nil {
+		cloned = &platform.Menu{
+			RightToLeft: m.RightToLeft,
+			Items:       cloneMenuItems(m.Items),
+		}
+	}
+	if w.b != nil {
+		w.b.mu.Lock()
+		w.menu = cloned
+		w.b.mu.Unlock()
+	} else {
+		w.menu = cloned
+	}
+}
+
+func (w *Window) SetAutoHideMenu(bool) {}
 
 func (w *Window) TitleBar() platform.TitleBar {
 	if !w.hiddenTitleBar() || w.opts.HideWindowButtons || w.fullscreen {

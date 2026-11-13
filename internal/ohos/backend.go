@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/egoist/mygo/internal/ohosaudio"
+	"github.com/egoist/mygo/internal/ohosvideo"
 	"github.com/egoist/mygo/internal/platform"
 	"github.com/egoist/mygo/internal/unsupported"
 )
@@ -124,6 +125,13 @@ type Backend struct {
 	trays         map[uint32]*trayItem
 	dragSessions  map[string]*Surface
 	perfHUDSent   bool
+
+	badge      string
+	appHidden  bool
+	hiddenWins []uint32
+	appLangs   []string
+	appRTL     bool
+	appMenu    *platform.Menu
 }
 
 // New returns the backend from the arguments and environment the host started
@@ -298,6 +306,7 @@ func (b *Backend) Init(h platform.AppHandler, opts platform.AppOptions) error {
 	b.mu.Unlock()
 	b.conn = &conn{fd: b.fd}
 	ohosaudio.SetBridge(b)
+	ohosvideo.SetBridge(b)
 	return nil
 }
 
@@ -394,7 +403,8 @@ func (b *Backend) popNextLocked() (event, bool) {
 				kindClipChanged, kindClipData, kindDialogResult, kindShellResult, kindAppOpen,
 				kindMediaCmd, kindNotifResult, kindNotifClicked, kindPowerState, kindNetState,
 				kindCookieResult, kindWebEvent, kindWebAsyncRes, kindSchemeReq,
-				kindHotkeyTrig, kindTrayEvent, kindDragEvent, kindAccessEvent, kindInternal:
+				kindHotkeyTrig, kindTrayEvent, kindDragEvent, kindAccessEvent,
+				kindVideoShm, kindVideoEvent, kindInternal:
 				idx = i
 			case kindQuit, kindSurface, kindGPUBuffer:
 				i = len(b.events)
@@ -544,6 +554,7 @@ func (b *Backend) Signal() {
 
 func (b *Backend) Quit() {
 	ohosaudio.ClearBridge(b)
+	ohosvideo.ClearBridge(b)
 	if b.IsMainThread() {
 		b.syncOwnedClipboardToHost()
 	}
@@ -727,6 +738,20 @@ func (b *Backend) readLoop() {
 			b.handleHotkeyRes(payload)
 			continue
 		}
+		if kind == kindVideoShm {
+			shmFD := -1
+			if len(fds) > 0 {
+				shmFD = fds[0]
+				closeFDs(fds[1:])
+			}
+			b.onVideoShm(payload, shmFD)
+			continue
+		}
+		if kind == kindVideoEvent {
+			closeFDs(fds)
+			b.onVideoEvent(payload)
+			continue
+		}
 		ev := event{kind: kind, payload: payload, fd: -1}
 		switch kind {
 		case kindGPUBuffer:
@@ -809,6 +834,10 @@ func (b *Backend) dispatch(ev event) {
 		b.onDragEvent(ev.payload)
 	case kindAccessEvent:
 		b.onAccessEvent(ev.payload)
+	case kindVideoShm:
+		b.onVideoShm(ev.payload, ev.fd)
+	case kindVideoEvent:
+		b.onVideoEvent(ev.payload)
 	case kindInternal:
 		if ev.fn != nil {
 			ev.fn()

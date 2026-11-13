@@ -310,7 +310,15 @@ export interface HostModule {
   resolveNotif(reqId: number, denied: boolean, err: string): void;
   notifyNotifClicked(id: string): void;
   notifyPowerState(onBattery: boolean, event: string): void;
-  notifyNetState(online: boolean, metered: boolean): void;
+  notifyNetState(
+    online: boolean,
+    metered: boolean,
+    proxyHost?: string,
+    proxyPort?: number,
+    proxyUser?: string,
+    proxyPass?: string,
+    proxyExclusions?: string[]
+  ): void;
   resolveCookie(reqId: number, err: string, cookies: HostCookie[]): void;
   notifyWebEvent(
     winId: number,

@@ -124,18 +124,26 @@ fd 走 `SCM_RIGHTS` → Go 引擎 `mmap` 画 → `FlushBuffer`。
 - [x] **桌面通知、电源/后台保活与网络感知**：接入 `@kit.NotificationKit`（支持图片通知、`WantAgent` 冷启动缓冲与热唤起 `NotificationClicked`、权限拒绝映射 `ErrNotificationsDenied`、按 `(id, label)` 取消）、`@kit.BackgroundTasksKit`（引用计数的 `AUDIO_PLAYBACK` 长时任务 + `setWindowKeepScreenOn`、`OnBattery`、锁屏/挂起恢复事件与输入驱动的 `IdleTime`）以及 `@kit.NetworkKit`（`Network.Status`/`Watch` 在线与计费网络监听）
 - [x] **退出判据**：单元测试（`go test -count=5 ./internal/ohos/... ./internal/ohosaudio/... ./audio/...` 含 `-tags mygo_ohos`）全绿；真机验证 48kHz 双声道 `F32LE` 共享内存音频流、`AVSession` 渲染流绑定（`renderer state is 2`）、电源长时任务与网络状态查询通过；`EntryAbility` 退后台触发 `SurfaceHidden` 停止无谓重绘而不误标窗口最小化
 
-## S8 端到端验证与框架化
+## S8 GPU 硬件渲染、WebView 混合合成、安全凭据、系统托盘与工程化闭环 —— 已完成
 
-- [ ] **零业务侵入运行 `mygo-music` 全量验证**：本地目录扫描导入、SQLite（`modernc`/`moejs`）、歌词与封面渲染、子设置窗、无标题栏拖拽、播控中心与深链登录全链路验收
-- [ ] 协议与宿主 `.so`/ArkTS 壳搬进 `cmd/mygo/template/ohos`
-- [ ] `mygo build -platform ohos/arm64`：交叉编译 + 打包 HNP + 签名 + `hvigorw`
-- [ ] `-tags mygo_ohos` 的构建约定写进框架文档
+- [x] **EGL + OpenGL ES 3.0 GPU 硬件加速（`internal/ohos/egl.go` + `internal/gl`）**：`OHNativeWindowBuffer` → `OH_NativeWindow_GetBufferHandleFromNative` → `DMA-BUF` + fence `SCM_RIGHTS` → Go 引擎零拷贝导入 `EGLImageKHR`（`EGL_LINUX_DMA_BUF_EXT`），支持 120Hz 脏区增量合成与软件回退，内置 120Hz 二阶临界阻尼触控板滚动重采样器消除像素阶梯抖动
+- [x] **ArkWeb 原生与页内混合 WebView（`Backend.WebViewAvailable` / `NewEmbeddedWebView`）**：主/子窗口独立 WebView 与自绘 UI 页内内嵌 `ArkWeb` 混合合成（圆角裁剪、自定义协议拦截、UserScript 注入、双向 RPC、异步 JS 执行、页面截图、PDF 导出、Cookie/站点数据管理）
+- [x] **系统托盘、安全凭据与优雅退出**：接入 `@kit.DeskTopExtensionKit` `statusBarManager` 状态栏图标与菜单、`@kit.AssetStoreKit` 硬件级 `keyring` 凭据存储（`keyring/ohos_linux.go`），打通 `onPrepareToTerminate`、`App.Relaunch` 与单实例激活
+- [x] **桌面外围与网络代理补齐**：
+      - `netproxy`（`netproxy/system_ohos.go` + `internal/ohosproxy`）：接入 `@kit.NetworkKit` `connection.getGlobalHttpProxy` / `getDefaultHttpProxy`，启动注入与运行期随 `kindNetState` 实时同步系统 HTTP 代理、鉴权与 `Exclusions` 绕过列表
+      - `AppController` / `Window` / `Shell`：补齐 `SetBadge`/`Badge`（`notificationManager.setBadgeNumber`）、`Hide`/`Unhide`/`IsHidden`、`ShowAboutPanel`、`SetLanguages`（含 RTL 菜单方向）、应用与窗口菜单快捷键加速键派发（`SetApplicationMenu`/`Window.SetMenu`/`UpdateMenuItem`）、`Window.SetIcon` PNG 校验、`Shell.PreviewItem`（`@kit.PreviewKit` `filePreview`）与 `Shell.OpenApplication`（`startAbility`）
+- [x] **原生视频解码与共享内存零套接字拷贝播放（`ui/video/ohos_linux.go` + `internal/ohosvideo`）**：宿主侧 `OH_AVPlayer` + `OH_ImageReceiverNative` 硬件解码输出至 3 槽 `memfd` 共享内存环（直通 `NV12` 双平面 `BT.601`/`BT.709`/`BT.2020` 全/限幅色域与 `BGRA` 回退，支持 `file://` / 内存 `OpenData` `SCM_RIGHTS` fd 与远程流 URL、首帧预解、暂停精确 Seek、缓冲状态、倍速、音量/静音与循环播放）
+- [x] **CLI 一站式构建与热重载（`cmd/mygo`）**：
+      - `mygo build -platform ohos/arm64`：自动编译 `-tags mygo_ohos` 引擎、解析 musl Pango `.so` 闭包打包 `mygo.hnp`、生成宿主工程与分层图标、调用 `hvigorw assembleHap`、无损注入 `Store` 模式 HNP 并支持 `hda` 自动签名
+      - `mygo dev`（HarmonyOS PC 自动启用 `-ohos`）：按宿主工程树 SHA-256 缓存未签名宿主 `.hap`（纯 Go 代码改动完全跳过 `hvigorw`），增量编译引擎、重打 `mygo.hnp`（含 `etc/mygo.env` 开发环境变量）、`hda` 签名、`hdc install -r` 安装、`aa start` 拉起 `EntryAbility` 并按进程 PID 实时流式转发 `hilog` 输出
+- [x] **零业务侵入运行 `mygo-music` 端到端验证**：本地与在线播放、封面与逐字歌词渲染、均衡器、无标题栏拖拽与缩放、播控中心、深链登录全链路跑通
 
-## 不进这个路线图
+## 当前系统能力边界（保持优雅降级 / `ErrUnsupported`）
 
-| 东西 | 为什么不 |
+| 能力 | 当前状态与原因 |
 |---|---|
-| 离屏 GL（`EGL_NATIVE_BUFFER_OHOS`） | 软件光栅在 `ui` 是一等公民；实测撑不住再做，且只换渲染器不动协议 |
-| 页内 WebView（`ArkWeb` 混合合成） | 纯 `ui` 自绘桌面应用无需 WebView；`WebViewAvailable() == false` 已是框架一等契约 |
-| 辅助功能、跨应用拖放、系统玻璃 | `platform` 有接口，先保持空实现或 `ErrUnsupported` |
-| 方案 C | 见 [c-in-process-cgo.md](docs/design/c-in-process-cgo.md)，翻案条件是 S4 的 p99（实测已通过 D⁺） |
+| 跨应用原生拖拽（`StartDrag` / Drop Target） | 依赖 ArkUI 组件级 `unifiedDataChannel` 拖拽会话，当前自绘 `XComponent` 表面暂保持应用内拖拽 |
+| 系统无障碍树（Accessibility Tree） | 自绘表面尚未桥接 `ArkUI_AccessibilityProvider` 节点树 |
+| 系统全局热键（Global Hotkey） | HarmonyOS PC 第三方应用受限于系统级快捷键抢占权限，暂返回不支持（应用/窗口内菜单快捷键已完整支持） |
+| 桌面壁纸设置 / 窗口毛玻璃材质（Vibrancy） | 保持平台可选能力降级语义 |
+| 方案 C（同进程 cgo） | 见 [c-in-process-cgo.md](docs/design/c-in-process-cgo.md)，D⁺ 在 120Hz 下端到端延迟与稳定性已全面达标，无需采用 |

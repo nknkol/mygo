@@ -39,6 +39,7 @@ import { i18n } from '@kit.LocalizationKit';
 import { connection } from '@kit.NetworkKit';
 import { notificationManager } from '@kit.NotificationKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { filePreview } from '@kit.PreviewKit';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'mygo-bridge';
@@ -114,6 +115,9 @@ const SHELL_OPEN_EXTERNAL: number = 1;
 const SHELL_OPEN_PATH: number = 2;
 const SHELL_SHOW_IN_FOLDER: number = 3;
 const SHELL_TRASH: number = 4;
+const SHELL_PREVIEW_ITEM: number = 5;
+const SHELL_OPEN_APP: number = 6;
+const SHELL_SET_BADGE: number = 7;
 
 const APP_OPEN_URLS: number = 1;
 const APP_OPEN_FILES: number = 2;
@@ -1502,10 +1506,14 @@ class HostBridgeManager {
 
   private handleShellReq(reqId: number, op: number, target: string): void {
     this.runShellReqAsync(op, target).then((): void => {
-      host.resolveShell(reqId, '');
+      if (reqId > 0) {
+        host.resolveShell(reqId, '');
+      }
     }).catch((err: BusinessError): void => {
-      const msg: string = err?.message ?? 'shell operation failed';
-      host.resolveShell(reqId, msg);
+      if (reqId > 0) {
+        const msg: string = err?.message ?? 'shell operation failed';
+        host.resolveShell(reqId, msg);
+      }
     });
   }
 
@@ -1577,6 +1585,102 @@ class HostBridgeManager {
             fileIo.unlinkSync(target);
           }
         }
+        return;
+      }
+      case SHELL_PREVIEW_ITEM: {
+        const uri: string = fileUri.getUriFromPath(target);
+        const parts: [string, string] = splitPathDirAndBase(target);
+        const info: filePreview.PreviewInfo = {
+          title: parts[1].length > 0 ? parts[1] : undefined,
+          uri: uri,
+          mimeType: ''
+        };
+        let canPrev: boolean = false;
+        try {
+          canPrev = await filePreview.canPreview(ctx, uri);
+        } catch (_) {}
+        if (!canPrev) {
+          const fallbackWant: Want = {
+            action: 'ohos.want.action.viewData',
+            uri: uri
+          };
+          await ctx.startAbility(fallbackWant);
+          return;
+        }
+        const shown: boolean = await filePreview.hasDisplayed(ctx);
+        if (shown) {
+          await filePreview.loadData(ctx, info);
+        } else {
+          await filePreview.openPreview(ctx, info);
+        }
+        return;
+      }
+      case SHELL_OPEN_APP: {
+        if (target.indexOf('://') > 0) {
+          try {
+            await ctx.openLink(target, { appLinkingOnly: false });
+          } catch (_) {
+            const linkWant: Want = {
+              action: 'ohos.want.action.viewData',
+              uri: target
+            };
+            await ctx.startAbility(linkWant);
+          }
+          return;
+        }
+        if (target.startsWith('/')) {
+          const uri: string = fileUri.getUriFromPath(target);
+          const fileWant: Want = {
+            action: 'ohos.want.action.viewData',
+            uri: uri
+          };
+          await ctx.startAbility(fileWant);
+          return;
+        }
+        const slashIdx: number = target.indexOf('/');
+        if (slashIdx > 0) {
+          const bName: string = target.substring(0, slashIdx);
+          const aName: string = target.substring(slashIdx + 1);
+          const explicitWant: Want = {
+            bundleName: bName,
+            abilityName: aName.length > 0 ? aName : 'EntryAbility'
+          };
+          await ctx.startAbility(explicitWant);
+          return;
+        }
+        try {
+          const launchWant: Want = bundleManager.getLaunchWantForBundleSync(target);
+          await ctx.startAbility(launchWant);
+          return;
+        } catch (_) {}
+        try {
+          const homeWant: Want = {
+            bundleName: target,
+            action: 'action.system.home',
+            entities: ['entity.system.home']
+          };
+          await ctx.startAbility(homeWant);
+          return;
+        } catch (_) {}
+        const fallbackAppWant: Want = {
+          bundleName: target,
+          abilityName: 'EntryAbility'
+        };
+        await ctx.startAbility(fallbackAppWant);
+        return;
+      }
+      case SHELL_SET_BADGE: {
+        const trimmed: string = target.trim();
+        let badgeNum: number = 0;
+        if (trimmed.length > 0) {
+          const parsed: number = parseInt(trimmed, 10);
+          if (!Number.isNaN(parsed)) {
+            badgeNum = Math.max(0, parsed);
+          } else {
+            badgeNum = 1;
+          }
+        }
+        await notificationManager.setBadgeNumber(badgeNum);
         return;
       }
       default:
@@ -2980,13 +3084,18 @@ class HostBridgeManager {
         commonEventManager.Support.COMMON_EVENT_CHARGING,
         commonEventManager.Support.COMMON_EVENT_DISCHARGING,
         commonEventManager.Support.COMMON_EVENT_POWER_CONNECTED,
-        commonEventManager.Support.COMMON_EVENT_POWER_DISCONNECTED
+        commonEventManager.Support.COMMON_EVENT_POWER_DISCONNECTED,
+        commonEventManager.Support.COMMON_EVENT_HTTP_PROXY_CHANGE
       ]
     };
     commonEventManager.createSubscriber(subInfo).then((sub: commonEventManager.CommonEventSubscriber): void => {
       this.powerSubscriber = sub;
       commonEventManager.subscribe(sub, (err: BusinessError, data: commonEventManager.CommonEventData): void => {
         if (err) {
+          return;
+        }
+        if (data.event === commonEventManager.Support.COMMON_EVENT_HTTP_PROXY_CHANGE) {
+          this.queryAndNotifyNetState();
           return;
         }
         const onBat: boolean = this.isCurrentlyOnBattery();
@@ -3083,7 +3192,22 @@ class HostBridgeManager {
       online = true;
       metered = false;
     }
-    host.notifyNetState(online, metered);
+    const curOnline: boolean = online;
+    const curMetered: boolean = metered;
+    try {
+      connection.getDefaultHttpProxy().then((proxy: connection.HttpProxy): void => {
+        const pHost: string = proxy.host ?? '';
+        const pPort: number = proxy.port ?? 0;
+        const pUser: string = proxy.username ?? '';
+        const pPass: string = proxy.password ?? '';
+        const pExcl: string[] = proxy.exclusionList ?? [];
+        host.notifyNetState(curOnline, curMetered, pHost, pPort, pUser, pPass, pExcl);
+      }).catch((): void => {
+        host.notifyNetState(curOnline, curMetered, '', 0, '', '', []);
+      });
+    } catch (_) {
+      host.notifyNetState(curOnline, curMetered, '', 0, '', '', []);
+    }
   }
 
   private handleNetWatch(): void {
@@ -3100,6 +3224,9 @@ class HostBridgeManager {
         this.queryAndNotifyNetState();
       });
       conn.on('netCapabilitiesChange', (): void => {
+        this.queryAndNotifyNetState();
+      });
+      conn.on('netConnectionPropertiesChange', (): void => {
         this.queryAndNotifyNetState();
       });
       conn.on('netLost', (): void => {

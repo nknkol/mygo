@@ -541,6 +541,9 @@ func (s *Surface) onKey(p []byte) {
 		Mods:        mods,
 		Repeat:      repeat,
 	})
+	if kind == platform.KeyPressed && !taken && s.w != nil && matchMenuAccelerator(s.w, arkCode, unicode, mods) {
+		taken = true
+	}
 	if kind == platform.KeyPressed && !taken && s.textInput &&
 		mods&(platform.ModCtrl|platform.ModAlt|platform.ModSuper) == 0 &&
 		unicode >= 0x20 && unicode != 0x7f {

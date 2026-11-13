@@ -91,6 +91,10 @@ const (
 	kindAccessTree     = 62 // engine -> host: accessibility tree snapshot & live announcements
 	kindAccessEvent    = 63 // host -> engine: {u32 winID, u8 ev, u8 actionKind, 2×pad, u64 nodeID, i32 from, i32 to, str text}
 	kindGPUBuffer      = 64 // host -> engine: {u32 winID, u32 bufID, u32 w, u32 h, u32 tokenCount, mask..., ints...} + fds
+	kindVideoOpen      = 65 // engine -> host: {u32 playerID, i64 size, str url} [+ fd]
+	kindVideoCmd       = 66 // engine -> host: {u32 playerID, u8 op, 3×pad, i64 arg, f64 farg}
+	kindVideoShm       = 67 // host -> engine: {u32 playerID, u32 slotBytes, u32 w, u32 h, u8 fmt, u8 matrix, u8 fullRange, u8 pad} + fd
+	kindVideoEvent     = 68 // host -> engine: {u32 playerID, u8 ev, u8 buffering, 2×pad, i64 posMs, i64 durMs, u32 w, u32 h, str err}
 
 	kindInternal = 255 // internal main-thread callback queued via Backend.post
 )
@@ -185,6 +189,9 @@ const (
 	shellOpenPath     byte = 2
 	shellShowInFolder byte = 3
 	shellTrash        byte = 4
+	shellPreviewItem  byte = 5
+	shellOpenApp      byte = 6
+	shellSetBadge     byte = 7
 )
 
 // Open/Save dialog option flags (kindDialogOpen / kindDialogSave).

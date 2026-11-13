@@ -18,6 +18,10 @@ target_link_libraries(mygo_host PUBLIC
     libohinputmethod.so
     libohinput.so
     libohaudio.so
+    libavplayer.so
+    libnative_media_core.so
+    libimage_receiver.so
+    libohimage.so
     libasset_ndk.z.so
     libudmf.so
     libpixelmap.so

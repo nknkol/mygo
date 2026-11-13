@@ -2,9 +2,12 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"debug/elf"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -88,6 +92,19 @@ func isOhosHost() bool {
 	}
 	_, err := exec.LookPath("ldconfig")
 	return err != nil
+}
+
+// ohosTempDir returns a writable temporary directory, preferring the terminal
+// sandbox's /data/storage/el2/base/haps/entry/temp on HarmonyOS PC when TMPDIR
+// is unset (since /tmp on HarmonyOS PC is owned by system:shell).
+func ohosTempDir() string {
+	if env := strings.TrimSpace(os.Getenv("TMPDIR")); env != "" {
+		return env
+	}
+	if isOhosHost() && isDir("/data/storage/el2/base/haps/entry/temp") {
+		return "/data/storage/el2/base/haps/entry/temp"
+	}
+	return os.TempDir()
 }
 
 // hapFileName returns "<slug>-<version>-<arch>.hap".
@@ -377,6 +394,11 @@ func findOhosToolchain() (hvigorw, sdkHome string, extraEnv []string) {
 	}
 	if sdkHome != "" {
 		extraEnv = append(extraEnv, "DEVECO_SDK_HOME="+sdkHome)
+	}
+	if strings.TrimSpace(os.Getenv("TMPDIR")) == "" {
+		if td := ohosTempDir(); td != "" {
+			extraEnv = append(extraEnv, "TMPDIR="+td)
+		}
 	}
 	if len(prependPaths) > 0 {
 		curPath := os.Getenv("PATH")
@@ -1313,6 +1335,10 @@ func writeOhosIcons(c *Config, stageHostDir string) error {
 // transitive musl Pango shared library closure in lib/*.so (0755), fonts.conf
 // in etc/fonts/fonts.conf (0644), and hnp.json (0644).
 func packOhosHNP(c *Config, engineBin, libDir, fontsConf string, res []resource, outPath string) error {
+	return packOhosHNPWithEnv(c, engineBin, libDir, fontsConf, res, nil, outPath)
+}
+
+func packOhosHNPWithEnv(c *Config, engineBin, libDir, fontsConf string, res []resource, devEnv []string, outPath string) error {
 	root := "mygo_" + fsName(c.Version)
 
 	var libs [][2]string
@@ -1492,6 +1518,21 @@ func packOhosHNP(c *Config, engineBin, libDir, fontsConf string, res []resource,
 	if fontsConf != "" {
 		if err := addFile(root+"/etc/fonts/fonts.conf", fontsConf, 0o644); err != nil {
 			return fail(err)
+		}
+	}
+	if len(devEnv) > 0 {
+		var envBuf strings.Builder
+		for _, kv := range devEnv {
+			kv = strings.TrimSpace(kv)
+			if strings.IndexByte(kv, '=') > 0 {
+				envBuf.WriteString(kv)
+				envBuf.WriteByte('\n')
+			}
+		}
+		if envBuf.Len() > 0 {
+			if err := addBytes(root+"/etc/mygo.env", []byte(envBuf.String()), 0o644); err != nil {
+				return fail(err)
+			}
 		}
 	}
 	if err := addBytes(root+"/hnp.json", conf, 0o644); err != nil {
@@ -1712,7 +1753,7 @@ func buildOhos(c *Config, goarch string, opts buildOptions) ([]string, error) {
 }
 
 // signOhosHapWithHDA signs hapPath in place using `hda install --keep-signed`
-// run from os.TempDir() so hdc never leaves hdc.log in the project directory.
+// run from ohosTempDir() so hdc never leaves hdc.log in the project directory.
 func signOhosHapWithHDA(hapPath string, extraEnv []string) error {
 	hda := ""
 	if p, err := exec.LookPath("hda"); err == nil {
@@ -1720,12 +1761,12 @@ func signOhosHapWithHDA(hapPath string, extraEnv []string) error {
 	} else if fileExists("/data/service/hnp/bin/hda") {
 		hda = "/data/service/hnp/bin/hda"
 	} else {
-		return errors.New("hda not found: install HarmonyOS Debug Assistant CLI or disable ohos.signWithHda")
+		return errors.New("hda not found: install HarmonyOS Debug Assistant CLI or pass -sign - when using an unsigned emulator/device")
 	}
-	signedTmp := hapPath + ".signed"
+	signedTmp := strings.TrimSuffix(hapPath, ".hap") + ".signed.hap"
 	defer os.Remove(signedTmp)
 	cmd := exec.Command(hda, "install", hapPath, "--keep-signed", signedTmp)
-	cmd.Dir = os.TempDir()
+	cmd.Dir = ohosTempDir()
 	cmd.Env = append(os.Environ(), extraEnv...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1735,4 +1776,529 @@ func signOhosHapWithHDA(hapPath string, extraEnv []string) error {
 		return fmt.Errorf("hda did not write signed HAP %s", signedTmp)
 	}
 	return os.Rename(signedTmp, hapPath)
+}
+
+// hashOhosStageDir computes a deterministic SHA-256 over all files and symlinks
+// in a staged HarmonyOS host project directory.
+func hashOhosStageDir(stageDir string) ([32]byte, error) {
+	var sum [32]byte
+	h := sha256.New()
+	err := filepath.WalkDir(stageDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(stageDir, path)
+		if err != nil || rel == "." {
+			return err
+		}
+		relSlash := filepath.ToSlash(rel)
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		switch mode := info.Mode(); {
+		case mode&fs.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(h, "L:%s->%s\x00", relSlash, filepath.ToSlash(target))
+		case mode.IsDir():
+			fmt.Fprintf(h, "D:%s\x00", relSlash)
+		case mode.IsRegular():
+			fmt.Fprintf(h, "F:%s:%d\x00", relSlash, info.Size())
+			f, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(h, f)
+			_ = f.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			h.Write([]byte{0})
+		}
+		return nil
+	})
+	if err != nil {
+		return sum, err
+	}
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
+}
+
+// ensureOhosDevHostHap returns a cached unsigned host .hap matching dc and
+// hostTemplateDir, running `hvigorw assembleHap` only when the staged host
+// project's SHA-256 changes.
+func ensureOhosDevHostHap(ctx context.Context, t *task, dc *Config, hostTemplateDir, cacheDir, hvigorw string, toolEnv []string) (string, [32]byte, error) {
+	var hostSum [32]byte
+	if err := os.MkdirAll(ohosTempDir(), 0o755); err != nil {
+		return "", hostSum, err
+	}
+	stageHost, err := os.MkdirTemp(ohosTempDir(), "mygo-ohos-host-*")
+	if err != nil {
+		return "", hostSum, err
+	}
+	defer os.RemoveAll(stageHost)
+	if err := os.Chmod(stageHost, 0o755); err != nil {
+		return "", hostSum, err
+	}
+	if err := writeOhosHostProject(dc, hostTemplateDir, stageHost, true); err != nil {
+		return "", hostSum, err
+	}
+	hostSum, err = hashOhosStageDir(stageHost)
+	if err != nil {
+		return "", hostSum, err
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return "", hostSum, err
+	}
+	cachedHap := filepath.Join(cacheDir, hex.EncodeToString(hostSum[:16])+".hap")
+	if fileExists(cachedHap) {
+		now := time.Now()
+		_ = os.Chtimes(cachedHap, now, now)
+		return cachedHap, hostSum, nil
+	}
+
+	if t != nil {
+		t.set("hvigorw assembleHap (cached for subsequent rebuilds)")
+	}
+	cmd := exec.CommandContext(ctx, hvigorw, "assembleHap", "--no-daemon")
+	cmd.Dir = stageHost
+	cmd.Env = append(os.Environ(), toolEnv...)
+	var hvigorOut bytes.Buffer
+	cmd.Stdout = &hvigorOut
+	cmd.Stderr = &hvigorOut
+	cmd.WaitDelay = waitDelay
+	if err := waited(cmd.Run()); err != nil {
+		if ctx.Err() != nil {
+			return "", hostSum, ctx.Err()
+		}
+		return "", hostSum, fmt.Errorf("hvigorw assembleHap: %w\n%s", err, strings.TrimSpace(hvigorOut.String()))
+	}
+
+	builtHap := filepath.Join(stageHost, "entry", "build", "default", "outputs", "default", "entry-default-unsigned.hap")
+	if !fileExists(builtHap) {
+		signed := filepath.Join(stageHost, "entry", "build", "default", "outputs", "default", "entry-default-signed.hap")
+		if fileExists(signed) {
+			builtHap = signed
+		}
+	}
+	tmpHap := cachedHap + ".tmp"
+	if err := copyFile(builtHap, tmpHap, 0o644); err != nil {
+		return "", hostSum, err
+	}
+	if err := os.Rename(tmpHap, cachedHap); err != nil {
+		_ = os.Remove(tmpHap)
+		return "", hostSum, err
+	}
+	pruneOhosHostCache(cacheDir, 4)
+	return cachedHap, hostSum, nil
+}
+
+func pruneOhosHostCache(cacheDir string, keep int) {
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil || len(entries) <= keep {
+		return
+	}
+	type item struct {
+		path string
+		mod  time.Time
+	}
+	var haps []item
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".hap") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		haps = append(haps, item{path: filepath.Join(cacheDir, e.Name()), mod: info.ModTime()})
+	}
+	if len(haps) <= keep {
+		return
+	}
+	sort.Slice(haps, func(i, j int) bool { return haps[i].mod.After(haps[j].mod) })
+	for _, old := range haps[keep:] {
+		_ = os.Remove(old.path)
+	}
+}
+
+func findOhosHDC(extraEnv []string) (string, error) {
+	if p, err := exec.LookPath("hdc"); err == nil {
+		return p, nil
+	}
+	for _, kv := range extraEnv {
+		if pathVal, ok := strings.CutPrefix(kv, "PATH="); ok {
+			for _, dir := range filepath.SplitList(pathVal) {
+				cand := filepath.Join(dir, "hdc")
+				if runtime.GOOS == "windows" {
+					cand += ".exe"
+				}
+				if fileExists(cand) {
+					return cand, nil
+				}
+			}
+		}
+	}
+	for _, cand := range []string{
+		"/storage/Users/currentUser/.harmonybrew/bin/hdc",
+		"/data/service/hnp/bin/hdc",
+	} {
+		if fileExists(cand) {
+			return cand, nil
+		}
+	}
+	return "", errors.New("hdc not found: install HarmonyOS Command Line Tools or add hdc to PATH")
+}
+
+func ensureOhosHDCTarget(hdc string, extraEnv []string) {
+	cmd := exec.Command(hdc, "list", "targets")
+	cmd.Dir = ohosTempDir()
+	cmd.Env = append(os.Environ(), extraEnv...)
+	out, err := cmd.Output()
+	trimmed := strings.TrimSpace(string(out))
+	if err == nil && trimmed != "" && !strings.Contains(trimmed, "[Empty]") {
+		return
+	}
+	if !isOhosHost() || !fileExists("/system/bin/param") {
+		return
+	}
+	portOut, err := exec.Command("/system/bin/param", "get", "persist.hdc.port").Output()
+	if err != nil {
+		return
+	}
+	port := strings.TrimSpace(string(portOut))
+	if n, err := strconv.Atoi(port); err == nil && n > 0 && n <= 65535 {
+		connCmd := exec.Command(hdc, "tconn", "127.0.0.1:"+port)
+		connCmd.Dir = ohosTempDir()
+		connCmd.Env = append(os.Environ(), extraEnv...)
+		_ = connCmd.Run()
+	}
+}
+
+func installOhosHapWithHDC(ctx context.Context, hdc, hapPath string, extraEnv []string) error {
+	ensureOhosHDCTarget(hdc, extraEnv)
+	cmd := exec.CommandContext(ctx, hdc, "install", "-r", hapPath)
+	cmd.Dir = ohosTempDir()
+	cmd.Env = append(os.Environ(), extraEnv...)
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	lower := strings.ToLower(text)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("hdc install: %w\n%s", err, text)
+	}
+	if strings.Contains(lower, "error:") || strings.Contains(lower, "failed to install") {
+		return fmt.Errorf("hdc install failed:\n%s", text)
+	}
+	return nil
+}
+
+// formatOhosHilogLine extracts clean application output from a HarmonyOS hilog
+// line formatted as "<date> <time> <pid> <tid> <lvl> <dom>/<pkg>/<tag>: <msg>".
+func formatOhosHilogLine(line string) (msg string, isErr, ok bool) {
+	line = strings.TrimRight(line, "\r\n")
+	if strings.TrimSpace(line) == "" {
+		return "", false, false
+	}
+	fields := strings.Fields(line)
+	if len(fields) < 6 {
+		return "", false, false
+	}
+	level := fields[4]
+	header := fields[5]
+	colonIdx := strings.Index(line, header)
+	if colonIdx < 0 {
+		return "", false, false
+	}
+	rest := line[colonIdx+len(header):]
+	rest = strings.TrimPrefix(rest, " ")
+	tag := strings.TrimSuffix(header, ":")
+	if slash := strings.LastIndexByte(tag, '/'); slash >= 0 {
+		tag = tag[slash+1:]
+	}
+	errLevel := level == "E" || level == "F"
+	switch tag {
+	case "mygo-host":
+		if strings.HasPrefix(rest, "engine started pid=") {
+			return "", false, false
+		}
+		return rest, errLevel, true
+	case "mygo", "mygo-bridge":
+		if errLevel {
+			return "[host] " + rest, true, true
+		}
+		return "", false, false
+	default:
+		return "", false, false
+	}
+}
+
+func isSafeOhosBundleName(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, r := range id {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// buildAndLaunchOhos compiles the HarmonyOS Go engine, reuses a cached host
+// .hap unless host configuration changed, repacks mygo.hnp, signs with hda,
+// installs over hdc, launches EntryAbility, and streams hilog output.
+func (s *devSession) buildAndLaunchOhos(ctx context.Context, t *task, running [32]byte) (p *devProcess, sum [32]byte, err error) {
+	const goarch = "arm64"
+	c, err := loadConfig(s.root)
+	if err != nil {
+		return nil, sum, err
+	}
+	hvigorw, sdkHome, toolEnv := findOhosToolchain()
+	if hvigorw == "" || sdkHome == "" {
+		return nil, sum, errors.New("HarmonyOS Command Line Tools not found: set DEVECO_SDK_HOME and add hvigorw to PATH")
+	}
+	hdc, err := findOhosHDC(toolEnv)
+	if err != nil {
+		return nil, sum, err
+	}
+	libDir := findOhosLibDir()
+	if libDir == "" && os.Getenv("MYGO_OHOS_SKIP_LIBS") != "1" {
+		return nil, sum, errors.New("HarmonyOS musl Pango libraries not found: set MYGO_OHOS_LIB_DIR or install Pango into ~/.harmonybrew/lib")
+	}
+	hostTemplateDir, err := findOhosHostDir(c)
+	if err != nil {
+		return nil, sum, err
+	}
+
+	dir := filepath.Join(s.root, ".mygo", "dev", "ohos-"+goarch)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, sum, err
+	}
+	stage, err := os.MkdirTemp(dir, ".staging-")
+	if err != nil {
+		return nil, sum, err
+	}
+	defer os.RemoveAll(stage)
+
+	if err := s.updateI18n(c); err != nil {
+		return nil, sum, err
+	}
+
+	dc := devConfig(c)
+	engineBin := filepath.Join(stage, "mygo-engine")
+	buildFlags := []string{"-ldflags", strings.TrimSpace(packageFlags(dc))}
+	buildFlags = append(buildFlags, ohosBuildTags(true)...)
+	if err := goBuild(ctx, c, t, engineBin, []string{"GOOS=linux", "GOARCH=" + goarch}, buildFlags...); err != nil {
+		return nil, sum, err
+	}
+
+	res, err := dc.resources("ohos", goarch, reservedNames(dc, "ohos")...)
+	if err != nil {
+		return nil, sum, err
+	}
+
+	cacheDir := filepath.Join(dir, "host-cache")
+	cachedHostHap, hostSum, err := ensureOhosDevHostHap(ctx, t, dc, hostTemplateDir, cacheDir, hvigorw, toolEnv)
+	if err != nil {
+		return nil, sum, err
+	}
+
+	devEnv := append([]string(nil), s.env...)
+	devEnv = append(devEnv, "MYGO_DEV=1")
+
+	h := sha256.New()
+	ef, err := os.Open(engineBin)
+	if err != nil {
+		return nil, sum, err
+	}
+	_, copyErr := io.Copy(h, ef)
+	_ = ef.Close()
+	if copyErr != nil {
+		return nil, sum, copyErr
+	}
+	if err := hashResources(h, res); err != nil {
+		return nil, sum, err
+	}
+	h.Write(hostSum[:])
+	for _, kv := range devEnv {
+		fmt.Fprintf(h, "E:%s\x00", kv)
+	}
+	fmt.Fprintf(h, "S:%s\x00", s.sign)
+	copy(sum[:], h.Sum(nil))
+	if sum == running {
+		return nil, sum, errUnchanged
+	}
+
+	if c.Bindings != "" {
+		t.set("generating the TypeScript client")
+		genBin := tempBinary(dc.slug())
+		defer os.Remove(genBin)
+		var genErr error
+		if runtime.GOOS == "linux" && runtime.GOARCH == goarch {
+			genErr = copyFile(engineBin, genBin, 0o755)
+		} else {
+			genErr = goBuild(ctx, c, t, genBin, nil)
+		}
+		if genErr != nil {
+			return nil, sum, genErr
+		}
+		changed, err := generateBindings(c, genBin)
+		if err != nil {
+			return nil, sum, err
+		}
+		if changed {
+			logf("Wrote %s", cyan(relPathTo(c.root, c.path(c.Bindings))))
+		}
+	}
+
+	t.set("packing mygo.hnp")
+	fontsConf := filepath.Join(hostTemplateDir, "fonts.conf")
+	if !fileExists(fontsConf) {
+		fontsConf = ""
+	}
+	hnpPath := filepath.Join(stage, "mygo.hnp")
+	if err := packOhosHNPWithEnv(dc, engineBin, libDir, fontsConf, res, devEnv, hnpPath); err != nil {
+		return nil, sum, err
+	}
+
+	dstHap := filepath.Join(stage, dc.slug()+".hap")
+	if err := copyFile(cachedHostHap, dstHap, 0o644); err != nil {
+		return nil, sum, err
+	}
+	if err := injectHNPIntoHAP(dstHap, "hnp/arm64-v8a/mygo.hnp", hnpPath); err != nil {
+		return nil, sum, err
+	}
+
+	if s.sign != "-" {
+		t.set("signing with hda")
+		if err := signOhosHapWithHDA(dstHap, toolEnv); err != nil {
+			return nil, sum, err
+		}
+	}
+
+	finalHap := filepath.Join(dir, dc.slug()+".hap")
+	if err := replacePath(dstHap, finalHap); err != nil {
+		return nil, sum, err
+	}
+
+	s.stopLive()
+	t.set("installing on HarmonyOS")
+	if err := installOhosHapWithHDC(ctx, hdc, finalHap, toolEnv); err != nil {
+		return nil, sum, err
+	}
+
+	t.set("launching " + dc.Name)
+	p, err = s.launchOhos(hdc, dc.Identifier, toolEnv)
+	if err != nil {
+		return nil, sum, err
+	}
+	return p, sum, nil
+}
+
+func (s *devSession) launchOhos(hdc, bundleName string, extraEnv []string) (*devProcess, error) {
+	if !isSafeOhosBundleName(bundleName) {
+		return nil, fmt.Errorf("invalid HarmonyOS bundle identifier %q", bundleName)
+	}
+	script := fmt.Sprintf(
+		"aa force-stop '%[1]s' >/dev/null 2>&1 || true; "+
+			"out=$(aa start -a EntryAbility -b '%[1]s' 2>&1); "+
+			"if [ $? -ne 0 ]; then printf '%%s\\n' \"$out\" >&2; exit 1; fi; "+
+			"case \"$out\" in *error*|*failed*) printf '%%s\\n' \"$out\" >&2; exit 1 ;; esac; "+
+			"pid=''; i=0; "+
+			"while [ $i -lt 50 ]; do "+
+			"  pid=$(pidof '%[1]s' 2>/dev/null | awk '{print $1}'); "+
+			"  [ -n \"$pid\" ] && break; "+
+			"  usleep 100000 2>/dev/null || sleep 1; "+
+			"  i=$((i + 1)); "+
+			"done; "+
+			"if [ -z \"$pid\" ]; then printf 'EntryAbility did not start for %[1]s: %%s\\n' \"$out\" >&2; exit 1; fi; "+
+			"hilog -P \"$pid\" -T mygo,mygo-host,mygo-bridge & "+
+			"hpid=$!; "+
+			"trap 'kill $hpid 2>/dev/null; aa force-stop '\\''%[1]s'\\'' >/dev/null 2>&1; exit 0' INT TERM HUP; "+
+			"while [ -d \"/proc/$pid\" ]; do sleep 1; done; "+
+			"usleep 200000 2>/dev/null || true; "+
+			"kill $hpid 2>/dev/null || true; "+
+			"wait $hpid 2>/dev/null || true; "+
+			"exit 0",
+		bundleName,
+	)
+
+	stdoutR, stdoutW := io.Pipe()
+	stderr, errDone, err := pipe(con.output("app", os.Stderr))
+	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		return nil, err
+	}
+
+	cmd := exec.Command(hdc, "shell", script)
+	cmd.Dir = ohosTempDir()
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderr
+	cmd.Env = append(os.Environ(), extraEnv...)
+	setProcessGroup(cmd)
+	err = cmd.Start()
+	_ = stdoutW.Close()
+	_ = stderr.Close()
+	if err != nil {
+		_ = stdoutR.Close()
+		return nil, err
+	}
+
+	outDone := make(chan struct{})
+	go func() {
+		defer close(outDone)
+		defer stdoutR.Close()
+		appOut := con.output("app", os.Stdout)
+		appErr := con.output("app", os.Stderr)
+		defer appOut.flush()
+		defer appErr.flush()
+		sc := bufio.NewScanner(stdoutR)
+		sc.Buffer(make([]byte, 0, 64*1024), 512*1024)
+		for sc.Scan() {
+			msg, isErr, ok := formatOhosHilogLine(sc.Text())
+			if !ok {
+				continue
+			}
+			if isErr {
+				_, _ = io.WriteString(appErr, msg+"\n")
+			} else {
+				_, _ = io.WriteString(appOut, msg+"\n")
+			}
+		}
+	}()
+
+	stopAbility := func() {
+		stopCmd := exec.Command(hdc, "shell", "aa", "force-stop", bundleName)
+		stopCmd.Dir = ohosTempDir()
+		stopCmd.Env = append(os.Environ(), extraEnv...)
+		_ = stopCmd.Run()
+	}
+
+	p := &devProcess{
+		exe:    bundleName,
+		cmd:    cmd,
+		stopFn: stopAbility,
+		done:   make(chan struct{}),
+	}
+	go func() {
+		p.err = cmd.Wait()
+		timeout := time.After(250 * time.Millisecond)
+	drain:
+		for _, copied := range []<-chan struct{}{outDone, errDone} {
+			select {
+			case <-copied:
+			case <-timeout:
+				break drain
+			}
+		}
+		close(p.done)
+	}()
+	return p, nil
 }

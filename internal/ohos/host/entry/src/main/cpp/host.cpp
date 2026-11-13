@@ -26,7 +26,12 @@
 #include <database/udmf/udmf.h>
 #include <database/udmf/uds.h>
 #include <inputmethod/inputmethod_controller_capi.h>
+#include <multimedia/image_framework/image/image_native.h>
+#include <multimedia/image_framework/image/image_receiver_native.h>
 #include <multimedia/image_framework/image/pixelmap_native.h>
+#include <multimedia/player_framework/avplayer.h>
+#include <multimedia/player_framework/avplayer_base.h>
+#include <multimedia/player_framework/native_avformat.h>
 #include <multimodalinput/oh_input_manager.h>
 #include <multimodalinput/oh_pointer_style.h>
 #include <native_window/external_window.h>
@@ -152,6 +157,10 @@ constexpr uint8_t kDragReply       = 61; // engine -> host: drag over/drop reply
 constexpr uint8_t kAccessTree      = 62; // engine -> host: surface accessibility tree snapshot
 constexpr uint8_t kAccessEvent     = 63; // host -> engine: accessibility enabled / action
 constexpr uint8_t kGpuBuffer       = 64; // host -> engine: serialized OH_NativeBuffer swapchain slot + fds
+constexpr uint8_t kVideoOpen       = 65; // engine -> host: {u32 playerId, i64 size, str url} [+ fd]
+constexpr uint8_t kVideoCmd        = 66; // engine -> host: {u32 playerId, u8 op, 3×pad, i64 arg, f64 farg}
+constexpr uint8_t kVideoShm        = 67; // host -> engine: {u32 playerId, u32 slotBytes, u32 w, u32 h} + fd
+constexpr uint8_t kVideoEvent      = 68; // host -> engine: {u32 playerId, u8 ev, u8 buffering, 2×pad, i64 posMs, i64 durMs, u32 w, u32 h, str err}
 
 constexpr uint8_t kWinActEnableWebLayer = 17;
 constexpr uint8_t kWinActFocusSurface   = 18;
@@ -471,6 +480,8 @@ std::vector<std::vector<uint8_t>> gPendingNotifClicks;
 bool gOnBattery = false;
 bool gNetOnline = true;
 bool gNetMetered = false;
+std::vector<uint8_t> gCachedNetWire;
+std::string gNetProxyJson;
 std::atomic<bool> gNowPlayingActive{false};
 std::atomic<uint32_t> gNowPlayingCmds{0};
 std::atomic<bool> gPerfHudAvailable{false};
@@ -5816,6 +5827,7 @@ std::vector<std::string> buildEngineEnv(const std::string &pkgRoot) {
             "MYGO_OHOS_PKG_ID=", "MYGO_OHOS_PKG_NAME=", "MYGO_OHOS_PKG_VER=",
             "MYGO_OHOS_LANGS=", "MYGO_OHOS_LOCALE=", "MYGO_OHOS_HOUR_CYCLE=",
             "MYGO_OHOS_FIRST_WEEKDAY=", "MYGO_OHOS_DISPLAYS=", "MYGO_OHOS_TEXT_SCALE=",
+            "MYGO_OHOS_HTTP_PROXY=",
         };
         for (const char *k : keys) {
             if (strncmp(entry, k, strlen(k)) == 0) {
@@ -5840,6 +5852,47 @@ std::vector<std::string> buildEngineEnv(const std::string &pkgRoot) {
             }
         }
     }
+    const std::string devEnvFile = pkgRoot + "/etc/mygo.env";
+    int devEnvFd = open(devEnvFile.c_str(), O_RDONLY);
+    if (devEnvFd >= 0) {
+        std::string raw;
+        char ebuf[512];
+        for (;;) {
+            ssize_t n = read(devEnvFd, ebuf, sizeof(ebuf));
+            if (n <= 0) {
+                break;
+            }
+            raw.append(ebuf, static_cast<size_t>(n));
+        }
+        close(devEnvFd);
+        size_t pos = 0;
+        while (pos < raw.size()) {
+            size_t nl = raw.find('\n', pos);
+            std::string entry = (nl == std::string::npos) ? raw.substr(pos) : raw.substr(pos, nl - pos);
+            pos = (nl == std::string::npos) ? raw.size() : (nl + 1);
+            if (!entry.empty() && entry.back() == '\r') {
+                entry.pop_back();
+            }
+            size_t eq = entry.find('=');
+            if (eq == std::string::npos || eq == 0 || overridden(entry.c_str())) {
+                continue;
+            }
+            const std::string keyPrefix = entry.substr(0, eq + 1);
+            for (auto it = env.begin(); it != env.end();) {
+                if (it->compare(0, keyPrefix.size(), keyPrefix) == 0) {
+                    it = env.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (keyPrefix == "MYGO_ENV=") {
+                hasMygoEnv = true;
+            } else if (entry == "MYGO_DEV=1") {
+                isMygoDev = true;
+            }
+            env.push_back(entry);
+        }
+    }
     if (!hasMygoEnv && !isMygoDev) {
         env.emplace_back("MYGO_ENV=production");
     }
@@ -5857,12 +5910,14 @@ std::vector<std::string> buildEngineEnv(const std::string &pkgRoot) {
     bool onBat = false;
     bool netOn = true;
     bool netMet = false;
+    std::string netProxyJson;
     {
         std::lock_guard<std::mutex> lk(gEnvMu);
         ce = gCachedEnv;
         onBat = gOnBattery;
         netOn = gNetOnline;
         netMet = gNetMetered;
+        netProxyJson = gNetProxyJson;
     }
     if (!ce.pkgId.empty()) {
         env.push_back("MYGO_OHOS_PKG_ID=" + ce.pkgId);
@@ -5896,6 +5951,9 @@ std::vector<std::string> buildEngineEnv(const std::string &pkgRoot) {
     env.push_back(std::string("MYGO_OHOS_ON_BATTERY=") + (onBat ? "1" : "0"));
     env.push_back(std::string("MYGO_OHOS_NET_ONLINE=") + (netOn ? "1" : "0"));
     env.push_back(std::string("MYGO_OHOS_NET_METERED=") + (netMet ? "1" : "0"));
+    if (!netProxyJson.empty()) {
+        env.push_back("MYGO_OHOS_HTTP_PROXY=" + netProxyJson);
+    }
     return env;
 }
 
@@ -6274,8 +6332,931 @@ void openAudioStream(uint32_t streamId, uint32_t sampleRate, uint32_t channels,
                 streamId, sampleRate, channels, sp->useFloat32 ? 1 : 0, sp->capFrames);
 }
 
+// ---------- Native Video Playback (OH_AVPlayer + OH_ImageReceiverNative) ----------
+
+constexpr size_t kVideoHeaderBytes = 64;
+constexpr uint32_t kVideoNumSlots = 3;
+
+constexpr uint8_t kVideoFmtNV12 = 0;
+constexpr uint8_t kVideoFmtBGRA = 1;
+
+constexpr uint8_t kVideoCmdPlay      = 1;
+constexpr uint8_t kVideoCmdPause     = 2;
+constexpr uint8_t kVideoCmdSeek      = 3;
+constexpr uint8_t kVideoCmdSetLoop   = 4;
+constexpr uint8_t kVideoCmdSetRate   = 5;
+constexpr uint8_t kVideoCmdSetVolume = 6;
+constexpr uint8_t kVideoCmdSetMuted  = 7;
+constexpr uint8_t kVideoCmdClose     = 8;
+
+constexpr uint8_t kVideoEvFrame     = 1;
+constexpr uint8_t kVideoEvMeta      = 2;
+constexpr uint8_t kVideoEvBuffering = 3;
+constexpr uint8_t kVideoEvSeekDone  = 4;
+constexpr uint8_t kVideoEvEnded     = 5;
+constexpr uint8_t kVideoEvError     = 6;
+
+struct VideoShmHeader {
+    std::atomic<uint32_t> writeSeq;   // [0..3]
+    std::atomic<uint32_t> latestSlot; // [4..7]
+    std::atomic<int32_t> busySlot;    // [8..11]
+    uint8_t format;                   // [12]
+    uint8_t matrix;                   // [13]
+    uint8_t pad0[2];                  // [14..15]
+    std::atomic<int64_t> posMs;       // [16..23]
+    std::atomic<int64_t> durMs;       // [24..31]
+    uint32_t slotBytes;               // [32..35]
+    std::atomic<uint32_t> width;      // [36..39]
+    std::atomic<uint32_t> height;     // [40..43]
+    uint8_t pad1[20];                 // [44..63]
+};
+static_assert(sizeof(VideoShmHeader) == kVideoHeaderBytes, "VideoShmHeader must be 64 bytes");
+
+struct VideoPlayerSession {
+    uint32_t id = 0;
+    std::atomic<bool> closing{false};
+
+    std::mutex mu;
+    OH_AVPlayer *player = nullptr;
+    OH_ImageReceiverNative *receiver = nullptr;
+    OHNativeWindow *window = nullptr;
+    int srcFd = -1;
+
+    void *shmBase = nullptr;
+    size_t shmBytes = 0;
+    uint32_t slotBytes = 0;
+    VideoShmHeader *shmHdr = nullptr;
+
+    AVPlayerState avState = AV_IDLE;
+    bool prepared = false;
+    bool wantPlay = false;
+    bool loop = false;
+    bool muted = false;
+    float volume = 1.0f;
+    float rate = 1.0f;
+    bool pendingSeek = false;
+    int32_t pendingSeekMs = 0;
+    int32_t videoW = 0;
+    int32_t videoH = 0;
+    std::atomic<int64_t> posMs{0};
+    std::atomic<int64_t> durMs{0};
+};
+
+std::mutex gVideoMu;
+std::unordered_map<uint32_t, std::shared_ptr<VideoPlayerSession>> gVideoPlayers;
+
+std::shared_ptr<VideoPlayerSession> findVideoPlayer(uint32_t playerId) {
+    std::lock_guard<std::mutex> lk(gVideoMu);
+    auto it = gVideoPlayers.find(playerId);
+    return it != gVideoPlayers.end() ? it->second : nullptr;
+}
+
+void sendVideoEventWire(uint32_t playerId, uint8_t ev, uint8_t buffering,
+                        int64_t posMs, int64_t durMs, uint32_t w, uint32_t h,
+                        const std::string &errText) {
+    std::vector<uint8_t> wire(32, 0);
+    memcpy(wire.data() + 0, &playerId, 4);
+    wire[4] = ev;
+    wire[5] = buffering;
+    memcpy(wire.data() + 8, &posMs, 8);
+    memcpy(wire.data() + 16, &durMs, 8);
+    memcpy(wire.data() + 24, &w, 4);
+    memcpy(wire.data() + 28, &h, 4);
+    appendStr(wire, errText);
+    sendMessage(kVideoEvent, wire.data(), static_cast<uint32_t>(wire.size()), -1);
+}
+
+bool sendVideoShmWire(uint32_t playerId, uint32_t slotBytes, uint32_t w, uint32_t h, int fd) {
+    uint8_t wire[16] = {0};
+    memcpy(wire + 0, &playerId, 4);
+    memcpy(wire + 4, &slotBytes, 4);
+    memcpy(wire + 8, &w, 4);
+    memcpy(wire + 12, &h, 4);
+    return sendMessage(kVideoShm, wire, sizeof(wire), fd);
+}
+
+int createVideoShmFd(size_t size) {
+    int fd = -1;
+#ifdef SYS_memfd_create
+    fd = static_cast<int>(syscall(SYS_memfd_create, "mygo-video-shm", 1 /* MFD_CLOEXEC */));
+#endif
+    if (fd >= 0) {
+        if (ftruncate(fd, static_cast<off_t>(size)) == 0) {
+            return fd;
+        }
+        close(fd);
+        fd = -1;
+    }
+    char tmpl[] = "/data/storage/el2/base/cache/mygo-vshm-XXXXXX";
+    fd = mkstemp(tmpl);
+    if (fd >= 0) {
+        unlink(tmpl);
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+        if (ftruncate(fd, static_cast<off_t>(size)) == 0) {
+            return fd;
+        }
+        close(fd);
+    }
+    return -1;
+}
+
+uint8_t mapVideoColorMatrix(OH_NativeBuffer *nb, uint32_t h) {
+    // Go scene.YUVMatrix: BT601=0, BT709=1, BT2020=2, FullRange=+3.
+    OH_NativeBuffer_ColorSpace cs = OH_COLORSPACE_NONE;
+    if (nb != nullptr && OH_NativeBuffer_GetColorSpace(nb, &cs) == 0) {
+        switch (cs) {
+        case OH_COLORSPACE_BT601_EBU_FULL:
+        case OH_COLORSPACE_BT601_SMPTE_C_FULL:
+        case OH_COLORSPACE_SRGB_FULL:
+        case OH_COLORSPACE_DISPLAY_SRGB:
+            return 0 + 3;
+        case OH_COLORSPACE_BT601_EBU_LIMIT:
+        case OH_COLORSPACE_BT601_SMPTE_C_LIMIT:
+        case OH_COLORSPACE_SRGB_LIMIT:
+            return 0;
+        case OH_COLORSPACE_BT709_FULL:
+            return 1 + 3;
+        case OH_COLORSPACE_BT709_LIMIT:
+            return 1;
+        case OH_COLORSPACE_BT2020_HLG_FULL:
+        case OH_COLORSPACE_BT2020_PQ_FULL:
+        case OH_COLORSPACE_DISPLAY_BT2020_SRGB:
+        case OH_COLORSPACE_DISPLAY_BT2020_HLG:
+        case OH_COLORSPACE_DISPLAY_BT2020_PQ:
+        case OH_COLORSPACE_BT2020_LOG_FULL:
+            return 2 + 3;
+        case OH_COLORSPACE_BT2020_HLG_LIMIT:
+        case OH_COLORSPACE_BT2020_PQ_LIMIT:
+        case OH_COLORSPACE_BT2020_LOG_LIMIT:
+            return 2;
+        default:
+            break;
+        }
+    }
+    return h >= 720 ? 1 : 0;
+}
+
+bool ensureVideoShmLocked(VideoPlayerSession *vp, uint32_t w, uint32_t h, uint8_t fmt) {
+    if (vp == nullptr || w == 0 || h == 0) {
+        return false;
+    }
+    uint32_t cw = (w + 1) / 2;
+    uint32_t ch = (h + 1) / 2;
+    uint64_t needed64 = (fmt == kVideoFmtBGRA)
+                            ? (4ULL * w * h)
+                            : (static_cast<uint64_t>(w) * h + 2ULL * cw * ch);
+    if (needed64 == 0 || needed64 > 64ULL * 1024ULL * 1024ULL) {
+        return false;
+    }
+    uint32_t needed = static_cast<uint32_t>((needed64 + 63ULL) & ~63ULL);
+    if (vp->shmBase != nullptr && vp->shmHdr != nullptr && needed <= vp->slotBytes) {
+        return true;
+    }
+
+    size_t total = kVideoHeaderBytes + static_cast<size_t>(needed) * kVideoNumSlots;
+    int fd = createVideoShmFd(total);
+    if (fd < 0) {
+        return false;
+    }
+    void *mem = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mem == MAP_FAILED) {
+        close(fd);
+        return false;
+    }
+    memset(mem, 0, kVideoHeaderBytes);
+    auto *hdr = static_cast<VideoShmHeader *>(mem);
+    hdr->busySlot.store(-1, std::memory_order_relaxed);
+    hdr->slotBytes = needed;
+    hdr->posMs.store(vp->posMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    hdr->durMs.store(vp->durMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+
+    if (!sendVideoShmWire(vp->id, needed, w, h, fd)) {
+        munmap(mem, total);
+        close(fd);
+        return false;
+    }
+    close(fd);
+
+    if (vp->shmBase != nullptr && vp->shmBytes > 0) {
+        munmap(vp->shmBase, vp->shmBytes);
+    }
+    vp->shmBase = mem;
+    vp->shmBytes = total;
+    vp->slotBytes = needed;
+    vp->shmHdr = hdr;
+    return true;
+}
+
+void onVideoImageArrive(OH_ImageReceiverNative *receiver, void *userData) {
+    uint32_t playerId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(userData));
+    auto vp = findVideoPlayer(playerId);
+    if (!vp || vp->closing.load(std::memory_order_acquire) || receiver == nullptr) {
+        return;
+    }
+
+    OH_ImageNative *img = nullptr;
+    if (OH_ImageReceiverNative_ReadLatestImage(receiver, &img) != IMAGE_SUCCESS || img == nullptr) {
+        return;
+    }
+
+    Image_Size imgSize = {0, 0};
+    OH_ImageNative_GetImageSize(img, &imgSize);
+
+    OH_NativeBuffer *nb = nullptr;
+    OH_ImageBufferData bufData = {};
+    if (OH_ImageNative_GetBufferData(img, &bufData) == IMAGE_SUCCESS && bufData.nativeBuffer != nullptr) {
+        nb = bufData.nativeBuffer;
+    } else {
+        size_t compCount = 0;
+        if (OH_ImageNative_GetComponentTypes(img, nullptr, &compCount) == IMAGE_SUCCESS && compCount > 0 && compCount <= 8) {
+            std::vector<uint32_t> comps(compCount, 0);
+            uint32_t *compPtr = comps.data();
+            if (OH_ImageNative_GetComponentTypes(img, &compPtr, &compCount) == IMAGE_SUCCESS && compCount > 0) {
+                OH_ImageNative_GetByteBuffer(img, comps[0], &nb);
+            }
+        }
+    }
+    if (nb == nullptr) {
+        OH_ImageNative_Release(img);
+        return;
+    }
+
+    OH_NativeBuffer_Config nbCfg = {};
+    OH_NativeBuffer_GetConfig(nb, &nbCfg);
+
+    void *virAddr = nullptr;
+    OH_NativeBuffer_Planes planes = {};
+    bool hasPlanes = (OH_NativeBuffer_MapPlanes(nb, &virAddr, &planes) == 0 && virAddr != nullptr && planes.planeCount >= 2);
+    if (!hasPlanes) {
+        virAddr = nullptr;
+        if (OH_NativeBuffer_Map(nb, &virAddr) != 0 || virAddr == nullptr) {
+            OH_ImageNative_Release(img);
+            return;
+        }
+    }
+
+    bool published = false;
+    int64_t curPosMs = 0;
+    int64_t curDurMs = 0;
+    uint32_t outW = 0, outH = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(vp->mu);
+        if (!vp->closing.load(std::memory_order_relaxed)) {
+            uint32_t w = imgSize.width > 0 ? imgSize.width : static_cast<uint32_t>(std::max(nbCfg.width, 0));
+            uint32_t h = imgSize.height > 0 ? imgSize.height : static_cast<uint32_t>(std::max(nbCfg.height, 0));
+            if (vp->videoW > 0 && static_cast<uint32_t>(vp->videoW) <= w) {
+                w = static_cast<uint32_t>(vp->videoW);
+            }
+            if (vp->videoH > 0 && static_cast<uint32_t>(vp->videoH) <= h) {
+                h = static_cast<uint32_t>(vp->videoH);
+            }
+            if (vp->player != nullptr && vp->prepared) {
+                int32_t p = OH_AVPlayer_GetPlaybackPosition(vp->player);
+                if (p >= 0) {
+                    vp->posMs.store(p, std::memory_order_relaxed);
+                }
+            }
+
+            const bool isRGB = (nbCfg.format == NATIVEBUFFER_PIXEL_FMT_RGBA_8888 ||
+                                nbCfg.format == NATIVEBUFFER_PIXEL_FMT_RGBX_8888 ||
+                                nbCfg.format == NATIVEBUFFER_PIXEL_FMT_BGRA_8888 ||
+                                nbCfg.format == NATIVEBUFFER_PIXEL_FMT_BGRX_8888);
+            const uint8_t outFmt = isRGB ? kVideoFmtBGRA : kVideoFmtNV12;
+
+            if (w > 0 && h > 0 && ensureVideoShmLocked(vp.get(), w, h, outFmt)) {
+                VideoShmHeader *hdr = vp->shmHdr;
+                int32_t busy = hdr->busySlot.load(std::memory_order_acquire);
+                uint32_t prevLatest = hdr->latestSlot.load(std::memory_order_relaxed);
+                uint32_t prevSeq = hdr->writeSeq.load(std::memory_order_relaxed);
+                uint32_t slot = 0;
+                while (static_cast<int32_t>(slot) == busy || (prevSeq > 0 && slot == prevLatest)) {
+                    slot++;
+                    if (slot >= kVideoNumSlots) {
+                        slot = 0;
+                        break;
+                    }
+                }
+
+                auto *dstSlot = static_cast<uint8_t *>(vp->shmBase) + kVideoHeaderBytes + static_cast<size_t>(slot) * vp->slotBytes;
+                const auto *srcBase = static_cast<const uint8_t *>(virAddr);
+                bool copied = false;
+
+                if (isRGB) {
+                    uint32_t rowStride = nbCfg.stride > 0 ? static_cast<uint32_t>(nbCfg.stride) : (4u * w);
+                    bool swizzleRB = (nbCfg.format == NATIVEBUFFER_PIXEL_FMT_RGBA_8888 ||
+                                      nbCfg.format == NATIVEBUFFER_PIXEL_FMT_RGBX_8888);
+                    bool forceOpaque = (nbCfg.format == NATIVEBUFFER_PIXEL_FMT_RGBX_8888 ||
+                                        nbCfg.format == NATIVEBUFFER_PIXEL_FMT_BGRX_8888);
+                    if (rowStride >= 4u * w) {
+                        for (uint32_t y = 0; y < h; ++y) {
+                            const uint8_t *sr = srcBase + static_cast<size_t>(y) * rowStride;
+                            uint8_t *dr = dstSlot + static_cast<size_t>(y) * (4u * w);
+                            if (!swizzleRB && !forceOpaque) {
+                                memcpy(dr, sr, 4u * w);
+                            } else {
+                                for (uint32_t x = 0; x < w; ++x) {
+                                    uint8_t c0 = sr[4 * x + 0];
+                                    uint8_t c1 = sr[4 * x + 1];
+                                    uint8_t c2 = sr[4 * x + 2];
+                                    uint8_t c3 = forceOpaque ? 255 : sr[4 * x + 3];
+                                    if (swizzleRB) {
+                                        dr[4 * x + 0] = c2;
+                                        dr[4 * x + 1] = c1;
+                                        dr[4 * x + 2] = c0;
+                                        dr[4 * x + 3] = c3;
+                                    } else {
+                                        dr[4 * x + 0] = c0;
+                                        dr[4 * x + 1] = c1;
+                                        dr[4 * x + 2] = c2;
+                                        dr[4 * x + 3] = c3;
+                                    }
+                                }
+                            }
+                        }
+                        copied = true;
+                    }
+                } else {
+                    const uint32_t cw = (w + 1) / 2;
+                    const uint32_t ch = (h + 1) / 2;
+                    uint8_t *dstY = dstSlot;
+                    uint8_t *dstUV = dstSlot + static_cast<size_t>(w) * h;
+                    const bool isCrFirst = (nbCfg.format == NATIVEBUFFER_PIXEL_FMT_YCRCB_420_SP ||
+                                            nbCfg.format == NATIVEBUFFER_PIXEL_FMT_YCRCB_420_P);
+
+                    if (hasPlanes) {
+                        uint64_t yOff = planes.planes[0].offset;
+                        uint32_t yStride = planes.planes[0].rowStride > 0 ? planes.planes[0].rowStride
+                                                                          : static_cast<uint32_t>(std::max<int32_t>(nbCfg.stride, w));
+                        for (uint32_t y = 0; y < h; ++y) {
+                            memcpy(dstY + static_cast<size_t>(y) * w,
+                                   srcBase + yOff + static_cast<size_t>(y) * yStride,
+                                   w);
+                        }
+
+                        if (planes.planeCount == 2 ||
+                            (planes.planeCount >= 3 && planes.planes[1].columnStride == 2 && planes.planes[2].columnStride == 2)) {
+                            uint64_t uvOff = planes.planes[1].offset;
+                            uint32_t uvStride = planes.planes[1].rowStride;
+                            if (planes.planeCount >= 3 && planes.planes[2].offset < uvOff) {
+                                uvOff = planes.planes[2].offset;
+                                uvStride = planes.planes[2].rowStride;
+                            }
+                            if (uvStride == 0) {
+                                uvStride = yStride;
+                            }
+                            for (uint32_t y = 0; y < ch; ++y) {
+                                const uint8_t *sr = srcBase + uvOff + static_cast<size_t>(y) * uvStride;
+                                uint8_t *dr = dstUV + static_cast<size_t>(y) * (2u * cw);
+                                if (!isCrFirst) {
+                                    memcpy(dr, sr, 2u * cw);
+                                } else {
+                                    for (uint32_t x = 0; x < cw; ++x) {
+                                        dr[2 * x + 0] = sr[2 * x + 1];
+                                        dr[2 * x + 1] = sr[2 * x + 0];
+                                    }
+                                }
+                            }
+                            copied = true;
+                        } else if (planes.planeCount >= 3) {
+                            OH_NativeBuffer_Plane pLow = planes.planes[1];
+                            OH_NativeBuffer_Plane pHigh = planes.planes[2];
+                            if (pHigh.offset < pLow.offset) {
+                                std::swap(pLow, pHigh);
+                            }
+                            const OH_NativeBuffer_Plane &cbP = isCrFirst ? pHigh : pLow;
+                            const OH_NativeBuffer_Plane &crP = isCrFirst ? pLow : pHigh;
+                            uint32_t cbCol = cbP.columnStride > 0 ? cbP.columnStride : 1u;
+                            uint32_t crCol = crP.columnStride > 0 ? crP.columnStride : 1u;
+                            uint32_t cbRow = cbP.rowStride > 0 ? cbP.rowStride : cw;
+                            uint32_t crRow = crP.rowStride > 0 ? crP.rowStride : cw;
+                            for (uint32_t y = 0; y < ch; ++y) {
+                                const uint8_t *sCb = srcBase + cbP.offset + static_cast<size_t>(y) * cbRow;
+                                const uint8_t *sCr = srcBase + crP.offset + static_cast<size_t>(y) * crRow;
+                                uint8_t *dr = dstUV + static_cast<size_t>(y) * (2u * cw);
+                                for (uint32_t x = 0; x < cw; ++x) {
+                                    dr[2 * x + 0] = sCb[x * cbCol];
+                                    dr[2 * x + 1] = sCr[x * crCol];
+                                }
+                            }
+                            copied = true;
+                        }
+                    } else {
+                        uint32_t stride = nbCfg.stride > 0 ? static_cast<uint32_t>(nbCfg.stride) : w;
+                        uint32_t sliceH = nbCfg.height > 0 ? static_cast<uint32_t>(nbCfg.height) : h;
+                        for (uint32_t y = 0; y < h; ++y) {
+                            memcpy(dstY + static_cast<size_t>(y) * w, srcBase + static_cast<size_t>(y) * stride, w);
+                        }
+                        const uint8_t *uvBase = srcBase + static_cast<size_t>(stride) * sliceH;
+                        for (uint32_t y = 0; y < ch; ++y) {
+                            const uint8_t *sr = uvBase + static_cast<size_t>(y) * stride;
+                            uint8_t *dr = dstUV + static_cast<size_t>(y) * (2u * cw);
+                            if (!isCrFirst) {
+                                memcpy(dr, sr, 2u * cw);
+                            } else {
+                                for (uint32_t x = 0; x < cw; ++x) {
+                                    dr[2 * x + 0] = sr[2 * x + 1];
+                                    dr[2 * x + 1] = sr[2 * x + 0];
+                                }
+                            }
+                        }
+                        copied = true;
+                    }
+                }
+
+                if (copied) {
+                    curPosMs = vp->posMs.load(std::memory_order_relaxed);
+                    curDurMs = vp->durMs.load(std::memory_order_relaxed);
+                    hdr->format = outFmt;
+                    hdr->matrix = outFmt == kVideoFmtNV12 ? mapVideoColorMatrix(nb, h) : 0;
+                    hdr->width.store(w, std::memory_order_relaxed);
+                    hdr->height.store(h, std::memory_order_relaxed);
+                    hdr->posMs.store(curPosMs, std::memory_order_relaxed);
+                    hdr->durMs.store(curDurMs, std::memory_order_relaxed);
+                    hdr->latestSlot.store(slot, std::memory_order_release);
+                    hdr->writeSeq.fetch_add(1, std::memory_order_acq_rel);
+                    outW = w;
+                    outH = h;
+                    published = true;
+                }
+            }
+        }
+    }
+
+    OH_NativeBuffer_Unmap(nb);
+    OH_ImageNative_Release(img);
+
+    if (published) {
+        sendVideoEventWire(playerId, kVideoEvFrame, 0, curPosMs, curDurMs, outW, outH, "");
+    }
+}
+
+void onVideoInfoCallback(OH_AVPlayer *player, AVPlayerOnInfoType type, OH_AVFormat *infoBody, void *userData) {
+    uint32_t playerId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(userData));
+    auto vp = findVideoPlayer(playerId);
+    if (!vp || vp->closing.load(std::memory_order_acquire) || player == nullptr) {
+        return;
+    }
+
+    switch (type) {
+    case AV_INFO_TYPE_STATE_CHANGE: {
+        int32_t rawState = 0;
+        if (infoBody == nullptr || !OH_AVFormat_GetIntValue(infoBody, OH_PLAYER_STATE, &rawState)) {
+            AVPlayerState queried = AV_IDLE;
+            if (OH_AVPlayer_GetState(player, &queried) == AV_ERR_OK) {
+                rawState = static_cast<int32_t>(queried);
+            }
+        }
+        auto st = static_cast<AVPlayerState>(rawState);
+        bool sendMeta = false;
+        bool sendEnded = false;
+        int64_t posMs = 0, durMs = 0;
+        uint32_t w = 0, h = 0;
+        {
+            std::lock_guard<std::mutex> lk(vp->mu);
+            if (vp->closing.load(std::memory_order_relaxed)) {
+                return;
+            }
+            vp->avState = st;
+            if (st == AV_PREPARED) {
+                vp->prepared = true;
+                int32_t d = 0, vw = 0, vh = 0;
+                if (OH_AVPlayer_GetDuration(player, &d) == AV_ERR_OK && d > 0) {
+                    vp->durMs.store(d, std::memory_order_relaxed);
+                    if (vp->shmHdr != nullptr) {
+                        vp->shmHdr->durMs.store(d, std::memory_order_relaxed);
+                    }
+                }
+                if (OH_AVPlayer_GetVideoWidth(player, &vw) == AV_ERR_OK && vw > 0) {
+                    vp->videoW = vw;
+                }
+                if (OH_AVPlayer_GetVideoHeight(player, &vh) == AV_ERR_OK && vh > 0) {
+                    vp->videoH = vh;
+                }
+                OH_AVPlayer_SetLooping(player, vp->loop);
+                float effVol = vp->muted ? 0.0f : std::clamp(vp->volume, 0.0f, 1.0f);
+                OH_AVPlayer_SetVolume(player, effVol, effVol);
+                OH_AVPlayer_SetMediaMuted(player, MEDIA_TYPE_AUD, vp->muted);
+                if (std::fabs(vp->rate - 1.0f) > 1e-4f) {
+                    OH_AVPlayer_SetPlaybackRate(player, std::clamp(vp->rate, 0.125f, 8.0f));
+                }
+                if (vp->pendingSeek) {
+                    int32_t target = vp->pendingSeekMs;
+                    vp->pendingSeek = false;
+                    OH_AVPlayer_Seek(player, target, AV_SEEK_CLOSEST);
+                }
+                if (vp->wantPlay) {
+                    OH_AVPlayer_Play(player);
+                }
+                posMs = vp->posMs.load(std::memory_order_relaxed);
+                durMs = vp->durMs.load(std::memory_order_relaxed);
+                w = vp->videoW > 0 ? static_cast<uint32_t>(vp->videoW) : 0u;
+                h = vp->videoH > 0 ? static_cast<uint32_t>(vp->videoH) : 0u;
+                sendMeta = true;
+            } else if (st == AV_COMPLETED) {
+                if (!vp->loop) {
+                    vp->wantPlay = false;
+                }
+                posMs = vp->durMs.load(std::memory_order_relaxed);
+                durMs = posMs;
+                if (vp->shmHdr != nullptr && durMs > 0) {
+                    vp->shmHdr->posMs.store(durMs, std::memory_order_relaxed);
+                }
+                sendEnded = true;
+            }
+        }
+        if (sendMeta) {
+            sendVideoEventWire(playerId, kVideoEvMeta, 0, posMs, durMs, w, h, "");
+        }
+        if (sendEnded) {
+            sendVideoEventWire(playerId, kVideoEvEnded, 0, posMs, durMs, 0, 0, "");
+        }
+        break;
+    }
+    case AV_INFO_TYPE_POSITION_UPDATE: {
+        int32_t pos = 0;
+        if (infoBody != nullptr && OH_AVFormat_GetIntValue(infoBody, OH_PLAYER_CURRENT_POSITION, &pos) && pos >= 0) {
+            vp->posMs.store(pos, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lk(vp->mu);
+            if (vp->shmHdr != nullptr) {
+                vp->shmHdr->posMs.store(pos, std::memory_order_relaxed);
+            }
+        }
+        break;
+    }
+    case AV_INFO_TYPE_DURATION_UPDATE: {
+        int64_t dur = 0;
+        if (infoBody != nullptr && OH_AVFormat_GetLongValue(infoBody, OH_PLAYER_DURATION, &dur) && dur > 0) {
+            vp->durMs.store(dur, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(vp->mu);
+                if (vp->shmHdr != nullptr) {
+                    vp->shmHdr->durMs.store(dur, std::memory_order_relaxed);
+                }
+            }
+            sendVideoEventWire(playerId, kVideoEvMeta, 0, vp->posMs.load(std::memory_order_relaxed), dur, 0, 0, "");
+        }
+        break;
+    }
+    case AV_INFO_TYPE_RESOLUTION_CHANGE: {
+        int32_t vw = 0, vh = 0;
+        if (infoBody != nullptr) {
+            OH_AVFormat_GetIntValue(infoBody, OH_PLAYER_VIDEO_WIDTH, &vw);
+            OH_AVFormat_GetIntValue(infoBody, OH_PLAYER_VIDEO_HEIGHT, &vh);
+        }
+        if (vw > 0 && vh > 0) {
+            {
+                std::lock_guard<std::mutex> lk(vp->mu);
+                vp->videoW = vw;
+                vp->videoH = vh;
+            }
+            sendVideoEventWire(playerId, kVideoEvMeta, 0,
+                               vp->posMs.load(std::memory_order_relaxed),
+                               vp->durMs.load(std::memory_order_relaxed),
+                               static_cast<uint32_t>(vw), static_cast<uint32_t>(vh), "");
+        }
+        break;
+    }
+    case AV_INFO_TYPE_SEEKDONE: {
+        int32_t pos = 0;
+        if (infoBody == nullptr || !OH_AVFormat_GetIntValue(infoBody, OH_PLAYER_SEEK_POSITION, &pos)) {
+            pos = static_cast<int32_t>(vp->posMs.load(std::memory_order_relaxed));
+        }
+        if (pos >= 0) {
+            vp->posMs.store(pos, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lk(vp->mu);
+            if (vp->shmHdr != nullptr) {
+                vp->shmHdr->posMs.store(pos, std::memory_order_relaxed);
+            }
+        }
+        sendVideoEventWire(playerId, kVideoEvSeekDone, 0, pos, vp->durMs.load(std::memory_order_relaxed), 0, 0, "");
+        break;
+    }
+    case AV_INFO_TYPE_EOS: {
+        int64_t dur = vp->durMs.load(std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(vp->mu);
+            if (!vp->loop) {
+                vp->wantPlay = false;
+            }
+            if (vp->shmHdr != nullptr && dur > 0) {
+                vp->shmHdr->posMs.store(dur, std::memory_order_relaxed);
+            }
+        }
+        sendVideoEventWire(playerId, kVideoEvEnded, 0, dur, dur, 0, 0, "");
+        break;
+    }
+    case AV_INFO_TYPE_BUFFERING_UPDATE: {
+        int32_t btype = 0, bval = 0;
+        if (infoBody != nullptr && OH_AVFormat_GetIntValue(infoBody, OH_PLAYER_BUFFERING_TYPE, &btype)) {
+            OH_AVFormat_GetIntValue(infoBody, OH_PLAYER_BUFFERING_VALUE, &bval);
+            if (btype == AVPLAYER_BUFFERING_START) {
+                sendVideoEventWire(playerId, kVideoEvBuffering, 1,
+                                   vp->posMs.load(std::memory_order_relaxed),
+                                   vp->durMs.load(std::memory_order_relaxed), 0, 0, "");
+            } else if (btype == AVPLAYER_BUFFERING_END ||
+                       (btype == AVPLAYER_BUFFERING_PERCENT && bval >= 100)) {
+                sendVideoEventWire(playerId, kVideoEvBuffering, 0,
+                                   vp->posMs.load(std::memory_order_relaxed),
+                                   vp->durMs.load(std::memory_order_relaxed), 0, 0, "");
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void onVideoErrorCallback(OH_AVPlayer *player, int32_t errorCode, const char *errorMsg, void *userData) {
+    (void)player;
+    uint32_t playerId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(userData));
+    auto vp = findVideoPlayer(playerId);
+    if (!vp || vp->closing.load(std::memory_order_acquire)) {
+        return;
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s (code %d)", (errorMsg != nullptr && errorMsg[0] != '\0') ? errorMsg : "AVPlayer error", errorCode);
+    sendVideoEventWire(playerId, kVideoEvError, 0, 0, 0, 0, 0, buf);
+}
+
+void destroyVideoResourcesSync(std::shared_ptr<VideoPlayerSession> vp) {
+    if (!vp) {
+        return;
+    }
+    vp->closing.store(true, std::memory_order_release);
+    OH_AVPlayer *player = nullptr;
+    OH_ImageReceiverNative *receiver = nullptr;
+    OHNativeWindow *window = nullptr;
+    void *shmBase = nullptr;
+    size_t shmBytes = 0;
+    int srcFd = -1;
+    {
+        std::lock_guard<std::mutex> lk(vp->mu);
+        player = vp->player;
+        vp->player = nullptr;
+        receiver = vp->receiver;
+        vp->receiver = nullptr;
+        window = vp->window;
+        vp->window = nullptr;
+        shmBase = vp->shmBase;
+        shmBytes = vp->shmBytes;
+        vp->shmBase = nullptr;
+        vp->shmBytes = 0;
+        vp->shmHdr = nullptr;
+        srcFd = vp->srcFd;
+        vp->srcFd = -1;
+    }
+    if (receiver != nullptr) {
+        OH_ImageReceiverNative_OffImageArrive(receiver, onVideoImageArrive);
+    }
+    if (player != nullptr) {
+        OH_AVPlayer_SetOnInfoCallback(player, nullptr, nullptr);
+        OH_AVPlayer_SetOnErrorCallback(player, nullptr, nullptr);
+        OH_AVPlayer_ReleaseSync(player);
+    }
+    if (window != nullptr) {
+        OH_NativeWindow_DestroyNativeWindow(window);
+    }
+    if (receiver != nullptr) {
+        OH_ImageReceiverNative_Release(receiver);
+    }
+    if (shmBase != nullptr && shmBytes > 0) {
+        munmap(shmBase, shmBytes);
+    }
+    if (srcFd >= 0) {
+        close(srcFd);
+    }
+}
+
+void closeVideoPlayer(uint32_t playerId, bool asyncRelease = true) {
+    std::shared_ptr<VideoPlayerSession> vp;
+    {
+        std::lock_guard<std::mutex> lk(gVideoMu);
+        auto it = gVideoPlayers.find(playerId);
+        if (it != gVideoPlayers.end()) {
+            vp = std::move(it->second);
+            gVideoPlayers.erase(it);
+        }
+    }
+    if (!vp) {
+        return;
+    }
+    vp->closing.store(true, std::memory_order_release);
+    if (asyncRelease) {
+        std::thread([vp = std::move(vp)]() mutable {
+            destroyVideoResourcesSync(std::move(vp));
+        }).detach();
+    } else {
+        destroyVideoResourcesSync(std::move(vp));
+    }
+}
+
+void closeAllVideoPlayers() {
+    std::unordered_map<uint32_t, std::shared_ptr<VideoPlayerSession>> all;
+    {
+        std::lock_guard<std::mutex> lk(gVideoMu);
+        all.swap(gVideoPlayers);
+    }
+    for (auto &kv : all) {
+        if (kv.second) {
+            kv.second->closing.store(true, std::memory_order_release);
+        }
+    }
+    if (!all.empty()) {
+        std::thread([all = std::move(all)]() mutable {
+            for (auto &kv : all) {
+                destroyVideoResourcesSync(std::move(kv.second));
+            }
+        }).detach();
+    }
+}
+
+void openVideoPlayer(uint32_t playerId, int64_t size, const std::string &url, int inFd) {
+    closeVideoPlayer(playerId, true);
+
+    auto vp = std::make_shared<VideoPlayerSession>();
+    vp->id = playerId;
+    vp->srcFd = inFd;
+
+    OH_ImageReceiverOptions *opts = nullptr;
+    if (OH_ImageReceiverOptions_Create(&opts) != IMAGE_SUCCESS || opts == nullptr) {
+        destroyVideoResourcesSync(vp);
+        sendVideoEventWire(playerId, kVideoEvError, 0, 0, 0, 0, 0, "OH_ImageReceiverOptions_Create failed");
+        return;
+    }
+    Image_Size initSize = {1920, 1080};
+    OH_ImageReceiverOptions_SetSize(opts, initSize);
+    OH_ImageReceiverOptions_SetCapacity(opts, 4);
+
+    OH_ImageReceiverNative *receiver = nullptr;
+    Image_ErrorCode imgErr = OH_ImageReceiverNative_Create(opts, &receiver);
+    OH_ImageReceiverOptions_Release(opts);
+    if (imgErr != IMAGE_SUCCESS || receiver == nullptr) {
+        destroyVideoResourcesSync(vp);
+        sendVideoEventWire(playerId, kVideoEvError, 0, 0, 0, 0, 0, "OH_ImageReceiverNative_Create failed");
+        return;
+    }
+    vp->receiver = receiver;
+
+    uint64_t surfaceId = 0;
+    if (OH_ImageReceiverNative_GetReceivingSurfaceId(receiver, &surfaceId) != IMAGE_SUCCESS || surfaceId == 0) {
+        destroyVideoResourcesSync(vp);
+        sendVideoEventWire(playerId, kVideoEvError, 0, 0, 0, 0, 0, "GetReceivingSurfaceId failed");
+        return;
+    }
+
+    OHNativeWindow *window = nullptr;
+    if (OH_NativeWindow_CreateNativeWindowFromSurfaceId(surfaceId, &window) != 0 || window == nullptr) {
+        destroyVideoResourcesSync(vp);
+        sendVideoEventWire(playerId, kVideoEvError, 0, 0, 0, 0, 0, "CreateNativeWindowFromSurfaceId failed");
+        return;
+    }
+    vp->window = window;
+    uint64_t usage = NATIVEBUFFER_USAGE_CPU_READ | NATIVEBUFFER_USAGE_CPU_READ_OFTEN | NATIVEBUFFER_USAGE_MEM_DMA;
+    OH_NativeWindow_NativeWindowHandleOpt(window, SET_USAGE, usage);
+
+    OH_ImageReceiverNative_OnImageArrive(receiver, onVideoImageArrive,
+                                         reinterpret_cast<void *>(static_cast<uintptr_t>(playerId)));
+
+    OH_AVPlayer *player = OH_AVPlayer_Create();
+    if (player == nullptr) {
+        destroyVideoResourcesSync(vp);
+        sendVideoEventWire(playerId, kVideoEvError, 0, 0, 0, 0, 0, "OH_AVPlayer_Create failed");
+        return;
+    }
+    vp->player = player;
+
+    {
+        std::lock_guard<std::mutex> lk(gVideoMu);
+        gVideoPlayers[playerId] = vp;
+    }
+
+    void *ud = reinterpret_cast<void *>(static_cast<uintptr_t>(playerId));
+    OH_AVPlayer_SetOnInfoCallback(player, onVideoInfoCallback, ud);
+    OH_AVPlayer_SetOnErrorCallback(player, onVideoErrorCallback, ud);
+
+    OH_AVErrCode avErr = AV_ERR_OK;
+    if (vp->srcFd >= 0) {
+        int64_t srcSize = size;
+        if (srcSize <= 0) {
+            struct stat st = {};
+            if (fstat(vp->srcFd, &st) == 0 && st.st_size > 0) {
+                srcSize = st.st_size;
+            }
+        }
+        avErr = OH_AVPlayer_SetFDSource(player, vp->srcFd, 0, srcSize);
+    } else {
+        avErr = OH_AVPlayer_SetURLSource(player, url.c_str());
+    }
+    if (avErr != AV_ERR_OK) {
+        closeVideoPlayer(playerId, true);
+        sendVideoEventWire(playerId, kVideoEvError, 0, 0, 0, 0, 0, "OH_AVPlayer SetSource failed");
+        return;
+    }
+
+    OH_AVPlayer_SetAudioRendererInfo(player, AUDIOSTREAM_USAGE_MOVIE);
+    if (OH_AVPlaybackStrategy *strategy = OH_AVPlaybackStrategy_Create()) {
+        OH_AVPlaybackStrategy_SetShowFirstFrameOnPrepare(strategy, true);
+        OH_AVPlaybackStrategy_SetKeepDecodingOnMute(strategy, true);
+        OH_AVPlayer_SetPlaybackStrategy(player, strategy);
+        OH_AVPlaybackStrategy_Destroy(strategy);
+    }
+
+    if (OH_AVPlayer_SetVideoSurface(player, window) != AV_ERR_OK) {
+        closeVideoPlayer(playerId, true);
+        sendVideoEventWire(playerId, kVideoEvError, 0, 0, 0, 0, 0, "OH_AVPlayer_SetVideoSurface failed");
+        return;
+    }
+    if (OH_AVPlayer_Prepare(player) != AV_ERR_OK) {
+        closeVideoPlayer(playerId, true);
+        sendVideoEventWire(playerId, kVideoEvError, 0, 0, 0, 0, 0, "OH_AVPlayer_Prepare failed");
+        return;
+    }
+}
+
+void handleVideoCmd(uint32_t playerId, uint8_t op, int64_t arg, double farg) {
+    if (op == kVideoCmdClose) {
+        closeVideoPlayer(playerId, true);
+        return;
+    }
+    auto vp = findVideoPlayer(playerId);
+    if (!vp || vp->closing.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(vp->mu);
+    if (vp->closing.load(std::memory_order_relaxed) || vp->player == nullptr) {
+        return;
+    }
+    switch (op) {
+    case kVideoCmdPlay:
+        vp->wantPlay = true;
+        if (vp->prepared) {
+            if (vp->avState == AV_COMPLETED) {
+                OH_AVPlayer_Seek(vp->player, 0, AV_SEEK_CLOSEST);
+            }
+            OH_AVPlayer_Play(vp->player);
+        }
+        break;
+    case kVideoCmdPause:
+        vp->wantPlay = false;
+        if (vp->prepared && vp->avState == AV_PLAYING) {
+            OH_AVPlayer_Pause(vp->player);
+        }
+        break;
+    case kVideoCmdSeek: {
+        int32_t ms = static_cast<int32_t>(std::clamp<int64_t>(arg, 0, INT32_MAX));
+        vp->posMs.store(ms, std::memory_order_relaxed);
+        if (vp->shmHdr != nullptr) {
+            vp->shmHdr->posMs.store(ms, std::memory_order_relaxed);
+        }
+        if (!vp->prepared) {
+            vp->pendingSeek = true;
+            vp->pendingSeekMs = ms;
+        } else {
+            OH_AVPlayer_Seek(vp->player, ms, AV_SEEK_CLOSEST);
+        }
+        break;
+    }
+    case kVideoCmdSetLoop:
+        vp->loop = (arg != 0);
+        if (vp->prepared) {
+            OH_AVPlayer_SetLooping(vp->player, vp->loop);
+        }
+        break;
+    case kVideoCmdSetRate: {
+        float r = std::clamp(static_cast<float>(farg), 0.125f, 8.0f);
+        vp->rate = r;
+        if (vp->prepared) {
+            OH_AVPlayer_SetPlaybackRate(vp->player, r);
+        }
+        break;
+    }
+    case kVideoCmdSetVolume: {
+        vp->volume = std::clamp(static_cast<float>(farg), 0.0f, 1.0f);
+        if (vp->prepared) {
+            float eff = vp->muted ? 0.0f : vp->volume;
+            OH_AVPlayer_SetVolume(vp->player, eff, eff);
+        }
+        break;
+    }
+    case kVideoCmdSetMuted: {
+        vp->muted = (arg != 0);
+        if (vp->prepared) {
+            float eff = vp->muted ? 0.0f : vp->volume;
+            OH_AVPlayer_SetVolume(vp->player, eff, eff);
+            OH_AVPlayer_SetMediaMuted(vp->player, MEDIA_TYPE_AUD, vp->muted);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 void killEngine() {
     closeAllAudioStreams();
+    closeAllVideoPlayers();
     clearAllHotkeys();
     {
         std::lock_guard<std::mutex> lk(gDragMu);
@@ -6683,6 +7664,7 @@ void resetAllPendingBuffers() {
 void sendInitialStateToEngine() {
     std::vector<uint8_t> envWire;
     std::vector<uint8_t> clipWire;
+    std::vector<uint8_t> netWire;
     std::vector<std::vector<uint8_t>> appOpens;
     std::vector<std::vector<uint8_t>> notifClicks;
     bool onBat = false;
@@ -6692,6 +7674,7 @@ void sendInitialStateToEngine() {
         std::lock_guard<std::mutex> lk(gEnvMu);
         envWire = gCachedEnv.wirePayload;
         clipWire = gCachedClipWire;
+        netWire = gCachedNetWire;
         appOpens.swap(gPendingAppOpens);
         notifClicks.swap(gPendingNotifClicks);
         onBat = gOnBattery;
@@ -6710,9 +7693,11 @@ void sendInitialStateToEngine() {
         appendU32(pwrWire, 0);
         sendMessage(kPowerState, pwrWire.data(), static_cast<uint32_t>(pwrWire.size()), -1);
     }
-    {
-        uint8_t netWire[4] = {static_cast<uint8_t>(netOn ? 1 : 0), static_cast<uint8_t>(netMet ? 1 : 0), 0, 0};
-        sendMessage(kNetState, netWire, sizeof(netWire), -1);
+    if (!netWire.empty()) {
+        sendMessage(kNetState, netWire.data(), static_cast<uint32_t>(netWire.size()), -1);
+    } else {
+        uint8_t fallbackNet[4] = {static_cast<uint8_t>(netOn ? 1 : 0), static_cast<uint8_t>(netMet ? 1 : 0), 0, 0};
+        sendMessage(kNetState, fallbackNet, sizeof(fallbackNet), -1);
     }
     for (const auto &ao : appOpens) {
         if (!ao.empty()) {
@@ -6751,9 +7736,10 @@ bool pumpEngineMessages() {
         }
         if (got < 0) {
             closeAllAudioStreams();
+            closeAllVideoPlayers();
             return !gSupervisorRunning.load() || gEngineCleanQuit.load();
         }
-        if (inFd >= 0 && kind != kAudioOpen && kind != kPresent) {
+        if (inFd >= 0 && kind != kAudioOpen && kind != kPresent && kind != kVideoOpen) {
             close(inFd);
             inFd = -1;
         }
@@ -6762,6 +7748,7 @@ bool pumpEngineMessages() {
         case kQuit: {
             gEngineCleanQuit.store(true);
             closeAllAudioStreams();
+            closeAllVideoPlayers();
             resetAllPendingBuffers();
             auto ev = std::make_unique<BridgeEvent>();
             ev->kind = BridgeEventKind::EngineQuit;
@@ -7293,6 +8280,38 @@ bool pumpEngineMessages() {
         case kAccessTree:
             handleAccessTree(payload);
             break;
+        case kVideoOpen: {
+            if (payload.size() >= 16) {
+                uint32_t playerId = 0;
+                int64_t size = 0;
+                memcpy(&playerId, payload.data() + 0, 4);
+                memcpy(&size, payload.data() + 4, 8);
+                size_t off = 12;
+                std::string url;
+                if (readStr(payload, off, &url) && off == payload.size()) {
+                    openVideoPlayer(playerId, size, url, inFd);
+                    inFd = -1;
+                }
+            }
+            if (inFd >= 0) {
+                close(inFd);
+                inFd = -1;
+            }
+            break;
+        }
+        case kVideoCmd: {
+            if (payload.size() == 24) {
+                uint32_t playerId = 0;
+                uint8_t op = payload[4];
+                int64_t arg = 0;
+                double farg = 0.0;
+                memcpy(&playerId, payload.data() + 0, 4);
+                memcpy(&arg, payload.data() + 8, 8);
+                memcpy(&farg, payload.data() + 16, 8);
+                handleVideoCmd(playerId, op, arg, farg);
+            }
+            break;
+        }
         default:
             break;
         }
@@ -8334,9 +9353,48 @@ napi_value NotifyPowerState(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+static void appendJsonEscaped(std::string &out, const std::string &s) {
+    out.push_back('"');
+    for (unsigned char c : s) {
+        switch (c) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (c < 0x20) {
+                char hex[8];
+                snprintf(hex, sizeof(hex), "\\u%04x", static_cast<unsigned>(c));
+                out += hex;
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+            break;
+        }
+    }
+    out.push_back('"');
+}
+
 napi_value NotifyNetState(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value argv[2] = {};
+    size_t argc = 7;
+    napi_value argv[7] = {};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 2) {
         return nullptr;
@@ -8345,13 +9403,98 @@ napi_value NotifyNetState(napi_env env, napi_callback_info info) {
     bool metered = false;
     napi_get_value_bool(env, argv[0], &online);
     napi_get_value_bool(env, argv[1], &metered);
+
+    bool hasProxyArgs = argc >= 4;
+    std::string pHost;
+    uint16_t pPort = 0;
+    std::string pUser;
+    std::string pPass;
+    std::vector<std::string> pExcl;
+    if (hasProxyArgs) {
+        pHost = getNapiString(env, argv[2]);
+        int32_t portVal = 0;
+        if (napi_get_value_int32(env, argv[3], &portVal) == napi_ok && portVal > 0 && portVal <= 65535) {
+            pPort = static_cast<uint16_t>(portVal);
+        }
+        if (argc >= 5 && argv[4] != nullptr) {
+            pUser = getNapiString(env, argv[4]);
+        }
+        if (argc >= 6 && argv[5] != nullptr) {
+            pPass = getNapiString(env, argv[5]);
+        }
+        if (argc >= 7 && argv[6] != nullptr) {
+            uint32_t arrLen = 0;
+            if (napi_get_array_length(env, argv[6], &arrLen) == napi_ok) {
+                for (uint32_t i = 0; i < arrLen && i < 1024; ++i) {
+                    napi_value elem = nullptr;
+                    if (napi_get_element(env, argv[6], i, &elem) == napi_ok && elem != nullptr) {
+                        std::string item = getNapiString(env, elem);
+                        if (!item.empty()) {
+                            pExcl.push_back(std::move(item));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<uint8_t> wire;
+    std::string json;
+    if (hasProxyArgs) {
+        wire.resize(8, 0);
+        wire[0] = online ? 1 : 0;
+        wire[1] = metered ? 1 : 0;
+        wire[2] = 1;
+        uint16_t exclCount = static_cast<uint16_t>(pExcl.size());
+        memcpy(wire.data() + 4, &pPort, 2);
+        memcpy(wire.data() + 6, &exclCount, 2);
+        appendStr(wire, pHost);
+        appendStr(wire, pUser);
+        appendStr(wire, pPass);
+        for (const auto &item : pExcl) {
+            appendStr(wire, item);
+        }
+
+        if (!pHost.empty() && pPort > 0) {
+            json = "{\"host\":";
+            appendJsonEscaped(json, pHost);
+            json += ",\"port\":" + std::to_string(pPort);
+            if (!pUser.empty()) {
+                json += ",\"username\":";
+                appendJsonEscaped(json, pUser);
+            }
+            if (!pPass.empty()) {
+                json += ",\"password\":";
+                appendJsonEscaped(json, pPass);
+            }
+            if (!pExcl.empty()) {
+                json += ",\"exclusions\":[";
+                for (size_t i = 0; i < pExcl.size(); ++i) {
+                    if (i > 0) {
+                        json.push_back(',');
+                    }
+                    appendJsonEscaped(json, pExcl[i]);
+                }
+                json.push_back(']');
+            }
+            json.push_back('}');
+        } else {
+            json = "{}";
+        }
+    } else {
+        wire = {static_cast<uint8_t>(online ? 1 : 0), static_cast<uint8_t>(metered ? 1 : 0), 0, 0};
+    }
+
     {
         std::lock_guard<std::mutex> lk(gEnvMu);
         gNetOnline = online;
         gNetMetered = metered;
+        gCachedNetWire = wire;
+        if (hasProxyArgs) {
+            gNetProxyJson = std::move(json);
+        }
     }
-    uint8_t wire[4] = {static_cast<uint8_t>(online ? 1 : 0), static_cast<uint8_t>(metered ? 1 : 0), 0, 0};
-    sendMessage(kNetState, wire, sizeof(wire), -1);
+    sendMessage(kNetState, wire.data(), static_cast<uint32_t>(wire.size()), -1);
     return nullptr;
 }
 

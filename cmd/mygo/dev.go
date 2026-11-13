@@ -51,6 +51,11 @@ the app for them (GOOS=js GOARCH=wasm), serves it at http://localhost:<port>,
 opens it, and rebuilds it as its code changes, which reloads the page; the
 page shows why a build failed.
 
+With -ohos (enabled automatically on a HarmonyOS PC host), it packages the
+development app as a HarmonyOS PC .hap, caches the compiled ArkTS/C++ host
+shell across Go edits, signs with hda (unless -sign -), installs via hdc,
+launches EntryAbility, and streams hilog output.
+
 With -lang, the app runs in that language, a BCP 47 tag such as de or
 zh-Hant, or a pseudo locale: en-XA (accented and longer text) or ar-XB
 (right to left), which test layouts without translations. It does not
@@ -58,6 +63,7 @@ keep it: the app's own setting is left as it is.`)
 	skipDevCommand := flags.Bool("skip-dev-command", false, "do not run devCommand")
 	sign := flags.String("sign", "", `macOS signing identity for the development app (default: an Apple Development identity, which keeps permissions and Keychain access across builds, else "-", ad hoc)`)
 	web := flags.Bool("web", false, "develop the app in browsers")
+	ohos := flags.Bool("ohos", isOhosHost(), "develop the app on HarmonyOS PC (.hap via hda and hdc)")
 	port := flags.Int("port", 5174, "with -web, the port to serve the app at, or the next free one")
 	openPage := flags.Bool("open", true, "with -web, open the app in the browser")
 	lang := flags.String("lang", "", "run the app in this language (as de, or the pseudo locales en-XA and ar-XB), without keeping it")
@@ -82,7 +88,11 @@ keep it: the app's own setting is left as it is.`)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	s := &devSession{root: c.root, sign: devSign(c, *sign), name: devConfig(c).Name, env: []string{"MYGO_ENV=development"}}
+	signVal := *sign
+	if !*ohos {
+		signVal = devSign(c, *sign)
+	}
+	s := &devSession{root: c.root, ohos: *ohos, sign: signVal, name: devConfig(c).Name, env: []string{"MYGO_ENV=development"}}
 	if *background {
 		s.env = append(s.env, "MYGO_DEV_BACKGROUND=1")
 	}
@@ -218,6 +228,7 @@ func devSign(c *Config, sign string) string {
 // devSession builds and runs development builds of an app.
 type devSession struct {
 	root string
+	ohos bool
 	sign string
 	name string   // of the development app, for messages
 	env  []string // for the app
@@ -479,6 +490,9 @@ func (s *devSession) killLive() {
 	p := s.live
 	s.liveMu.Unlock()
 	if p != nil {
+		if p.stopFn != nil {
+			p.stopFn()
+		}
 		kill(p.cmd)
 	}
 }
@@ -553,6 +567,9 @@ func devConfig(c *Config) *Config {
 // running build, whose fingerprint is running, showing its progress on t.
 // It returns the new process.
 func (s *devSession) buildAndLaunch(ctx context.Context, t *task, running [32]byte) (p *devProcess, sum [32]byte, err error) {
+	if s.ohos {
+		return s.buildAndLaunchOhos(ctx, t, running)
+	}
 	c, err := loadConfig(s.root)
 	if err != nil {
 		return nil, sum, err
@@ -852,10 +869,11 @@ func (s *devSession) takeRelaunchArgs() []string {
 
 // devProcess is a running development build.
 type devProcess struct {
-	exe  string
-	cmd  *exec.Cmd
-	done chan struct{} // closed when the process exited
-	err  error         // how it exited, set before done is closed
+	exe    string
+	cmd    *exec.Cmd
+	stopFn func()        // optional hook run before stopping cmd (e.g. hdc aa force-stop)
+	done   chan struct{} // closed when the process exited
+	err    error         // how it exited, set before done is closed
 	// replaced is set when the build is stopped for the next one.
 	replaced atomic.Bool
 }
@@ -872,6 +890,9 @@ func (p *devProcess) stop() {
 	case <-p.done:
 		return
 	default:
+	}
+	if p.stopFn != nil {
+		p.stopFn()
 	}
 	interrupt(p.cmd)
 	select {
